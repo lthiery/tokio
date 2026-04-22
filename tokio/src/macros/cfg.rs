@@ -746,3 +746,17 @@ macro_rules! cfg_io_uring {
         )*
     };
 }
+
+macro_rules! cfg_io_uring_reactor {
+    ($($item:item)*) => {
+        $(
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt",
+                target_os = "linux",
+            ))]
+            $item
+        )*
+    };
+}
