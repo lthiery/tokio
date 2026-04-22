@@ -59,7 +59,8 @@
 use crate::loom::sync::{Arc, Mutex};
 use crate::runtime;
 use crate::runtime::scheduler::multi_thread::{
-    idle, park, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, Unparker,
+    idle, park, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus,
+    WorkerParker, WorkerUnparker,
 };
 use crate::runtime::scheduler::{inject, Defer, Lock};
 use crate::runtime::task::OwnedTasks;
@@ -146,7 +147,7 @@ struct Core {
     ///
     /// Stored in an `Option` as the parker is added / removed to make the
     /// borrow checker happy.
-    park: Option<Parker>,
+    park: Option<WorkerParker>,
 
     /// Per-worker runtime stats
     stats: Stats,
@@ -224,7 +225,7 @@ struct Remote {
     pub(super) steal: queue::Steal<Arc<Handle>>,
 
     /// Unparks the associated worker thread
-    unpark: Unparker,
+    unpark: WorkerUnparker,
 }
 
 /// Thread-local context
@@ -273,12 +274,47 @@ pub(super) fn create(
     let mut remotes = Vec::with_capacity(size);
     let mut worker_metrics = Vec::with_capacity(size);
 
+    // If the uring reactor is enabled, construct the shared UringHandle
+    // once so every worker's UringParker can reference it.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    let uring_handle = match io_flavor {
+        IoFlavor::Traditional => None,
+        IoFlavor::UringPerWorker => Some(std::sync::Arc::new(
+            crate::runtime::io::uring_driver::UringHandle::new(size),
+        )),
+    };
+
     // Create the local queues
-    for _ in 0..size {
+    for worker_idx in 0..size {
         let (steal, run_queue) = queue::local();
 
-        let park = park.clone();
-        let unpark = park.unpark();
+        let worker_park: WorkerParker = match io_flavor {
+            IoFlavor::Traditional => WorkerParker::Traditional(park.clone()),
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            IoFlavor::UringPerWorker => {
+                let handle = std::sync::Arc::clone(
+                    uring_handle.as_ref().expect("uring handle constructed above"),
+                );
+                WorkerParker::Uring(
+                    crate::runtime::scheduler::multi_thread::uring_park::UringParker::new(
+                        worker_idx, handle,
+                    ),
+                )
+            }
+        };
+        let _ = worker_idx; // suppress warning on non-linux builds
+        let unpark = worker_park.unparker();
+        let park = worker_park;
         let metrics = WorkerMetrics::from_config(&config);
         let stats = Stats::new(&metrics);
 

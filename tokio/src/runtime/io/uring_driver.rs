@@ -299,6 +299,45 @@ impl Drop for LocalReactorGuard<'_> {
     }
 }
 
+/// Install a `RefCell<Reactor>` pointer into the current thread's
+/// `LOCAL_REACTOR` slot without an RAII guard.
+///
+/// This is used by the multi-thread scheduler's `UringParker`, which cannot
+/// hold a `!Send` [`LocalReactorGuard`] because its containing `Core` must
+/// itself be `Send` to cross the `spawn_blocking` boundary.
+///
+/// # Safety contract
+///
+/// The caller must:
+///
+/// 1. Pass a pointer to a `RefCell<Reactor>` whose allocation lives at
+///    least as long as the pointer remains in the TLS slot.
+/// 2. Call [`clear_local_reactor`] on the same thread before the pointed-to
+///    allocation is dropped.
+/// 3. Install only once per thread; re-installing a different pointer is a
+///    programming error and will trigger the debug-mode assertion.
+///
+/// In practice, the worker thread constructs its `Reactor` inside a
+/// `Box<RefCell<Reactor>>` owned by its `UringParker`; the parker installs
+/// via this function on first `park`, and clears via `clear_local_reactor`
+/// in its `Drop` impl. Both calls happen on the worker thread.
+pub(crate) unsafe fn install_local_reactor_raw(ptr: *const RefCell<Reactor>) {
+    LOCAL_REACTOR.with(|slot| {
+        debug_assert!(
+            slot.get().is_null(),
+            "another Reactor is already installed on this thread",
+        );
+        slot.set(ptr);
+    });
+}
+
+/// Clear the current thread's `LOCAL_REACTOR` slot. No-op if nothing was
+/// installed. Must be called before the reactor's backing allocation is
+/// dropped.
+pub(crate) fn clear_local_reactor() {
+    LOCAL_REACTOR.with(|slot| slot.set(ptr::null()));
+}
+
 /// Run `f` with a mutable reference to the current thread's reactor, if
 /// one is installed. Returns `None` if the thread is not a worker.
 ///

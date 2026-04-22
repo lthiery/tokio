@@ -17,6 +17,7 @@ pub(crate) struct Parker {
     inner: Arc<Inner>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Unparker {
     inner: Arc<Inner>,
 }
@@ -124,6 +125,144 @@ impl Clone for Parker {
 impl Unparker {
     pub(crate) fn unpark(&self, driver: &driver::Handle) {
         self.inner.unpark(driver);
+    }
+}
+
+// ===== WorkerParker / WorkerUnparker =====
+//
+// Enum wrappers that let the multi-thread worker be parameterized by I/O
+// flavor at runtime. The `Traditional` variant is always present; the
+// `Uring` variant is compiled in only under `cfg` guards matching the
+// `io-uring-reactor` feature.
+
+#[cfg(all(
+    tokio_unstable,
+    feature = "io-uring-reactor",
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
+use super::uring_park::{UringParker, UringUnparker};
+
+/// Per-worker parker. One of these is owned by each worker's `Core`.
+pub(crate) enum WorkerParker {
+    /// Shared-driver path (mio/epoll). All workers clone the same underlying
+    /// `Shared` and contend for `TryLock<Driver>`.
+    Traditional(Parker),
+
+    /// Per-worker `io_uring` path. Each worker owns an exclusive ring.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    Uring(UringParker),
+}
+
+/// Per-worker unparker. Cloned and stored in `Remote` so peer workers and
+/// external threads can wake this worker.
+#[derive(Clone)]
+pub(crate) enum WorkerUnparker {
+    Traditional(Unparker),
+
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    Uring(UringUnparker),
+}
+
+impl WorkerParker {
+    pub(crate) fn unparker(&self) -> WorkerUnparker {
+        match self {
+            WorkerParker::Traditional(p) => WorkerUnparker::Traditional(p.unpark()),
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            WorkerParker::Uring(p) => WorkerUnparker::Uring(p.unparker()),
+        }
+    }
+
+    pub(crate) fn park(&mut self, handle: &driver::Handle) -> HadDriver {
+        match self {
+            WorkerParker::Traditional(p) => p.park(handle),
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            WorkerParker::Uring(p) => p.park(handle),
+        }
+    }
+
+    pub(crate) fn park_timeout(
+        &mut self,
+        handle: &driver::Handle,
+        duration: Duration,
+    ) -> HadDriver {
+        match self {
+            WorkerParker::Traditional(p) => p.park_timeout(handle, duration),
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            WorkerParker::Uring(p) => p.park_timeout(handle, duration),
+        }
+    }
+
+    pub(crate) fn shutdown(&mut self, handle: &driver::Handle) {
+        match self {
+            WorkerParker::Traditional(p) => p.shutdown(handle),
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            WorkerParker::Uring(p) => p.shutdown(handle),
+        }
+    }
+}
+
+// Only the traditional variant can be produced by cloning a `Parker`. Uring
+// parkers are fresh per worker and are not clone-constructed.
+impl Clone for WorkerParker {
+    fn clone(&self) -> Self {
+        match self {
+            WorkerParker::Traditional(p) => WorkerParker::Traditional(p.clone()),
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            WorkerParker::Uring(_) => {
+                unreachable!("UringParker is per-worker; do not clone WorkerParker::Uring")
+            }
+        }
+    }
+}
+
+impl WorkerUnparker {
+    pub(crate) fn unpark(&self, handle: &driver::Handle) {
+        match self {
+            WorkerUnparker::Traditional(u) => u.unpark(handle),
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            WorkerUnparker::Uring(u) => u.unpark(handle),
+        }
     }
 }
 

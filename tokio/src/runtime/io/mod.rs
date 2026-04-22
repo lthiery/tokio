@@ -19,13 +19,11 @@ mod metrics;
 use metrics::IoDriverMetrics;
 
 cfg_io_uring_reactor! {
-    // Experimental per-worker io_uring reactor. Not yet wired into the driver
-    // — these modules currently stand alone so the scaffolding can be built
-    // and reviewed before the Parker/Handle integration lands.
-    #[allow(dead_code)]
-    mod uring_reactor;
-    #[allow(dead_code)]
-    mod uring_driver;
+    // Experimental per-worker io_uring reactor. Consumed by the
+    // multi_thread scheduler's `UringParker` when `enable_uring_reactor()`
+    // is selected on the runtime builder.
+    pub(crate) mod uring_reactor;
+    pub(crate) mod uring_driver;
 }
 
 use crate::util::ptr_expose::PtrExposeDomain;
