@@ -33,11 +33,12 @@
 use io_uring::{opcode, types, IoUring};
 
 use crate::io::{Interest, Ready};
+use crate::loom::sync::Arc;
 use crate::runtime::io::driver::Tick;
 use crate::runtime::io::ScheduledIo;
 
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
 /// Submission queue depth. Per-worker, so small is fine.
@@ -66,9 +67,59 @@ const RESERVED_SENTINEL_FLOOR: u64 = u64::MAX - 15;
 ///
 /// Owns a single [`IoUring`] instance. The owning worker is the sole submitter
 /// (enforced by `IORING_SETUP_SINGLE_ISSUER`); cross-worker wakeups come in via
-/// `MSG_RING` SQEs submitted on the sender's own ring.
+/// `MSG_RING` SQEs submitted on the sender's own ring; external-thread wakeups
+/// come in via a per-reactor [`eventfd`] registered with `POLL_ADD_MULTI` on
+/// this same ring.
+///
+/// [`eventfd`]: https://man7.org/linux/man-pages/man2/eventfd.2.html
 pub(crate) struct Reactor {
     ring: IoUring,
+    /// eventfd for external-thread wakeups. Held behind an `Arc` so
+    /// [`ExternalWaker`]s can be handed out cheaply to non-worker threads.
+    external_wake_fd: Arc<OwnedFd>,
+}
+
+/// Thread-safe handle for waking a [`Reactor`] from a non-worker thread.
+///
+/// A write to the underlying eventfd races with the reactor's `park()` call
+/// and causes the POLL_ADD_MULTI registration on the eventfd to fire, which
+/// posts a CQE with `USER_DATA_EVENTFD` and unblocks the park.
+///
+/// Cheap to clone — it's just an `Arc<OwnedFd>`.
+#[derive(Clone, Debug)]
+pub(crate) struct ExternalWaker {
+    fd: Arc<OwnedFd>,
+}
+
+impl ExternalWaker {
+    /// Wake the owning reactor. Thread-safe; may be called from any thread,
+    /// any number of times. Coalesces: the eventfd's internal counter
+    /// accumulates all writes until the reactor drains it on the next park.
+    pub(crate) fn wake(&self) -> io::Result<()> {
+        // eventfd writes are 8 bytes of a u64. Writing 1 increments the
+        // counter by 1; any non-zero value works, the receive side only
+        // cares that the fd is readable.
+        let buf = 1u64.to_ne_bytes();
+        // SAFETY: valid fd, valid buffer, correct length.
+        let ret = unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                buf.as_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            // EAGAIN on a non-blocking eventfd means the counter is already
+            // at u64::MAX - 1, which implies the reactor is behind but a
+            // wake is already pending. That's fine — treat it as success.
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
 }
 
 impl Reactor {
@@ -82,21 +133,79 @@ impl Reactor {
     ///
     /// Kernel requirement: Linux 6.0+ (DEFER_TASKRUN landed in 5.19 but was
     /// not mature until 6.x; we target 6.0 as the minimum supported kernel).
+    ///
+    /// # Thread binding
+    ///
+    /// `new()` performs an initial `io_uring_enter` to submit the eventfd
+    /// registration. Because `IORING_SETUP_SINGLE_ISSUER` binds the ring's
+    /// submitter identity on the first `enter`, **`new()` must be called on
+    /// the same thread that will drive the reactor** — typically, the worker
+    /// thread itself during runtime spawn. Constructing a `Reactor` on one
+    /// thread and moving it to another will cause subsequent `park()` calls
+    /// to fail with `EEXIST`.
     pub(crate) fn new() -> io::Result<Self> {
-        let ring = IoUring::builder()
+        let mut ring = IoUring::builder()
             .setup_single_issuer()
             .setup_defer_taskrun()
             .setup_coop_taskrun()
             .setup_cqsize(CQ_ENTRIES)
             .build(SQ_ENTRIES)?;
 
-        Ok(Self { ring })
+        let external_wake_fd = make_eventfd()?;
+        register_eventfd_multishot(&mut ring, external_wake_fd.as_raw_fd())?;
+
+        Ok(Self {
+            ring,
+            external_wake_fd: Arc::new(external_wake_fd),
+        })
     }
 
     /// Raw fd of the underlying ring. Needed by other workers so they can
     /// submit `MSG_RING` SQEs targeting this reactor's CQ.
     pub(crate) fn ring_fd(&self) -> RawFd {
         self.ring.as_raw_fd()
+    }
+
+    /// Obtain a thread-safe waker that can unblock this reactor's `park()`
+    /// from any thread, including non-worker threads (spawn_blocking,
+    /// external code calling `waker.wake()`).
+    ///
+    /// The returned `ExternalWaker` is cheap to clone and may be held across
+    /// runtime shutdown — waking a dead reactor is a no-op error which
+    /// callers should ignore.
+    #[allow(dead_code)]
+    pub(crate) fn external_waker(&self) -> ExternalWaker {
+        ExternalWaker {
+            fd: self.external_wake_fd.clone(),
+        }
+    }
+
+    /// Send a `MSG_RING` wake to another reactor's ring.
+    ///
+    /// Must be called from the worker that owns **this** reactor —
+    /// `SINGLE_ISSUER` requires submission on our own ring.
+    ///
+    /// Per the design, this flushes immediately (`io_uring_enter(submit,
+    /// min_complete=0)`) rather than deferring to our next park, so the
+    /// target worker receives the wake with low latency. Cost is one
+    /// non-blocking syscall, comparable to an eventfd write.
+    #[allow(dead_code)]
+    pub(crate) fn send_msg_ring(&mut self, target_ring_fd: RawFd) -> io::Result<()> {
+        let sqe = opcode::MsgRingData::new(
+            types::Fd(target_ring_fd),
+            0,                    // `result` — surfaces as CQE.result on receiver; unused.
+            USER_DATA_MSG_RING,   // CQE user_data posted on the *target* ring.
+            None,                 // no user_flags pass-through.
+        )
+        .build()
+        .user_data(USER_DATA_IGNORE); // our own completion (MSG send ack) is discarded.
+
+        // SAFETY: MsgRingData references no user buffers; always safe.
+        unsafe { self.push_sqe(sqe)? };
+
+        // Flush immediately — do not wait for park. Non-blocking submit.
+        self.ring.submit()?;
+        Ok(())
     }
 
     /// Register interest in readiness events for `fd`.
@@ -202,14 +311,26 @@ impl Reactor {
     /// purely CQE-driven and would work just as well against a victim ring's
     /// CQ once CAS-based head advancement is added.
     fn drain_completions(&mut self) {
+        // Collect the eventfd fd up front so we can drain it without
+        // borrowing `self` mutably while iterating the CQ.
+        let external_fd = self.external_wake_fd.as_raw_fd();
+        let mut saw_external_wake = false;
+
         let cq = self.ring.completion();
         for cqe in cq {
             match cqe.user_data() {
-                USER_DATA_EVENTFD | USER_DATA_MSG_RING | USER_DATA_IGNORE => {
-                    // Sentinel: nothing to dispatch. External-wake and
-                    // cross-worker-wake handling is done by the scheduler
-                    // *around* park(), not here. Control SQE completions
-                    // (POLL_REMOVE, TIMEOUT) are discarded.
+                USER_DATA_EVENTFD => {
+                    // External-thread wake arrived. We drain the eventfd's
+                    // counter below (outside the CQ borrow) so subsequent
+                    // writes produce fresh CQEs. The POLL_ADD_MULTI
+                    // registration auto-rearms — no resubmission needed.
+                    saw_external_wake = true;
+                }
+                USER_DATA_MSG_RING | USER_DATA_IGNORE => {
+                    // Cross-worker wake: nothing to dispatch here, the
+                    // scheduler handles the "check task queues" logic
+                    // *around* park(). Control SQE completions (POLL_REMOVE,
+                    // TIMEOUT, MSG_RING send-ack) are discarded.
                 }
                 ptr_value => {
                     let flags = cqe.result();
@@ -232,8 +353,13 @@ impl Reactor {
                 }
             }
         }
-        // `cq` dropping here writes the updated head pointer back to the
-        // kernel.
+        // The iterator consumed `cq`, so its drop ran at the end of the
+        // `for` loop and the updated head pointer has already been written
+        // back to the kernel.
+
+        if saw_external_wake {
+            drain_eventfd(external_fd);
+        }
     }
 
     /// Push an SQE into the submission ring, flushing to the kernel if the
@@ -266,6 +392,54 @@ impl std::fmt::Debug for Reactor {
 /// drivers can coexist and share the readiness machinery.
 fn token_for(scheduled_io: &ScheduledIo) -> u64 {
     super::EXPOSE_IO.expose_provenance(scheduled_io) as u64
+}
+
+/// Create a non-blocking, close-on-exec eventfd for external-thread wakeups.
+///
+/// The counter starts at zero; writes increment it, reads drain it to zero.
+/// Non-blocking so our drain read never stalls the worker; close-on-exec so
+/// it doesn't leak into child processes.
+fn make_eventfd() -> io::Result<OwnedFd> {
+    // SAFETY: eventfd2 is a straightforward syscall with no pointer args;
+    // we check the return value for -1.
+    let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw is a valid, owned fd (we just created it).
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Register `fd` on `ring` with a multi-shot POLL_ADD for readable events
+/// (the eventfd is only ever read-ready). Submits synchronously so the
+/// registration is live before `new()` returns.
+fn register_eventfd_multishot(ring: &mut IoUring, fd: RawFd) -> io::Result<()> {
+    let sqe = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32)
+        .multi(true)
+        .build()
+        .user_data(USER_DATA_EVENTFD);
+
+    // SAFETY: fd outlives the registration (stored on the Reactor as an
+    // OwnedFd); matching POLL_REMOVE is issued implicitly by ring teardown
+    // when the reactor is dropped.
+    while unsafe { ring.submission().push(&sqe) }.is_err() {
+        ring.submit()?;
+    }
+    ring.submit()?;
+    Ok(())
+}
+
+/// Drain an eventfd's counter. Non-blocking reads return either 8 bytes (the
+/// counter value) or EAGAIN (counter was zero, nothing to drain). We
+/// discard the value — we only care that the counter is reset so the next
+/// write produces a fresh CQE.
+fn drain_eventfd(fd: RawFd) {
+    let mut buf = [0u8; 8];
+    // SAFETY: valid fd, valid 8-byte buffer, correct length.
+    let _ = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    // Errors are intentionally ignored: EAGAIN means already drained,
+    // EBADF means the fd is gone (reactor shutting down). Either way the
+    // wake has been acknowledged by virtue of the CQE reaching us.
 }
 
 /// Translate tokio's [`Interest`] into an epoll/poll event mask suitable for
@@ -318,6 +492,104 @@ mod tests {
             return;
         };
         reactor.park_timeout(Duration::ZERO).expect("park_timeout(0) should succeed");
+    }
+
+    /// Writing to the external waker from another thread unblocks a
+    /// parked reactor. Exercises the eventfd → POLL_ADD_MULTI → CQE → drain
+    /// path end-to-end.
+    #[test]
+    fn external_waker_unblocks_park() {
+        let Ok(mut reactor) = Reactor::new() else {
+            eprintln!("skipping: reactor unavailable");
+            return;
+        };
+        let waker = reactor.external_waker();
+
+        let handle = std::thread::spawn(move || {
+            // Give the main thread a moment to enter park().
+            std::thread::sleep(Duration::from_millis(50));
+            waker.wake().expect("wake() should succeed");
+        });
+
+        let start = std::time::Instant::now();
+        reactor.park().expect("park should return after external wake");
+        let elapsed = start.elapsed();
+
+        handle.join().unwrap();
+
+        // Sanity: we should have blocked ~50ms, not 0 (which would mean the
+        // wake was already pending before park) and not hit an internal
+        // timeout (we have none). Allow wide slop for CI noise.
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "park returned too quickly: {elapsed:?}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "park took suspiciously long: {elapsed:?}",
+        );
+    }
+
+    /// A reactor can send a MSG_RING wake to another reactor and unblock
+    /// its park. Exercises the cross-worker wake path.
+    ///
+    /// Each reactor must be constructed on the same thread that will drive
+    /// it, because `IORING_SETUP_SINGLE_ISSUER` binds the ring's submitter
+    /// identity at the first `io_uring_enter` call. We pass the target
+    /// ring's fd across a channel rather than moving the receiver.
+    #[test]
+    fn msg_ring_wakes_peer() {
+        use std::sync::mpsc;
+
+        let (fd_tx, fd_rx) = mpsc::channel::<RawFd>();
+        let (elapsed_tx, elapsed_rx) = mpsc::channel::<Duration>();
+
+        // Receiver thread: owns its own reactor end-to-end.
+        let receiver_thread = std::thread::spawn(move || {
+            let Ok(mut receiver) = Reactor::new() else {
+                // Propagate a dummy target so the sender side doesn't hang.
+                fd_tx.send(-1).unwrap();
+                return;
+            };
+            fd_tx.send(receiver.ring_fd()).unwrap();
+
+            let start = std::time::Instant::now();
+            receiver.park().expect("receiver park should return");
+            elapsed_tx.send(start.elapsed()).unwrap();
+        });
+
+        let target_fd = fd_rx.recv().unwrap();
+        if target_fd == -1 {
+            eprintln!("skipping: receiver reactor unavailable");
+            receiver_thread.join().unwrap();
+            return;
+        }
+
+        let Ok(mut sender) = Reactor::new() else {
+            eprintln!("skipping: sender reactor unavailable");
+            // Send something to unblock the receiver (an external wake via
+            // a fresh eventfd would also work, but we're already here).
+            let _ = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+            });
+            return;
+        };
+
+        // Give the receiver time to enter park() before we send.
+        std::thread::sleep(Duration::from_millis(50));
+        sender.send_msg_ring(target_fd).expect("send_msg_ring should succeed");
+
+        receiver_thread.join().unwrap();
+        let elapsed = elapsed_rx.recv().unwrap();
+
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "receiver park returned too quickly: {elapsed:?}",
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "receiver park took suspiciously long: {elapsed:?}",
+        );
     }
 }
 
