@@ -424,6 +424,29 @@ pub(crate) enum TimerFlavor {
     Alternative,
 }
 
+/// Selects the I/O driver used by the multi-thread runtime.
+///
+/// `Traditional` is the default: a single shared `IoStack` (mio/epoll on Linux)
+/// is contended for by workers via `TryLock<Driver>`.
+///
+/// `UringPerWorker` (experimental, Linux-only, `--cfg tokio_unstable` +
+/// feature = "io-uring-reactor") gives each worker its own io_uring ring so
+/// readiness is polled and dispatched per-worker. Requires
+/// `TimerFlavor::Alternative` (per-worker timer wheels) to be useful — the
+/// builder enforces this when the knob is flipped.
+#[allow(dead_code)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub(crate) enum IoFlavor {
+    Traditional,
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    UringPerWorker,
+}
+
 cfg_time! {
     pub(crate) mod time;
 

@@ -2,7 +2,7 @@
 
 use crate::runtime::handle::Handle;
 use crate::runtime::{
-    blocking, driver, Callback, HistogramBuilder, Runtime, TaskCallback, TimerFlavor,
+    blocking, driver, Callback, HistogramBuilder, IoFlavor, Runtime, TaskCallback, TimerFlavor,
 };
 #[cfg(tokio_unstable)]
 use crate::runtime::{metrics::HistogramConfiguration, TaskMeta};
@@ -142,6 +142,8 @@ pub struct Builder {
     pub(super) unhandled_panic: UnhandledPanic,
 
     timer_flavor: TimerFlavor,
+
+    io_flavor: IoFlavor,
 
     /// Whether or not to enable eager hand-off for the I/O and time drivers (in
     /// `tokio_unstable`).
@@ -339,6 +341,8 @@ impl Builder {
 
             timer_flavor: TimerFlavor::Traditional,
 
+            io_flavor: IoFlavor::Traditional,
+
             // Eager driver handoff is disabled by default.
             enable_eager_driver_handoff: false,
         }
@@ -418,6 +422,46 @@ impl Builder {
     pub fn enable_alt_timer(&mut self) -> &mut Self {
         self.enable_time();
         self.timer_flavor = TimerFlavor::Alternative;
+        self
+    }
+
+    /// Enables the experimental per-worker `io_uring` reactor, replacing
+    /// `mio`/`epoll` as the I/O readiness driver on Linux.
+    ///
+    /// When this option is enabled, each multi-thread runtime worker owns its
+    /// own `io_uring` ring and drives readiness (via `POLL_ADD_MULTI`)
+    /// independently of the other workers. Cross-worker wakeups are delivered
+    /// via `IORING_OP_MSG_RING`; wakeups from threads outside the runtime are
+    /// delivered via an `eventfd`.
+    ///
+    /// This option only applies to multi-threaded runtimes. It implicitly
+    /// enables I/O as well as [`Builder::enable_alt_timer`] — a per-worker
+    /// timer wheel is required to avoid re-introducing the shared driver lock
+    /// that this mode is designed to eliminate.
+    ///
+    /// Requires Linux 6.0+ (for `IORING_SETUP_DEFER_TASKRUN` maturity) and is
+    /// gated behind the `io-uring-reactor` Cargo feature + `--cfg
+    /// tokio_unstable`.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        )))
+    )]
+    pub fn enable_uring_reactor(&mut self) -> &mut Self {
+        self.enable_io();
+        self.enable_time();
+        self.timer_flavor = TimerFlavor::Alternative;
+        self.io_flavor = IoFlavor::UringPerWorker;
         self
     }
 
@@ -1893,6 +1937,7 @@ cfg_rt_multi_thread! {
                     metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
                 },
                 self.timer_flavor,
+                self.io_flavor,
                 self.name.clone(),
             );
 

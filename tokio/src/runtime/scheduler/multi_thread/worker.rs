@@ -64,7 +64,8 @@ use crate::runtime::scheduler::multi_thread::{
 use crate::runtime::scheduler::{inject, Defer, Lock};
 use crate::runtime::task::OwnedTasks;
 use crate::runtime::{
-    blocking, driver, scheduler, task, Config, SchedulerMetrics, TimerFlavor, WorkerMetrics,
+    blocking, driver, scheduler, task, Config, IoFlavor, SchedulerMetrics, TimerFlavor,
+    WorkerMetrics,
 };
 use crate::runtime::{context, TaskHooks};
 use crate::task::coop;
@@ -265,6 +266,7 @@ pub(super) fn create(
     seed_generator: RngSeedGenerator,
     config: Config,
     timer_flavor: TimerFlavor,
+    io_flavor: IoFlavor,
     name: Option<String>,
 ) -> (Arc<Handle>, Launch) {
     let mut cores = Vec::with_capacity(size);
@@ -330,6 +332,7 @@ pub(super) fn create(
         blocking_spawner,
         seed_generator,
         timer_flavor,
+        io_flavor,
         #[cfg(all(tokio_unstable, feature = "time"))]
         is_shutdown: AtomicBool::new(false),
     });

@@ -41,7 +41,7 @@ use crate::loom::sync::Arc;
 use crate::runtime::{
     blocking,
     driver::{self, Driver},
-    scheduler, Config, TimerFlavor,
+    scheduler, Config, IoFlavor, TimerFlavor,
 };
 use crate::util::RngSeedGenerator;
 
@@ -63,6 +63,7 @@ impl MultiThread {
         seed_generator: RngSeedGenerator,
         config: Config,
         timer_flavor: TimerFlavor,
+        io_flavor: IoFlavor,
         name: Option<String>,
     ) -> (MultiThread, Arc<Handle>, Launch) {
         let parker = Parker::new(driver);
@@ -74,6 +75,7 @@ impl MultiThread {
             seed_generator,
             config,
             timer_flavor,
+            io_flavor,
             name,
         );
 

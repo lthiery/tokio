@@ -5,7 +5,7 @@ use crate::runtime::task::{Notified, Task, TaskHarnessScheduleHooks};
 use crate::runtime::{
     blocking, driver,
     task::{self, JoinHandle, SpawnLocation},
-    TaskHooks, TaskMeta, TimerFlavor,
+    IoFlavor, TaskHooks, TaskMeta, TimerFlavor,
 };
 use crate::util::RngSeedGenerator;
 
@@ -44,6 +44,14 @@ pub(crate) struct Handle {
     #[cfg_attr(not(feature = "time"), allow(dead_code))]
     /// Timer flavor used by the runtime
     pub(crate) timer_flavor: TimerFlavor,
+
+    /// I/O driver flavor selected by the runtime builder.
+    ///
+    /// `IoFlavor::Traditional` preserves the historical shared-`IoStack`
+    /// (`mio`/`epoll`) path. `IoFlavor::UringPerWorker` (when compiled in) is
+    /// the experimental per-worker `io_uring` reactor. See [`IoFlavor`].
+    #[allow(dead_code)]
+    pub(crate) io_flavor: IoFlavor,
 
     #[cfg(all(tokio_unstable, feature = "time"))]
     /// Indicates that the runtime is shutting down.
