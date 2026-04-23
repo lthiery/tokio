@@ -64,12 +64,35 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// Submission queue depth. Per-worker, so small is fine.
-const SQ_ENTRIES: u32 = 512;
+/// Submission queue depth. Per-worker, so small is fine: the steady-state
+/// SQE rate is dominated by one POLL_ADD_MULTI per registered fd (submitted
+/// once, lives until dereg) plus a handful of per-park control ops. A worker
+/// with dozens of live registrations stages well under 64 SQEs between
+/// submissions.
+///
+/// Sized at 128 — a comfortable 2–4× over observed peaks in
+/// `net_uring_bench.rs`. The prior 512 was needlessly large and, combined
+/// with the oversized CQ below, pinned ~160 KB per ring; under 4-way
+/// parallel test execution (`cargo test --test-threads=4`, 8 concurrent
+/// workers cold-starting rings together) that sizing pushed the kernel
+/// slab allocator into contention, causing individual `io_uring_setup`
+/// calls to take 10–18 ms and several to return `-ENOMEM` outright. See
+/// the bpftrace analysis captured during the `tcp_read_blocks_then_wakes`
+/// flake investigation for the evidence.
+const SQ_ENTRIES: u32 = 128;
 
-/// Completion queue depth. Sized larger than the SQ to absorb bursts during
-/// slow drains (4× the io_uring default of 2048).
-const CQ_ENTRIES: u32 = 8192;
+/// Completion queue depth. Sized to absorb peak CQE bursts without
+/// overflowing — level-triggered `POLL_ADD_MULTI` can fire repeatedly for
+/// the same fd while data is available, so CQE occupancy under fan-out
+/// load (see `tcp_many_concurrent_connections`, 64 live sockets + rapid
+/// read/write flips) can briefly exceed 1024 entries between park cycles.
+/// 4096 keeps a comfortable overflow margin while still halving the prior
+/// 8192 sizing (saving 64 KB of locked memory per ring). Kernel overflow
+/// recovery via `IORING_FEAT_NODROP` is a correctness fallback, not a
+/// performance one: once the CQ overflows, `submit` paths return `-EBUSY`
+/// and we observe hangs in the multishot-POLL drain path — so we stay
+/// generously above the working-set size.
+const CQ_ENTRIES: u32 = 4096;
 
 // ===== user_data variant tags =====
 
