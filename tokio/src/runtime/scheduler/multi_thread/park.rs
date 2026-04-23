@@ -230,6 +230,25 @@ impl WorkerParker {
             WorkerParker::Uring(p) => p.shutdown(handle),
         }
     }
+
+    /// Called once per worker at the top of `worker::run`, before any task
+    /// is polled. For the uring flavor this builds the per-worker reactor
+    /// (which must happen on the worker's own thread because of
+    /// `IORING_SETUP_SINGLE_ISSUER`) and then blocks until all sibling
+    /// workers have done the same. For the traditional flavor there is no
+    /// per-worker state to build, so this is a no-op.
+    pub(crate) fn eager_startup_sync(&mut self) {
+        match self {
+            WorkerParker::Traditional(_) => {}
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            WorkerParker::Uring(p) => p.eager_init_and_sync(),
+        }
+    }
 }
 
 // Only the traditional variant can be produced by cloning a `Parker`. Uring

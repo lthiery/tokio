@@ -148,6 +148,27 @@ pub(crate) struct UringHandle {
     pub(super) synced: Mutex<registration_set::Synced>,
 
     pub(crate) metrics: IoDriverMetrics,
+
+    /// Per-runtime startup barrier. Every worker waits here after building
+    /// its reactor and before entering the scheduler loop, so that task
+    /// polling on all workers begins at the same wall-clock moment.
+    ///
+    /// Why: without this barrier, cold-start differentials between workers
+    /// (e.g. worker 0 initializes first and starts polling before worker 3
+    /// has finished its `io_uring_setup`) produce observable clock skew in
+    /// tests that measure durations across workers. See the analysis in
+    /// `tcp_read_blocks_then_wakes` — the server's sleep clock would start
+    /// before the client's `Instant::now`, making `elapsed` under-estimate
+    /// the real sleep duration. The barrier collapses that window to
+    /// (approximately) the monotonic clock's resolution.
+    ///
+    /// Sized to `num_workers` at construction. `std::sync::Barrier` is
+    /// reusable, but we only use the first trip; it has no shutdown mode,
+    /// so correctness requires that every worker thread reaches the
+    /// barrier. The multi-thread scheduler's `launch` path spawns exactly
+    /// `num_workers` blocking tasks and each calls [`Self::wait_for_start`]
+    /// at the top of `worker::run`, satisfying that requirement.
+    start_barrier: std::sync::Barrier,
 }
 
 impl std::fmt::Debug for UringHandle {
@@ -165,13 +186,25 @@ impl UringHandle {
             workers.push(WorkerState::new());
         }
         let (registrations, synced) = RegistrationSet::new();
+        // Barrier must have at least 1 participant; a handle with zero
+        // workers is degenerate but we keep it constructible for tests.
+        let barrier_count = num_workers.max(1);
         Self {
             workers: workers.into_boxed_slice(),
             next_worker: AtomicUsize::new(0),
             registrations,
             synced: Mutex::new(synced),
             metrics: IoDriverMetrics::default(),
+            start_barrier: std::sync::Barrier::new(barrier_count),
         }
+    }
+
+    /// Block until every sibling worker has also reached this call. Used
+    /// exactly once per worker at startup, after the reactor has been
+    /// built and published but before the worker enters its task loop.
+    /// See `start_barrier` field docs for rationale.
+    pub(crate) fn wait_for_start(&self) {
+        self.start_barrier.wait();
     }
 
     /// Number of workers this handle serves.

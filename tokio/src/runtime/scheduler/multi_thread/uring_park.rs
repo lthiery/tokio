@@ -266,6 +266,28 @@ impl UringParker {
         }
     }
 
+    /// Build the reactor on the current thread (required for
+    /// `IORING_SETUP_SINGLE_ISSUER`) and then block until every sibling
+    /// worker has done the same. Intended to be called once, at the top of
+    /// the scheduler's worker entry point, before any task is polled.
+    ///
+    /// Without this, workers race to initialize their rings: worker 0 may
+    /// start polling tasks while worker 3's `io_uring_setup` is still in
+    /// progress. Tests that observe durations across workers (e.g.
+    /// `tcp_read_blocks_then_wakes`, which times a server's sleep from the
+    /// client's perspective) see the resulting wall-clock skew as spurious
+    /// failures. The startup barrier in [`UringHandle`] collapses that
+    /// skew to roughly the monotonic clock's resolution.
+    ///
+    /// `ensure_reactor_installed` remains callable from the lazy
+    /// first-park path so a parker that was never given an eager-init
+    /// opportunity (e.g. isolated unit tests that drive `park` directly)
+    /// still initializes correctly on first use.
+    pub(crate) fn eager_init_and_sync(&mut self) {
+        self.ensure_reactor_installed();
+        self.handle.wait_for_start();
+    }
+
     /// Lazy-initialize the reactor and install it into the thread-local
     /// `LOCAL_REACTOR` slot. Idempotent — subsequent calls are no-ops.
     ///

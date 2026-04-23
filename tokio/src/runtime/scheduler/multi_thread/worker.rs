@@ -627,10 +627,23 @@ fn run(worker: Arc<Worker>) {
 
     // Acquire a core. If this fails, then another thread is running this
     // worker and there is nothing further to do.
-    let core = match worker.core.take() {
+    let mut core = match worker.core.take() {
         Some(core) => core,
         None => return,
     };
+
+    // Eager per-worker startup. For the uring flavor this builds the
+    // per-worker reactor (on this thread, as required by
+    // `IORING_SETUP_SINGLE_ISSUER`) under a process-wide setup permit, and
+    // then waits on a per-runtime barrier until every sibling worker has
+    // also reached this point. This synchronizes the "starting line" so
+    // that cross-worker duration measurements (see the analysis on
+    // `tcp_read_blocks_then_wakes`) aren't skewed by which worker
+    // finished its cold-start first. For the traditional mio/epoll flavor
+    // this is a no-op.
+    if let Some(parker) = core.park.as_mut() {
+        parker.eager_startup_sync();
+    }
 
     worker.handle.shared.worker_metrics[worker.index].set_thread_id(thread::current().id());
 

@@ -94,6 +94,32 @@ const SQ_ENTRIES: u32 = 128;
 /// generously above the working-set size.
 const CQ_ENTRIES: u32 = 4096;
 
+/// Process-wide permit for `io_uring_setup`.
+///
+/// Expressed as a 1-permit semaphore (a `Mutex<()>`). With one permit,
+/// setup calls are fully serialized; raising the permit count to N would
+/// let N setups proceed concurrently. One is the right default because
+/// concurrent setup is exactly what drives the contention we want to
+/// avoid — high-order page allocations (after our ring-size shrink:
+/// order-2 for the SQ, order-5 for the CQ) via
+/// `__get_free_pages(__GFP_NOWARN | __GFP_RETRY_MAYFAIL)` start failing
+/// or stalling when several rings compete for the buddy allocator at the
+/// same time. Under `cargo test --test-threads=4` we measured individual
+/// `io_uring_setup` calls taking 10–18 ms and some returning `-ENOMEM`.
+///
+/// The permit is held only for the `build()` call itself. Setup happens
+/// once per worker at runtime startup and never again, so there is no
+/// steady-state cost. Serialization shifts the cold-start cost from
+/// "concurrent and quadratic in worker count" to "serial and linear",
+/// which is a win on both total wall time and tail latency.
+///
+/// Note that this serialization is deliberately process-wide, not
+/// per-runtime: the contention is on kernel resources shared across all
+/// io_uring instances on the host, so a per-runtime lock would not catch
+/// the cross-runtime case (multiple `#[tokio::test]` suites, multiple
+/// in-process runtimes, etc.).
+static RING_SETUP_PERMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ===== user_data variant tags =====
 
 /// Multi-shot `POLL_ADD` registration. The hot path.
@@ -280,12 +306,22 @@ impl Reactor {
     /// thread and moving it to another will cause subsequent `park()` calls
     /// to fail with `EEXIST`.
     pub(crate) fn new() -> io::Result<Self> {
-        let mut ring = IoUring::builder()
-            .setup_single_issuer()
-            .setup_defer_taskrun()
-            .setup_coop_taskrun()
-            .setup_cqsize(CQ_ENTRIES)
-            .build(SQ_ENTRIES)?;
+        // Acquire the process-wide `io_uring_setup` permit. Released when
+        // the scoped guard drops at the end of this block. `PoisonError`
+        // is ignored: the permit only guards the build call, so a prior
+        // panicked holder leaves no partial state behind. See
+        // `RING_SETUP_PERMIT` docs for rationale.
+        let mut ring = {
+            let _permit = RING_SETUP_PERMIT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            IoUring::builder()
+                .setup_single_issuer()
+                .setup_defer_taskrun()
+                .setup_coop_taskrun()
+                .setup_cqsize(CQ_ENTRIES)
+                .build(SQ_ENTRIES)?
+        };
 
         let external_wake_fd = make_eventfd()?;
 
