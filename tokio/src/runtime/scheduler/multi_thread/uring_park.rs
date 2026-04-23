@@ -275,11 +275,18 @@ impl UringParker {
             return;
         }
 
-        let reactor = Reactor::new().expect(
+        let mut reactor = Reactor::new().expect(
             "failed to construct per-worker io_uring Reactor; \
              kernel must support io_uring with SINGLE_ISSUER + DEFER_TASKRUN \
              (Linux 6.0+)",
         );
+
+        // Publish our worker index onto the reactor so its drain loop
+        // can recognize readiness CQEs whose owning registration has
+        // been rebound to a peer (v2 lazy placement) and skip the wake
+        // — see the cross-thread kill-switch in
+        // `uring_reactor::Reactor::drain_completions`.
+        reactor.set_worker_index(self.idx as u32);
 
         // Publish ring_fd + external_waker so other threads can target us.
         self.handle
@@ -317,13 +324,17 @@ fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) {
     for op in pending {
         let _ = match op {
             PendingOp::Register { fd, interest, io } => reactor.register(fd, interest, &io),
-            // The reactor identifies the slab slot for this `io` via the
-            // `uring_slab_key` field that `register` stamped on it, then
-            // submits POLL_REMOVE. The Arc held inside the slab slot is
-            // dropped only when the kernel posts the terminal CQE for the
-            // multi-shot poll (no `IORING_CQE_F_MORE`); see
+            // The caller snapshotted the slab identity at queue time.
+            // `reactor.deregister` gen-checks this against the current slab
+            // state: a stale snapshot (the slot has been recycled, e.g. by
+            // a lazy rebind to another worker) is silently dropped rather
+            // than risking a mis-cancel. The Arc held inside the slab slot
+            // is released only when the kernel posts the terminal CQE for
+            // the multi-shot poll (no `IORING_CQE_F_MORE`); see
             // `uring_reactor::Reactor::deregister`.
-            PendingOp::Deregister { io } => reactor.deregister(io),
+            PendingOp::Deregister { slab_key, slab_gen } => {
+                reactor.deregister(slab_key, slab_gen)
+            }
         };
     }
 }

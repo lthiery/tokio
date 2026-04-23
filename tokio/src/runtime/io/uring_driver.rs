@@ -73,9 +73,13 @@ pub(crate) enum PendingOp {
         interest: Interest,
         io: Arc<ScheduledIo>,
     },
-    /// Submit a POLL_REMOVE matching the slab slot recorded on `io`. The
-    /// slot's Arc is released by the reactor on the terminal CQE, not here.
-    Deregister { io: Arc<ScheduledIo> },
+    /// Submit a POLL_REMOVE for the slab slot identified by `(slab_key,
+    /// slab_gen)`. The snapshot is taken at the time the pending op is
+    /// queued; a stale request (slot recycled by a rebind before the owning
+    /// worker drains its queue) is detected by gen-check inside
+    /// `Reactor::deregister` and silently ignored. The slab entry's Arc is
+    /// released by the reactor on the terminal CQE, not here.
+    Deregister { slab_key: u32, slab_gen: u32 },
 }
 
 /// Per-worker coordination slot. One of these per worker, indexed by worker
@@ -294,6 +298,12 @@ impl UringHandle {
 
         let worker_idx = self.fallback_worker();
 
+        // Publish the assigned worker onto the ScheduledIo so that v2 lazy
+        // placement can observe "which worker currently owns this ring
+        // registration" on every poll without touching the handle.
+        io.uring_worker
+            .store(worker_idx as u32, Ordering::Relaxed);
+
         {
             let slot = &self.workers[worker_idx];
             let mut queue = slot.pending_ops.lock();
@@ -342,12 +352,19 @@ impl UringHandle {
         // Queue the POLL_REMOVE first so that if the caller races with
         // shutdown, the kernel-side cleanup still lands before the Arc is
         // freed. The worker drains this at its next park() call.
+        //
+        // We snapshot the slab identity at push time so that a later rebind
+        // (which re-stamps `uring_slab_key`/`uring_gen`) cannot confuse the
+        // worker into cancelling the wrong slot. If the snapshot is already
+        // stale (e.g. the resource was never registered, or was migrated
+        // between `add_source` and `deregister_source`), the reactor's
+        // gen-check in `Reactor::deregister` will drop the request silently.
         if worker_idx < self.workers.len() {
+            let slab_key = io.uring_slab_key.load(Ordering::Relaxed);
+            let slab_gen = io.uring_gen.load(Ordering::Relaxed);
             let slot = &self.workers[worker_idx];
             let mut queue = slot.pending_ops.lock();
-            queue.push(PendingOp::Deregister {
-                io: Arc::clone(io),
-            });
+            queue.push(PendingOp::Deregister { slab_key, slab_gen });
         }
 
         // Mark the registration for release; the worker-side drain of
@@ -368,6 +385,162 @@ impl UringHandle {
 
         self.metrics.dec_fd_count();
         Ok(())
+    }
+
+    /// Sentinel stored in `ScheduledIo::uring_worker` while a rebind is
+    /// in flight: it holds the CAS token that another caller can observe
+    /// to bail out of a concurrent rebind attempt on the same resource.
+    /// Distinct from `u32::MAX` ("never registered") so the deregister
+    /// path can tell them apart.
+    const REBINDING_MARKER: u32 = u32::MAX - 1;
+}
+
+impl UringHandle {
+    /// Move a live registration from its current owning worker to the
+    /// caller's own worker. The caller **must** be executing on the
+    /// target worker thread (i.e. [`uring_park::current_worker_index`]
+    /// returns `Some(worker_idx)`), so that `with_local_reactor` can
+    /// submit the new `POLL_ADD_MULTI` on the correct ring.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Atomically claim the `ScheduledIo::uring_worker` slot via a CAS
+    ///    from `old_worker` to the [`REBINDING_MARKER`] sentinel.
+    ///    Concurrent rebind attempts on the same resource observe the
+    ///    marker (or the already-settled new worker) and bail out — so
+    ///    we never register the same fd on multiple rings in parallel.
+    /// 2. Snapshot the old `(slab_key, slab_gen)` off the `ScheduledIo`.
+    /// 3. Call `Reactor::register` locally — this allocates a new slab
+    ///    slot on the caller's ring and re-stamps `uring_slab_key`
+    ///    and `uring_gen` on the resource.
+    /// 4. Publish the new worker index to `ScheduledIo::uring_worker`,
+    ///    clearing the rebinding marker with `Release` ordering.
+    /// 5. Fire a MSG_RING to the old worker's ring carrying the
+    ///    snapshotted `(old_gen, old_key)` so the old worker tears down
+    ///    its stale multi-shot POLL. Gen-checked on arrival.
+    ///
+    /// On any non-recoverable error we try to restore `uring_worker` to
+    /// the old value so the resource is not left pointing at the
+    /// rebinding-marker sentinel.
+    ///
+    /// Returns `Ok(true)` if a rebind actually happened, `Ok(false)` if
+    /// the registration was already on the target worker or a racing
+    /// rebind won the CAS.
+    #[allow(dead_code)]
+    pub(crate) fn rebind_source(
+        &self,
+        io: &Arc<ScheduledIo>,
+        fd: RawFd,
+        interest: Interest,
+        target_worker: usize,
+    ) -> io::Result<bool> {
+        use crate::runtime::io::uring_driver;
+
+        debug_assert!(
+            target_worker < self.workers.len(),
+            "rebind_source target_worker {target_worker} out of range",
+        );
+
+        // Load the current owning worker. Relaxed is sufficient: the only
+        // cross-thread ordering that matters is between our new
+        // registration (published via the CAS below) and the peer's
+        // reception of the MSG_RING cross-deregister, and that is ordered
+        // by the kernel-side CQE post on the peer's ring.
+        let old_worker = io.uring_worker.load(Ordering::Relaxed);
+        if old_worker as usize == target_worker {
+            // Already bound here — nothing to do.
+            return Ok(false);
+        }
+        if old_worker == u32::MAX {
+            // Never fully registered (or already released). Skip — the
+            // normal registration / deregistration path handles these.
+            return Ok(false);
+        }
+        if old_worker == Self::REBINDING_MARKER {
+            // Another poller on this resource is mid-rebind. Let them
+            // finish; we'll pick up the new value on the next poll.
+            return Ok(false);
+        }
+
+        // Claim exclusive rebind via CAS. If another thread beat us to
+        // it, yield: they'll land the registration on some worker (maybe
+        // this one, maybe another), and we'll reconcile on the next
+        // poll.
+        match io.uring_worker.compare_exchange(
+            old_worker,
+            Self::REBINDING_MARKER,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {}
+            Err(_) => return Ok(false),
+        }
+
+        // Snapshot the old slab identity *before* the new register
+        // overwrites these atomics.
+        let old_slab_key = io.uring_slab_key.load(Ordering::Relaxed);
+        let old_slab_gen = io.uring_gen.load(Ordering::Relaxed);
+
+        // Register on the local (target) ring. `with_local_reactor` is
+        // guaranteed to return `Some` here because the caller must be on
+        // a worker thread with the reactor installed — debug_assert in
+        // the None branch for clarity.
+        let register_result = uring_driver::with_local_reactor(|reactor| {
+            reactor.register(fd, interest, io)
+        });
+        let register_result = match register_result {
+            Some(r) => r,
+            None => {
+                // Not on a worker — caller-side invariant violation.
+                // Restore old worker so the resource isn't stuck in
+                // REBINDING_MARKER.
+                io.uring_worker.store(old_worker, Ordering::Release);
+                debug_assert!(
+                    false,
+                    "rebind_source called off-worker (no LOCAL_REACTOR)",
+                );
+                return Ok(false);
+            }
+        };
+
+        if let Err(e) = register_result {
+            // Registration failed. Restore the old worker pointer so the
+            // resource remains usable — the peer's multi-shot POLL is
+            // still live and will still deliver readiness.
+            io.uring_worker.store(old_worker, Ordering::Release);
+            return Err(e);
+        }
+
+        // Publish the new worker. `Release` pairs with any `Acquire` read
+        // by a subsequent poller observing the new binding.
+        io.uring_worker
+            .store(target_worker as u32, Ordering::Release);
+
+        // Fire a cross-ring deregister at the old owner. MSG_RING gets
+        // flushed immediately; the peer observes a
+        // `VARIANT_CROSS_DEREGISTER` CQE on its ring and submits its
+        // local `POLL_REMOVE` inside its own drain loop.
+        let old_ring_fd = self.workers[old_worker as usize]
+            .ring_fd
+            .load(Ordering::Acquire);
+        if old_ring_fd >= 0 {
+            let sent = uring_driver::with_local_reactor(|reactor| {
+                reactor.send_msg_ring_deregister(old_ring_fd, old_slab_gen, old_slab_key)
+            });
+            match sent {
+                Some(Ok(())) | None => {}
+                Some(Err(_e)) => {
+                    // Best-effort — peer is left with a dormant multi-shot
+                    // POLL. Not fatal: when the peer next drains, it will
+                    // still deliver readiness to the (now rebound) resource,
+                    // which is correct (the new owner's POLL will also fire,
+                    // so readiness is over-delivered — harmless spurious
+                    // wake by the registration's documented contract).
+                }
+            }
+        }
+
+        Ok(true)
     }
 
     /// Drain and return the pending-ops queue for `worker_idx`. Intended to

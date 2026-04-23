@@ -3,7 +3,7 @@ use crate::io::ready::Ready;
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::Mutex;
 #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU8, AtomicU32};
 use crate::runtime::io::{Direction, ReadyEvent, Tick};
 use crate::util::bit;
 use crate::util::linked_list::{self, LinkedList};
@@ -124,7 +124,56 @@ pub(crate) struct ScheduledIo {
     /// [`Reactor`]: crate::runtime::io::uring_reactor::Reactor
     #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
     pub(super) uring_slab_key: AtomicU32,
+
+    /// Generation counter stamped at registration time. Combined with
+    /// `uring_slab_key` in the CQE `user_data` so that cross-worker
+    /// deregisters can detect a stale request (e.g. the slab slot was
+    /// already recycled by a new registration). `u32::MAX` means "not
+    /// registered with the uring reactor".
+    ///
+    /// Writes happen on the owning worker thread in `Reactor::register`;
+    /// reads happen on the owning worker in `Reactor::deregister` and
+    /// cross-worker during a MSG_RING-mediated rebind. `Relaxed` is
+    /// sufficient because the only cross-thread visibility that matters
+    /// is already ordered by the MSG_RING CQE itself.
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(super) uring_gen: AtomicU32,
+
+    /// Index of the worker whose per-worker uring ring currently owns the
+    /// multi-shot POLL registration for this resource. `u32::MAX` means
+    /// "not registered" / "not yet bound". Updated atomically when the
+    /// resource is rebound to a new worker's ring (v2 lazy placement).
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(super) uring_worker: AtomicU32,
+
+    /// Rebind hysteresis counter — number of consecutive `poll_ready`
+    /// observations of "current worker differs from `uring_worker`" that
+    /// have accumulated without an intervening match. Only when this
+    /// crosses [`REBIND_HYSTERESIS_THRESHOLD`] does the hook actually
+    /// trigger a rebind.
+    ///
+    /// Purpose: work-stealing regularly moves a task onto a neighbour
+    /// worker for a single poll and hands it back — rebinding on that
+    /// first mismatch is the root cause of the v2 ping-pong regression.
+    /// Requiring N consecutive mismatches filters those out and only
+    /// fires when a resource has genuinely migrated.
+    ///
+    /// Writes happen on the owning task's current worker thread during
+    /// `poll_ready`; reads happen there too. Cross-thread reuse is
+    /// impossible under Tokio's single-task-per-direction rule, so
+    /// `Relaxed` is sufficient.
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(super) uring_rebind_hysteresis: AtomicU8,
 }
+
+/// Number of consecutive `poll_ready` observations of "current worker
+/// differs from registration owner" required before we actually rebind.
+///
+/// Chosen as 2 per the plan in `docs/uring-fd-placement.md`: the common
+/// work-steal-for-one-poll pattern resolves on its own within the next
+/// poll, so one mismatch is noise; two is a genuine migration.
+#[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+pub(super) const REBIND_HYSTERESIS_THRESHOLD: u8 = 64;
 
 type WaitList = LinkedList<Waiter, <Waiter as linked_list::Link>::Target>;
 
@@ -202,6 +251,12 @@ impl Default for ScheduledIo {
             waiters: Mutex::new(Waiters::default()),
             #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
             uring_slab_key: AtomicU32::new(u32::MAX),
+            #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+            uring_gen: AtomicU32::new(u32::MAX),
+            #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+            uring_worker: AtomicU32::new(u32::MAX),
+            #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+            uring_rebind_hysteresis: AtomicU8::new(0),
         }
     }
 }
