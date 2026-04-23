@@ -258,29 +258,27 @@ impl UringHandle {
     /// Register a raw fd for readiness notifications.
     ///
     /// Allocates a [`ScheduledIo`] from the shared registration set, picks a
-    /// worker to host the registration, and queues a [`PendingOp::Register`]
-    /// on that worker. The worker submits the actual `POLL_ADD_MULTI` SQE on
-    /// its next trip through park() (we unpark it here so that happens
+    /// worker via round-robin, and queues a [`PendingOp::Register`] on that
+    /// worker. The worker submits the actual `POLL_ADD_MULTI` SQE on its
+    /// next trip through park() (we unpark it here so that happens
     /// immediately).
     ///
     /// # Placement policy
     ///
-    /// On a work-stealing runtime, we want the ring that owns a fd's
-    /// registration (`W_ring`) to be the ring that also runs the task
-    /// awaiting it (`W_task`). When the two match, the wake path is
-    /// push-to-local-LIFO with zero syscalls; when they diverge, at worst
-    /// we pay a cross-worker `MSG_RING` and park→unpark round-trip.
+    /// Round-robin across rings via [`Self::fallback_worker`]. This keeps
+    /// CQE drain load and ring-queue depth roughly balanced across workers,
+    /// which is the right default when the eventual `W_task` is unknown at
+    /// registration time.
     ///
-    /// So: if the caller is currently executing on a worker thread, prefer
-    /// *that* worker. Tasks overwhelmingly register fds as part of their
-    /// own execution (e.g., `TcpStream::connect().await`), so the executing
-    /// worker is the best available predictor of where the registration
-    /// will be awaited next.
-    ///
-    /// Fall back to a round-robin counter only when the caller is off-worker
-    /// (external threads, `spawn_blocking` pools, main-thread `block_on`
-    /// initialization, etc.) — for those the current worker is unknown and
-    /// load-balancing across rings is a reasonable default.
+    /// Task-local placement (`W_ring == W_task`) is addressed by v2 *lazy
+    /// re-registration*: on first poll from a worker whose index differs
+    /// from `ScheduledIo::registered_on`, the fd is migrated to the polling
+    /// worker's ring. That moves locality decisions from "predict where the
+    /// task will run at registration time" (v1, ineffective in the presence
+    /// of `tokio::spawn` distribution) to "observe where the task actually
+    /// polls" (v2), which is correct for every caller shape — including the
+    /// listener + `tokio::spawn(handler)` pattern that dominates
+    /// `net_uring_bench.rs`.
     ///
     /// Returns the allocated `Arc<ScheduledIo>` together with the assigned
     /// worker index. Callers must remember the index and pass it back into
@@ -294,7 +292,7 @@ impl UringHandle {
     ) -> io::Result<(Arc<ScheduledIo>, usize)> {
         let io = self.registrations.allocate(&mut self.synced.lock())?;
 
-        let worker_idx = self.pick_worker();
+        let worker_idx = self.fallback_worker();
 
         {
             let slot = &self.workers[worker_idx];
@@ -315,41 +313,14 @@ impl UringHandle {
         Ok((io, worker_idx))
     }
 
-    /// Select a worker index for a new fd registration.
+    /// Pick a worker by round-robin across `next_worker`. `fetch_add` is
+    /// `Relaxed`: ordering of assignments does not affect correctness, only
+    /// balance, and we only need distinct calls to tend toward distinct
+    /// workers.
     ///
-    /// Prefer the current worker — see placement rationale on
-    /// [`Self::add_source`]. When the caller is not a worker thread, or
-    /// when the current worker index is out of range for this handle (which
-    /// would indicate a cross-runtime TLS leak — defensive but cheap to
-    /// check), fall back to a round-robin counter.
-    fn pick_worker(&self) -> usize {
-        // Locality-preferred path: register on the worker we're running on.
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring-reactor",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        {
-            if let Some(idx) =
-                crate::runtime::scheduler::multi_thread::uring_park::current_worker_index()
-            {
-                if idx < self.workers.len() {
-                    return idx;
-                }
-            }
-        }
-
-        self.fallback_worker()
-    }
-
-    /// Placement fallback when the calling thread is not a worker of this
-    /// handle. Round-robin over `next_worker` — equivalent to the historic
-    /// placement policy, but now scoped to the off-worker minority.
-    ///
-    /// `fetch_add` is `Relaxed`: ordering of assignments does not affect
-    /// correctness, only balance, and we only need distinct calls to tend
-    /// toward distinct workers.
+    /// Kept as a named helper (rather than inlined into `add_source`)
+    /// because the v2 re-registration path will call it when an fd needs
+    /// to be rebound to a different worker and we don't yet know which one.
     fn fallback_worker(&self) -> usize {
         self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len()
     }
