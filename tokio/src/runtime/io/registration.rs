@@ -137,34 +137,6 @@ cfg_io_driver! {
 
         /// Reference to state stored by the driver.
         shared: Arc<ScheduledIo>,
-
-        /// For the per-worker `io_uring` reactor: the raw fd under
-        /// registration, cached so a later *rebind* (v2 lazy placement)
-        /// can re-register the same fd on a different worker without
-        /// reaching back through the `RegistrationSource`. Meaningful only
-        /// when [`scheduler::Handle::uring_handle`] is `Some`.
-        ///
-        /// The underlying fd is owned by the caller's I/O resource (which
-        /// outlives this `Registration`), so caching the raw value is
-        /// sound.
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring-reactor",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        uring_fd: std::os::fd::RawFd,
-
-        /// Readiness interest this registration was installed with.
-        /// Snapshotted because rebinds must re-issue `POLL_ADD_MULTI` with
-        /// the same mask. `None` on the mio path / non-uring runtimes.
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring-reactor",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        uring_interest: Option<Interest>,
     }
 }
 
@@ -203,34 +175,12 @@ impl Registration {
         if let Some(uring) = handle.uring_handle() {
             let fd = io.registration_raw_fd();
             let (shared, _worker_idx) = uring.add_source(fd, interest)?;
-            return Ok(Registration {
-                handle,
-                shared,
-                uring_fd: fd,
-                uring_interest: Some(interest),
-            });
+            return Ok(Registration { handle, shared });
         }
 
         let shared = handle.driver().io().add_source(io, interest)?;
 
-        Ok(Registration {
-            handle,
-            shared,
-            #[cfg(all(
-                tokio_unstable,
-                feature = "io-uring-reactor",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
-            uring_fd: -1,
-            #[cfg(all(
-                tokio_unstable,
-                feature = "io-uring-reactor",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
-            uring_interest: None,
-        })
+        Ok(Registration { handle, shared })
     }
 
     /// Deregisters the I/O resource from the reactor it is associated with.
@@ -256,24 +206,17 @@ impl Registration {
             feature = "rt-multi-thread",
             target_os = "linux",
         ))]
-        if self.uring_interest.is_some() {
+        if let Some(uring) = self.handle.uring_handle() {
             // Unused `io` on the uring path: mio's `Registry::deregister`
             // is not involved — the worker will submit `POLL_REMOVE` on
             // its ring when it drains the pending-ops queue.
             let _ = io;
-            if let Some(uring) = self.handle.uring_handle() {
-                // Read the *current* owning worker off the `ScheduledIo`:
-                // a prior rebind may have moved the registration. A sentinel
-                // value (`u32::MAX` — not registered — or the in-flight
-                // rebind marker) is ignored by `deregister_source`.
-                let worker_idx = self
-                    .shared
-                    .uring_worker
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    as usize;
-                return uring.deregister_source(&self.shared, worker_idx);
-            }
-            return Ok(());
+            let worker_idx = self
+                .shared
+                .uring_worker
+                .load(std::sync::atomic::Ordering::Relaxed)
+                as usize;
+            return uring.deregister_source(&self.shared, worker_idx);
         }
 
         self.handle().deregister_source(&self.shared, io)
@@ -328,19 +271,6 @@ impl Registration {
         ready!(crate::trace::trace_leaf(cx));
         // Keep track of task budget
         let coop = ready!(crate::task::coop::poll_proceed(cx));
-
-        // v2 lazy placement hook. Gated by a hysteresis counter inside
-        // the `maybe_rebind_to_current_worker` implementation so that
-        // the common work-steal-for-one-poll pattern (which the
-        // scheduler resolves on its own within the next poll) does not
-        // trigger a cross-ring rebind. See `uring-fd-placement.md`.
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring-reactor",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        self.maybe_rebind_to_current_worker();
 
         let ev = ready!(self.shared.poll_readiness(cx, direction));
 
@@ -428,74 +358,6 @@ impl Registration {
 
     fn handle(&self) -> &Handle {
         self.handle.driver().io()
-    }
-
-    /// v2 lazy placement hook. If this registration's `POLL_ADD_MULTI` is
-    /// currently installed on a worker other than the one running the
-    /// calling task, re-register on the current worker and schedule a
-    /// cross-ring teardown of the old registration.
-    ///
-    /// Cheap in the common case — one atomic load plus a `usize` compare.
-    /// Rebind itself goes through an atomic CAS to single-issuer the
-    /// migration when two tasks share the same `Registration` across
-    /// read+write halves.
-    ///
-    /// Errors from the local re-register are intentionally swallowed: a
-    /// failed rebind leaves the resource on its previous worker, which
-    /// remains fully functional (just not task-local). The poll call
-    /// continues and will see readiness via the old ring's delivery path.
-    #[cfg(all(
-        tokio_unstable,
-        feature = "io-uring-reactor",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    fn maybe_rebind_to_current_worker(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-
-        let Some(interest) = self.uring_interest else {
-            // Mio-path registration under a non-uring runtime — nothing
-            // to do.
-            return;
-        };
-        let Some(current) =
-            crate::runtime::scheduler::multi_thread::uring_park::current_worker_index()
-        else {
-            // Not executing on a uring worker thread (e.g., polled from a
-            // LocalSet inside a blocking pool task). Leave the counter
-            // untouched — it'll resume tracking on the next worker-thread
-            // poll.
-            return;
-        };
-        // Fast-path compare without CAS: current owner already matches?
-        // Reset the hysteresis counter so that a transient ping does not
-        // accumulate across unrelated wake-ups.
-        let owner = self.shared.uring_worker.load(Relaxed);
-        if owner as usize == current {
-            self.shared.uring_rebind_hysteresis.store(0, Relaxed);
-            return;
-        }
-
-        // Accumulate a mismatch. Only when the same worker has seen
-        // `REBIND_HYSTERESIS_THRESHOLD` consecutive polls of this
-        // registration — without the owner ever snapping back to it —
-        // do we pay the cross-ring rebind cost.
-        let prev = self.shared.uring_rebind_hysteresis.fetch_add(1, Relaxed);
-        if prev + 1 < crate::runtime::io::scheduled_io::REBIND_HYSTERESIS_THRESHOLD {
-            return;
-        }
-        // Reset the counter eagerly: the rebind either succeeds (owner
-        // now matches `current`, so future polls take the fast-path
-        // return above) or fails (old owner unchanged; we want a fresh
-        // window before trying again rather than hammering every poll).
-        self.shared.uring_rebind_hysteresis.store(0, Relaxed);
-
-        let Some(uring) = self.handle.uring_handle() else {
-            return;
-        };
-        // `rebind_source` internally handles stale / in-flight / mismatch
-        // cases; we just forward and ignore the Ok/Err detail.
-        let _ = uring.rebind_source(&self.shared, self.uring_fd, interest, current);
     }
 }
 

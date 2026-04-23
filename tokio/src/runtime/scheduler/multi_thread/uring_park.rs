@@ -275,18 +275,11 @@ impl UringParker {
             return;
         }
 
-        let mut reactor = Reactor::new().expect(
+        let reactor = Reactor::new().expect(
             "failed to construct per-worker io_uring Reactor; \
              kernel must support io_uring with SINGLE_ISSUER + DEFER_TASKRUN \
              (Linux 6.0+)",
         );
-
-        // Publish our worker index onto the reactor so its drain loop
-        // can recognize readiness CQEs whose owning registration has
-        // been rebound to a peer (v2 lazy placement) and skip the wake
-        // — see the cross-thread kill-switch in
-        // `uring_reactor::Reactor::drain_completions`.
-        reactor.set_worker_index(self.idx as u32);
 
         // Publish ring_fd + external_waker so other threads can target us.
         self.handle

@@ -85,15 +85,6 @@ const VARIANT_EVENTFD: u8 = 0x02;
 /// Cross-worker wake delivered via a peer's `MSG_RING`.
 const VARIANT_MSG_RING_INCOMING: u8 = 0x03;
 
-/// Cross-worker deregister request delivered via a peer's `MSG_RING`.
-///
-/// Sent by a worker that has just rebound a resource to its own ring (v2
-/// lazy placement) so that the *previous* owner tears down its stale
-/// `POLL_ADD_MULTI` registration. The `user_data` carries the slab
-/// `(gen, key)` of the old registration on the target ring so the target
-/// reactor can perform a gen-checked `POLL_REMOVE` locally.
-const VARIANT_CROSS_DEREGISTER: u8 = 0x04;
-
 // ===== well-known slab keys =====
 //
 // These are populated as the very first inserts in `Reactor::new`, in this
@@ -151,19 +142,13 @@ enum OpState {
     /// `POLL_REMOVE`, or autonomous kernel cleanup, e.g. on `POLLHUP`).
     PollMulti {
         io: Arc<ScheduledIo>,
-        /// True once this slot has been scheduled for teardown — either by
-        /// a local `deregister()` or by a `VARIANT_CROSS_DEREGISTER` CQE
-        /// from a peer that has rebound the same resource to its own ring.
-        ///
+        /// True once a local `deregister()` has scheduled this slot for
+        /// teardown but the kernel has not yet posted the terminal CQE.
         /// The drain loop reads this flag in the `VARIANT_POLL_MULTI` arm
-        /// and suppresses readiness delivery on any further CQEs for the
-        /// slot. This closes the v2 ping-pong window where two
-        /// POLL_ADD_MULTI registrations (old + new) could both deliver
-        /// readiness during the cross-ring handoff, each dragging the
-        /// task back to its own worker in turn. Level-triggered semantics
-        /// are preserved by the new ring's registration; the old ring's
-        /// CQEs between `removing=true` and the terminal CQE carry no
-        /// unique information.
+        /// and suppresses readiness delivery on any in-flight CQEs that
+        /// land between `deregister` submission and the terminal
+        /// `-ECANCELED` — the caller has already dropped interest, so
+        /// delivering readiness would wake a stale task handle.
         removing: bool,
     },
 
@@ -205,18 +190,6 @@ pub(crate) struct Reactor {
     /// effective range (truncated by [`encode`]); wraparound is
     /// astronomically unlikely to collide with an outstanding CQE.
     next_gen: u32,
-
-    /// Worker index this reactor is bound to, or `u32::MAX` if it has not
-    /// yet been bound (e.g. in unit tests that construct a standalone
-    /// reactor without a UringHandle).
-    ///
-    /// Set exactly once, at worker bootstrap, via [`Reactor::set_worker_index`].
-    /// Used by `drain_completions` to detect readiness CQEs that belong
-    /// to a registration which has been rebound to a peer's ring (v2
-    /// lazy placement) — in that case `ScheduledIo::uring_worker`
-    /// carries the *new* owner's index and we skip the local wake to
-    /// avoid the ping-pong described in `docs/uring-fd-placement.md`.
-    self_worker_idx: u32,
 }
 
 /// Thread-safe handle for waking a [`Reactor`] from a non-worker thread.
@@ -311,22 +284,7 @@ impl Reactor {
             // Start at 1; gen=0 is reserved for the never-recycled
             // well-known slots so they don't compete for the counter.
             next_gen: 1,
-            self_worker_idx: u32::MAX,
         })
-    }
-
-    /// Publish the worker index this reactor is bound to. Must be called
-    /// exactly once during worker bootstrap, before the first park; the
-    /// drain loop reads it without synchronization (single-issuer worker
-    /// owns both write and read).
-    #[allow(dead_code)]
-    pub(crate) fn set_worker_index(&mut self, idx: u32) {
-        debug_assert_eq!(
-            self.self_worker_idx,
-            u32::MAX,
-            "self_worker_idx already set",
-        );
-        self.self_worker_idx = idx;
     }
 
     /// Raw fd of the underlying ring. Needed by other workers so they can
@@ -489,48 +447,6 @@ impl Reactor {
         Ok(())
     }
 
-    /// Send a cross-ring deregister request to a peer reactor via
-    /// `MSG_RING`. The peer's CQE will be tagged
-    /// [`VARIANT_CROSS_DEREGISTER`] with the provided `(slab_gen, slab_key)`
-    /// in the `user_data`; the peer's `drain_completions` will then perform
-    /// the local gen-checked `POLL_REMOVE` on its own ring.
-    ///
-    /// Must be called from the worker that owns **this** reactor (the one
-    /// that has just taken ownership of the resource in its own slab).
-    ///
-    /// Submits immediately — peer-side teardown latency should be bounded
-    /// by the peer's next `park()`, not by our own.
-    #[allow(dead_code)]
-    pub(crate) fn send_msg_ring_deregister(
-        &mut self,
-        target_ring_fd: RawFd,
-        slab_gen: u32,
-        slab_key: u32,
-    ) -> io::Result<()> {
-        // Our own ack — a throwaway Control slot.
-        let (ack_ud, _ack_key) = self.alloc_control_slot();
-
-        // The peer will observe this user_data on its own ring's CQE.
-        let peer_ud = encode(VARIANT_CROSS_DEREGISTER, slab_gen, slab_key);
-
-        let sqe = opcode::MsgRingData::new(
-            types::Fd(target_ring_fd),
-            0,                 // `result` (unused on receiver).
-            peer_ud,           // CQE user_data posted on the *target* ring.
-            None,              // no user_flags pass-through.
-        )
-        .build()
-        .user_data(ack_ud);
-
-        // SAFETY: MsgRingData references no user buffers; always safe.
-        unsafe { self.push_sqe(sqe)? };
-
-        // Flush immediately so the peer sees the teardown request without
-        // waiting on our own park cadence. Non-blocking submit.
-        self.ring.submit()?;
-        Ok(())
-    }
-
     /// Block until at least one CQE is available, then drain completions.
     ///
     /// Performs one `io_uring_enter(submit=pending, min_complete=1,
@@ -589,10 +505,6 @@ impl Reactor {
         // run arbitrary user code (waker callbacks), so we want it strictly
         // outside the CQ-iterator borrow.
         let mut readiness_deliveries: Vec<(Arc<ScheduledIo>, Ready)> = Vec::with_capacity(16);
-        // Stage cross-ring deregister requests: we can't submit a
-        // POLL_REMOVE SQE (needs `&mut self.ring.submission()`) while the
-        // CQ iterator borrows the ring. Dispatched after the borrow drops.
-        let mut cross_deregisters: Vec<(u32, u32)> = Vec::new();
 
         let cq = self.ring.completion();
         for cqe in cq {
@@ -616,31 +528,14 @@ impl Reactor {
                     let flags = cqe.flags();
                     let has_more = cqueue::more(flags);
 
-                    // Cross-thread kill-switch for the v2 rebind path.
-                    //
-                    // When a peer worker rebinds this resource to its own
-                    // ring, it publishes its index to `io.uring_worker`
-                    // *before* submitting the MSG_RING cross-deregister.
-                    // Between that store and the moment our drain
-                    // processes the CROSS_DEREGISTER CQE (which may span
-                    // several of our own parks), the kernel may keep
-                    // posting POLL_MULTI CQEs for the still-live old
-                    // registration on our ring. Delivering those would
-                    // call `io.wake()` on *this* worker, dragging the
-                    // task back here — the classic ping-pong.
-                    //
-                    // Skip the wake if the registration now points at a
-                    // different owner. The `removing` flag catches the
-                    // narrower case where teardown was scheduled locally
-                    // (so `uring_worker` may still equal ours); check
-                    // both.
-                    let owner = io_arc.uring_worker.load(Ordering::Relaxed);
-                    let belongs_elsewhere = self.self_worker_idx != u32::MAX
-                        && owner != u32::MAX
-                        && owner != u32::MAX - 1 // REBINDING_MARKER
-                        && owner != self.self_worker_idx;
-
-                    if result >= 0 && !removing && !belongs_elsewhere {
+                    // Skip delivery if the slot has been scheduled for
+                    // local teardown by `deregister()` — the caller has
+                    // already dropped interest, and waking a stale task
+                    // handle would be a spurious poll at best and a
+                    // use-after-free scheduler hazard at worst. The
+                    // terminal `-ECANCELED` CQE still frees the slot
+                    // below via `!has_more`.
+                    if result >= 0 && !removing {
                         let ready = ready_from_poll_flags(result);
                         readiness_deliveries.push((io_arc, ready));
                     }
@@ -677,32 +572,6 @@ impl Reactor {
                     // Slot stays.
                 }
 
-                VARIANT_CROSS_DEREGISTER => {
-                    // A peer has rebound one of our registrations to its
-                    // own ring and is asking us to tear down our stale
-                    // POLL_ADD_MULTI. The `(gen, key)` carried here
-                    // refers to *our* slab — gen-check happens against
-                    // `self.ops[key].gen`.
-                    //
-                    // Flip `removing = true` eagerly, *before* the actual
-                    // POLL_REMOVE submission that happens after the CQ
-                    // iterator drops. This matters because the same drain
-                    // batch may contain readiness CQEs for this slot
-                    // posted just before the peer took over — suppressing
-                    // them here prevents the ping-pong where our
-                    // VARIANT_POLL_MULTI handler would otherwise wake the
-                    // task back onto *this* worker after the peer already
-                    // claimed ownership.
-                    if let Some(entry) = self.ops.get_mut(key as usize) {
-                        if entry.gen == gen {
-                            if let OpState::PollMulti { removing, .. } = &mut entry.state {
-                                *removing = true;
-                            }
-                        }
-                    }
-                    cross_deregisters.push((gen, key));
-                }
-
                 _ => {
                     // Unknown variant — ignore. Could happen if a future
                     // op type is introduced and an old binary sees its
@@ -722,13 +591,6 @@ impl Reactor {
         for (io, ready) in readiness_deliveries {
             io.set_readiness(Tick::Set, |curr| curr | ready);
             io.wake(ready);
-        }
-
-        for (gen, key) in cross_deregisters {
-            // Errors here are non-fatal: the worst case is a lingering
-            // multi-shot POLL on a (now-unowned) fd. Swallow and keep
-            // draining so one bad request doesn't poison the park loop.
-            let _ = self.deregister(key, gen);
         }
 
         if saw_external_wake {
@@ -895,7 +757,6 @@ mod tests {
             (VARIANT_CONTROL, 0x12_3456, 0xDEAD_BEEF),
             (VARIANT_EVENTFD, 0, KEY_EVENTFD),
             (VARIANT_MSG_RING_INCOMING, 0, KEY_MSG_RING_INCOMING),
-            (VARIANT_CROSS_DEREGISTER, 0x00_0001, 0x0000_0042),
         ];
         for (v, g, k) in cases {
             let ud = encode(v, g, k);
@@ -1097,141 +958,4 @@ mod tests {
         );
     }
 
-    /// A `MSG_RING` cross-deregister sent from reactor B targeting reactor A
-    /// tears down A's multi-shot POLL for a fd that was registered on A.
-    /// This is the kernel-side half of v2 lazy re-registration: the new
-    /// worker owns the live registration, the old worker gets asked to
-    /// clean up its stale one over the wire.
-    ///
-    /// Verified by: register on A, submit cross-deregister from B → A,
-    /// drive A's park loop until A's slab slot count returns to baseline
-    /// and the caller's `Arc<ScheduledIo>` strong count drops to 1.
-    #[test]
-    fn cross_deregister_via_msg_ring_tears_down_peer_registration() {
-        use std::os::fd::{BorrowedFd, FromRawFd};
-
-        let Ok(mut reactor_a) = Reactor::new() else {
-            eprintln!("skipping: reactor A unavailable");
-            return;
-        };
-        let Ok(mut reactor_b) = Reactor::new() else {
-            eprintln!("skipping: reactor B unavailable");
-            return;
-        };
-
-        // Real fd for the registration.
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: standard pipe2 call with valid out-ptr.
-        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-        assert_eq!(rc, 0, "pipe2 failed: {}", io::Error::last_os_error());
-        // SAFETY: we own both ends.
-        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let _write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-
-        let baseline_a = reactor_a.ops.len();
-
-        // Register on A.
-        let io = Arc::new(ScheduledIo::default());
-        // SAFETY: read_end outlives this scope.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(read_end.as_raw_fd()) };
-        reactor_a
-            .register(borrowed.as_raw_fd(), Interest::READABLE, &io)
-            .expect("register on A");
-
-        let slab_key = io.uring_slab_key.load(Ordering::Relaxed);
-        let slab_gen = io.uring_gen.load(Ordering::Relaxed);
-        assert_ne!(slab_key, u32::MAX, "slab key published");
-        assert_eq!(Arc::strong_count(&io), 2, "caller + A's slab clone");
-
-        // B submits the cross-deregister targeting A.
-        let a_ring_fd = reactor_a.ring_fd();
-        reactor_b
-            .send_msg_ring_deregister(a_ring_fd, slab_gen, slab_key)
-            .expect("send_msg_ring_deregister");
-
-        // Drive A's park loop until the terminal CQE for the multi-shot
-        // POLL arrives. Bounded timeout so a kernel stall doesn't hang
-        // the test.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while Arc::strong_count(&io) > 1 && std::time::Instant::now() < deadline {
-            reactor_a
-                .park_timeout(Duration::from_millis(100))
-                .expect("park A");
-        }
-
-        assert_eq!(
-            Arc::strong_count(&io),
-            1,
-            "A's slab clone should have been released by the terminal CQE",
-        );
-        // Baseline+0 allows for transient Control slots still in flight.
-        // The key invariant is the caller-observable Arc count.
-        let _ = baseline_a;
-    }
-
-    /// A stale cross-deregister (one whose `(gen, key)` no longer matches
-    /// A's current slab state, e.g. because A's slot was already recycled)
-    /// is a safe no-op: A's drain loop gen-checks the request and does
-    /// not cancel an unrelated registration that happens to sit in the
-    /// same recycled slab slot.
-    #[test]
-    fn cross_deregister_with_stale_gen_is_no_op() {
-        use std::os::fd::{BorrowedFd, FromRawFd};
-
-        let Ok(mut reactor_a) = Reactor::new() else {
-            eprintln!("skipping: reactor A unavailable");
-            return;
-        };
-        let Ok(mut reactor_b) = Reactor::new() else {
-            eprintln!("skipping: reactor B unavailable");
-            return;
-        };
-
-        let mut fds = [0 as libc::c_int; 2];
-        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-        assert_eq!(rc, 0);
-        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        let _write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-
-        let io = Arc::new(ScheduledIo::default());
-        let borrowed = unsafe { BorrowedFd::borrow_raw(read_end.as_raw_fd()) };
-        reactor_a
-            .register(borrowed.as_raw_fd(), Interest::READABLE, &io)
-            .expect("register on A");
-        let real_key = io.uring_slab_key.load(Ordering::Relaxed);
-        let real_gen = io.uring_gen.load(Ordering::Relaxed);
-
-        // Send a stale cross-deregister: correct key, wrong gen. The
-        // receiver should decode it and then drop it on gen-mismatch;
-        // the registration on A should remain live.
-        let bogus_gen = real_gen.wrapping_add(1) & 0x00FF_FFFF;
-        reactor_b
-            .send_msg_ring_deregister(reactor_a.ring_fd(), bogus_gen, real_key)
-            .expect("send stale cross-deregister");
-
-        // Drain A a couple of times. Nothing should be torn down.
-        for _ in 0..2 {
-            reactor_a
-                .park_timeout(Duration::from_millis(50))
-                .expect("park A");
-        }
-
-        assert_eq!(
-            Arc::strong_count(&io),
-            2,
-            "A's registration must survive a stale cross-deregister",
-        );
-
-        // Clean up so Drop path doesn't race with the pipe fds closing
-        // while the multi-shot POLL is still live.
-        reactor_a
-            .deregister(real_key, real_gen)
-            .expect("cleanup deregister");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while Arc::strong_count(&io) > 1 && std::time::Instant::now() < deadline {
-            reactor_a
-                .park_timeout(Duration::from_millis(100))
-                .expect("cleanup park");
-        }
-    }
 }
