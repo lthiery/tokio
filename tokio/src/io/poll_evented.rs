@@ -1,7 +1,9 @@
 use crate::io::interest::Interest;
+use crate::runtime::io::registration::RegistrationSource;
 use crate::runtime::io::Registration;
 use crate::runtime::scheduler;
 
+#[allow(unused_imports)]
 use mio::event::Source;
 use std::fmt;
 use std::io;
@@ -63,7 +65,7 @@ cfg_io_driver! {
     /// [`clear_readiness`]: Registration::clear_readiness
     /// [`poll_read_ready`]: Registration::poll_read_ready
     /// [`poll_write_ready`]: Registration::poll_write_ready
-    pub(crate) struct PollEvented<E: Source> {
+    pub(crate) struct PollEvented<E: RegistrationSource> {
         io: Option<E>,
         registration: Registration,
     }
@@ -71,7 +73,7 @@ cfg_io_driver! {
 
 // ===== impl PollEvented =====
 
-impl<E: Source> PollEvented<E> {
+impl<E: RegistrationSource> PollEvented<E> {
     /// Creates a new `PollEvented` associated with the default reactor.
     ///
     /// The returned `PollEvented` has readable and writable interests. For more control, use
@@ -86,7 +88,10 @@ impl<E: Source> PollEvented<E> {
     /// explicitly with [`Runtime::enter`](crate::runtime::Runtime::enter) function.
     #[track_caller]
     #[cfg_attr(feature = "signal", allow(unused))]
-    pub(crate) fn new(io: E) -> io::Result<Self> {
+    pub(crate) fn new(io: E) -> io::Result<Self>
+    where
+        E: RegistrationSource,
+    {
         PollEvented::new_with_interest(io, Interest::READABLE | Interest::WRITABLE)
     }
 
@@ -107,7 +112,10 @@ impl<E: Source> PollEvented<E> {
     /// function.
     #[track_caller]
     #[cfg_attr(feature = "signal", allow(unused))]
-    pub(crate) fn new_with_interest(io: E, interest: Interest) -> io::Result<Self> {
+    pub(crate) fn new_with_interest(io: E, interest: Interest) -> io::Result<Self>
+    where
+        E: RegistrationSource,
+    {
         Self::new_with_interest_and_handle(io, interest, scheduler::Handle::current())
     }
 
@@ -116,7 +124,10 @@ impl<E: Source> PollEvented<E> {
         mut io: E,
         interest: Interest,
         handle: scheduler::Handle,
-    ) -> io::Result<Self> {
+    ) -> io::Result<Self>
+    where
+        E: RegistrationSource,
+    {
         let registration = Registration::new_with_interest_and_handle(&mut io, interest, handle)?;
         Ok(Self {
             io: Some(io),
@@ -132,7 +143,10 @@ impl<E: Source> PollEvented<E> {
 
     /// Deregisters the inner io from the registration and returns a Result containing the inner io.
     #[cfg(any(feature = "net", feature = "process"))]
-    pub(crate) fn into_inner(mut self) -> io::Result<E> {
+    pub(crate) fn into_inner(mut self) -> io::Result<E>
+    where
+        E: RegistrationSource,
+    {
         let mut inner = self.io.take().unwrap(); // As io shouldn't ever be None, just unwrap here.
         self.registration.deregister(&mut inner)?;
         Ok(inner)
@@ -140,7 +154,10 @@ impl<E: Source> PollEvented<E> {
 
     /// Re-register under new runtime with `interest`.
     #[cfg(all(feature = "process", target_os = "linux"))]
-    pub(crate) fn reregister(&mut self, interest: Interest) -> io::Result<()> {
+    pub(crate) fn reregister(&mut self, interest: Interest) -> io::Result<()>
+    where
+        E: RegistrationSource,
+    {
         let io = self.io.as_mut().unwrap(); // As io shouldn't ever be None, just unwrap here.
         let _ = self.registration.deregister(io);
         self.registration =
@@ -156,7 +173,7 @@ feature! {
     use crate::io::ReadBuf;
     use std::task::{Context, Poll};
 
-    impl<E: Source> PollEvented<E> {
+    impl<E: RegistrationSource> PollEvented<E> {
         // Safety: The caller must ensure that `E` can read into uninitialized memory
         pub(crate) unsafe fn poll_read<'a>(
             &'a self,
@@ -291,11 +308,11 @@ feature! {
     }
 }
 
-impl<E: Source> UnwindSafe for PollEvented<E> {}
+impl<E: RegistrationSource> UnwindSafe for PollEvented<E> {}
 
-impl<E: Source> RefUnwindSafe for PollEvented<E> {}
+impl<E: RegistrationSource> RefUnwindSafe for PollEvented<E> {}
 
-impl<E: Source> Deref for PollEvented<E> {
+impl<E: RegistrationSource> Deref for PollEvented<E> {
     type Target = E;
 
     fn deref(&self) -> &E {
@@ -303,13 +320,13 @@ impl<E: Source> Deref for PollEvented<E> {
     }
 }
 
-impl<E: Source + fmt::Debug> fmt::Debug for PollEvented<E> {
+impl<E: RegistrationSource + fmt::Debug> fmt::Debug for PollEvented<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PollEvented").field("io", &self.io).finish()
     }
 }
 
-impl<E: Source> Drop for PollEvented<E> {
+impl<E: RegistrationSource> Drop for PollEvented<E> {
     fn drop(&mut self) {
         if let Some(mut io) = self.io.take() {
             // Ignore errors

@@ -65,6 +65,29 @@ impl Handle {
             Handle::Disabled => unreachable!(),
         }
     }
+
+    /// The shared per-worker `io_uring` reactor handle, if the runtime was
+    /// built with `enable_uring_reactor()`. Returns `None` for current-thread
+    /// runtimes and for multi-thread runtimes using the traditional mio
+    /// backend. Used by [`crate::runtime::io::Registration`] to route fd
+    /// registrations onto the uring path when it is active.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    pub(crate) fn uring_handle(
+        &self,
+    ) -> Option<&crate::loom::sync::Arc<crate::runtime::io::uring_driver::UringHandle>> {
+        match self {
+            #[cfg(feature = "rt")]
+            Handle::CurrentThread(_) => None,
+            Handle::MultiThread(h) => h.uring_handle.as_ref(),
+            #[cfg(not(feature = "rt"))]
+            Handle::Disabled => None,
+        }
+    }
 }
 
 cfg_rt! {

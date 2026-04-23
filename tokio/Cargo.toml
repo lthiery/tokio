@@ -88,7 +88,7 @@ time = []
 io-uring = ["dep:io-uring", "libc", "mio/os-poll", "mio/os-ext", "dep:slab"]
 # Unstable, experimental. Replaces mio/epoll with per-worker io_uring rings for
 # readiness-model I/O on Linux. Requires `--cfg tokio_unstable` to enable.
-io-uring-reactor = ["rt", "dep:io-uring", "libc", "dep:slab"]
+io-uring-reactor = ["rt", "rt-multi-thread", "time", "net", "dep:io-uring", "libc", "dep:slab"]
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.
 taskdump = ["dep:backtrace"]
 

@@ -2,6 +2,8 @@ use crate::io::interest::Interest;
 use crate::io::ready::Ready;
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::Mutex;
+#[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+use std::sync::atomic::AtomicU32;
 use crate::runtime::io::{Direction, ReadyEvent, Tick};
 use crate::util::bit;
 use crate::util::linked_list::{self, LinkedList};
@@ -105,6 +107,23 @@ pub(crate) struct ScheduledIo {
     readiness: AtomicUsize,
 
     waiters: Mutex<Waiters>,
+
+    /// Slab key assigned by the per-worker io_uring [`Reactor`] when this
+    /// `ScheduledIo` is registered. `u32::MAX` means "not registered with
+    /// the uring reactor" (or registered with the legacy mio driver).
+    ///
+    /// Both writes (in `Reactor::register`) and reads (in
+    /// `Reactor::deregister`) happen on the owning worker thread, so
+    /// `Relaxed` ordering is sufficient.
+    ///
+    /// This field replaces the pointer-in-`user_data` scheme used by the
+    /// legacy retention pipeline. The kernel never sees a pointer; it sees
+    /// only an encoded `(variant, gen, key)` tuple. The slab key here is
+    /// purely an internal lookup token used by the reactor itself.
+    ///
+    /// [`Reactor`]: crate::runtime::io::uring_reactor::Reactor
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(super) uring_slab_key: AtomicU32,
 }
 
 type WaitList = LinkedList<Waiter, <Waiter as linked_list::Link>::Target>;
@@ -181,6 +200,8 @@ impl Default for ScheduledIo {
             linked_list_pointers: UnsafeCell::new(linked_list::Pointers::new()),
             readiness: AtomicUsize::new(0),
             waiters: Mutex::new(Waiters::default()),
+            #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+            uring_slab_key: AtomicU32::new(u32::MAX),
         }
     }
 }

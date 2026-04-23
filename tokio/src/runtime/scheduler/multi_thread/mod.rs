@@ -24,7 +24,7 @@ pub(crate) use park::{Parker, WorkerParker, WorkerUnparker};
     feature = "rt-multi-thread",
     target_os = "linux",
 ))]
-mod uring_park;
+pub(crate) mod uring_park;
 
 pub(crate) mod queue;
 

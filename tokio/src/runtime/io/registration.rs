@@ -9,6 +9,92 @@ use std::io;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
+/// Source trait bound used by `Registration::new_with_interest_and_handle`.
+///
+/// On Linux with the experimental `io-uring-reactor` feature enabled, the
+/// uring backend needs a raw fd so it can submit `POLL_ADD_MULTI` keyed on
+/// it. We expose that fd via a [`registration_raw_fd`] method rather than a
+/// direct [`AsRawFd`] supertrait bound, because [`mio::unix::SourceFd<'_>`]
+/// — used by `AsyncFd` — does not itself implement `AsRawFd` even though
+/// it trivially holds a `RawFd`. A hand-written impl below plugs that hole.
+///
+/// On non-Linux or with the feature disabled, this trait is just a blanket
+/// renaming of [`mio::event::Source`] and has no additional requirements.
+///
+/// [`registration_raw_fd`]: RegistrationSource::registration_raw_fd
+/// [`AsRawFd`]: std::os::fd::AsRawFd
+pub(crate) trait RegistrationSource: Source {
+    /// Return the raw fd to register with the uring reactor. Only called on
+    /// Linux with the `io-uring-reactor` feature enabled; other builds
+    /// dead-code-eliminate it.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    fn registration_raw_fd(&self) -> std::os::fd::RawFd;
+}
+
+// We deliberately avoid a blanket `impl<T: Source + AsRawFd>` here because it
+// would conflict (coherence-wise) with a hand-written impl for
+// `mio::unix::SourceFd<'_>`: the compiler notes that an upstream crate could
+// add an `AsRawFd` impl for `SourceFd<'_>` in the future. Instead, we
+// enumerate the concrete types Tokio actually wraps with `PollEvented` /
+// `Registration`.
+#[cfg(all(
+    tokio_unstable,
+    feature = "io-uring-reactor",
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
+mod registration_source_impls {
+    use super::RegistrationSource;
+    use std::os::fd::{AsRawFd, RawFd};
+
+    macro_rules! impl_registration_source_via_asrawfd {
+        ($($ty:ty),* $(,)?) => {$(
+            impl RegistrationSource for $ty {
+                fn registration_raw_fd(&self) -> RawFd {
+                    AsRawFd::as_raw_fd(self)
+                }
+            }
+        )*};
+    }
+
+    // mio::net::* types used by tokio::net (gated behind `net` in Cargo.toml,
+    // but this module is already under that same cfg via the wider feature
+    // set).
+    #[cfg(feature = "net")]
+    impl_registration_source_via_asrawfd! {
+        mio::net::TcpStream,
+        mio::net::TcpListener,
+        mio::net::UdpSocket,
+        mio::net::UnixStream,
+        mio::net::UnixListener,
+        mio::net::UnixDatagram,
+        mio::unix::pipe::Sender,
+        mio::unix::pipe::Receiver,
+    }
+
+    // Hand-written impl for `mio::unix::SourceFd<'_>`, used by `AsyncFd`.
+    // `SourceFd` does not implement `AsRawFd`, but holds a `&RawFd` directly.
+    impl RegistrationSource for mio::unix::SourceFd<'_> {
+        fn registration_raw_fd(&self) -> RawFd {
+            *self.0
+        }
+    }
+}
+
+// Non-uring builds: no fd accessor, just a rename of `Source`.
+#[cfg(not(all(
+    tokio_unstable,
+    feature = "io-uring-reactor",
+    feature = "rt-multi-thread",
+    target_os = "linux",
+)))]
+impl<T: Source> RegistrationSource for T {}
+
 cfg_io_driver! {
     /// Associates an I/O resource with the reactor instance that drives it.
     ///
@@ -51,6 +137,19 @@ cfg_io_driver! {
 
         /// Reference to state stored by the driver.
         shared: Arc<ScheduledIo>,
+
+        /// For the per-worker `io_uring` reactor: which worker owns the
+        /// `POLL_ADD_MULTI` registration for this fd. `Some(idx)` when the
+        /// registration was routed onto a uring worker's ring; `None` for
+        /// the traditional mio path. Remembered here so `deregister` can
+        /// submit `POLL_REMOVE` on the same ring.
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        uring_worker: Option<usize>,
     }
 }
 
@@ -71,13 +170,44 @@ impl Registration {
     /// - `Err` if an error was encountered during registration
     #[track_caller]
     pub(crate) fn new_with_interest_and_handle(
-        io: &mut impl Source,
+        io: &mut impl RegistrationSource,
         interest: Interest,
         handle: scheduler::Handle,
     ) -> io::Result<Registration> {
+        // When the runtime was built with `enable_uring_reactor()`, route
+        // the registration through the per-worker uring handle instead of
+        // mio. The uring path does not touch `mio::Registry`; the fd is
+        // passed in raw and a `POLL_ADD_MULTI` SQE is queued for the
+        // assigned worker.
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        if let Some(uring) = handle.uring_handle() {
+            let fd = io.registration_raw_fd();
+            let (shared, worker_idx) = uring.add_source(fd, interest)?;
+            return Ok(Registration {
+                handle,
+                shared,
+                uring_worker: Some(worker_idx),
+            });
+        }
+
         let shared = handle.driver().io().add_source(io, interest)?;
 
-        Ok(Registration { handle, shared })
+        Ok(Registration {
+            handle,
+            shared,
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            uring_worker: None,
+        })
     }
 
     /// Deregisters the I/O resource from the reactor it is associated with.
@@ -96,7 +226,24 @@ impl Registration {
     /// no longer result in notifications getting sent for this registration.
     ///
     /// `Err` is returned if an error is encountered.
-    pub(crate) fn deregister(&mut self, io: &mut impl Source) -> io::Result<()> {
+    pub(crate) fn deregister(&mut self, io: &mut impl RegistrationSource) -> io::Result<()> {
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        if let Some(worker_idx) = self.uring_worker {
+            // Unused `io` on the uring path: mio's `Registry::deregister`
+            // is not involved — the worker will submit `POLL_REMOVE` on
+            // its ring when it drains the pending-ops queue.
+            let _ = io;
+            if let Some(uring) = self.handle.uring_handle() {
+                return uring.deregister_source(&self.shared, worker_idx);
+            }
+            return Ok(());
+        }
+
         self.handle().deregister_source(&self.shared, io)
     }
 

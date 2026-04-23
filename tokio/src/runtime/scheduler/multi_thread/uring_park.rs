@@ -28,13 +28,66 @@
 use crate::loom::sync::Arc;
 use crate::runtime::driver;
 use crate::runtime::io::uring_driver::{
-    clear_local_reactor, install_local_reactor_raw, UringHandle,
+    clear_local_reactor, install_local_reactor_raw, PendingOp, UringHandle,
 };
 use crate::runtime::io::uring_reactor::Reactor;
 use crate::runtime::scheduler::multi_thread::park::HadDriver;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::Duration;
+
+thread_local! {
+    /// Current worker's index for the running thread, or `None` if this
+    /// thread is not currently executing a multi-thread uring worker loop.
+    ///
+    /// Set by [`UringParker::ensure_reactor_installed`] on first park (the
+    /// same point where `LOCAL_REACTOR` is installed) and cleared by
+    /// [`UringParker::shutdown`] / `Drop`, plus the `ClearUringTls` RAII
+    /// guard in `worker.rs` (belt-and-braces for recycled blocking-pool
+    /// threads across runtimes).
+    ///
+    /// Used by [`UringHandle::add_source`] to place new fd registrations on
+    /// the current worker's ring — preferring `W_ring == W_task` locality
+    /// over round-robin load balance — and by [`UringUnparker::unpark`] to
+    /// short-circuit self-wakes. `None` means the caller is not on a worker
+    /// thread; callers must fall back to a policy that doesn't assume
+    /// worker-local state.
+    ///
+    /// Distinct from `LOCAL_REACTOR`: that TLS points at this worker's
+    /// `RefCell<Reactor>` (required for `MSG_RING` routing), while this one
+    /// is just the integer index — sufficient for routing decisions that
+    /// don't touch the reactor itself.
+    static CURRENT_WORKER: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Index of the worker currently executing on this thread, or `None` if
+/// this thread is not a multi-thread uring worker.
+pub(crate) fn current_worker_index() -> Option<usize> {
+    CURRENT_WORKER.with(Cell::get)
+}
+
+/// Publish `idx` as this thread's current worker index. Must be paired with
+/// [`clear_current_worker`] before the worker loop exits.
+fn set_current_worker(idx: usize) {
+    CURRENT_WORKER.with(|c| c.set(Some(idx)));
+}
+
+/// Publish the current worker index from the worker's `run` entry point,
+/// before any task executes on this thread. Separate from the parker-side
+/// install because the parker runs its lazy init on the *first park*, which
+/// is too late for tasks that register fds during the pre-park burst at
+/// startup.
+///
+/// Paired with the `ClearUringTls` teardown guard in `worker.rs`, which
+/// already calls [`clear_current_worker`] on worker exit.
+pub(crate) fn set_current_worker_early(idx: usize) {
+    set_current_worker(idx);
+}
+
+/// Clear this thread's `CURRENT_WORKER` slot. Idempotent.
+pub(crate) fn clear_current_worker() {
+    CURRENT_WORKER.with(|c| c.set(None));
+}
 
 /// Per-worker parker for the `io_uring` backend.
 ///
@@ -132,6 +185,7 @@ impl UringParker {
     pub(crate) fn shutdown(&mut self, _driver: &driver::Handle) {
         if self.tls_installed {
             clear_local_reactor();
+            clear_current_worker();
             self.tls_installed = false;
         }
         self.reactor.take();
@@ -152,6 +206,12 @@ impl UringParker {
         // so that the two atomics (`ring_fd`, `external_waker`) are already
         // visible by the time `park_state == PARKED` is observable.
         if self.handle.begin_park(self.idx) {
+            // Even on the NOTIFIED fast path, we drain any fd (de)register
+            // ops that landed on our queue. Otherwise a burst of
+            // `Registration::new` followed immediately by an unpark would
+            // skip the kernel round-trip and leave `POLL_ADD_MULTI` SQEs
+            // un-submitted until the next real park.
+            self.drain_pending_ops_and_submit();
             return;
         }
 
@@ -161,6 +221,12 @@ impl UringParker {
             .as_deref()
             .expect("reactor installed");
         let mut reactor = cell.borrow_mut();
+
+        // Apply any fd registration / deregistration ops that peer threads
+        // queued for us. These become SQEs on our ring and flush together
+        // with the park's `submit_and_wait`.
+        let pending = self.handle.take_pending_ops(self.idx);
+        apply_pending_ops(&mut reactor, pending);
 
         let result = match duration {
             None => reactor.park(),
@@ -173,7 +239,31 @@ impl UringParker {
         let _ = result;
 
         drop(reactor);
+
+        // Release any `ScheduledIo`s whose `Registration` was dropped while
+        // we were parked; we do it on the owning thread so the drop runs
+        // here (and so it interleaves naturally with the worker loop).
+        self.handle.release_pending_registrations();
+
         self.handle.end_park(self.idx);
+    }
+
+    /// Fast-path variant used when `begin_park` consumed a NOTIFIED — we
+    /// skip the syscall but still need to flush any fd-registration ops
+    /// so they become visible to the kernel before we return to the task
+    /// loop.
+    fn drain_pending_ops_and_submit(&mut self) {
+        let pending = self.handle.take_pending_ops(self.idx);
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(cell) = self.reactor.as_deref() {
+            let mut reactor = cell.borrow_mut();
+            apply_pending_ops(&mut reactor, pending);
+            // Non-blocking flush so the kernel sees the SQEs; we'll drain
+            // their completions on the next real park.
+            let _ = reactor.park_timeout(Duration::ZERO);
+        }
     }
 
     /// Lazy-initialize the reactor and install it into the thread-local
@@ -206,7 +296,35 @@ impl UringParker {
         unsafe {
             install_local_reactor_raw(cell_ptr);
         }
+        // Publish the worker index alongside the reactor pointer so that
+        // `UringHandle::add_source` can prefer this worker for fds being
+        // registered from tasks currently executing here. Paired with the
+        // `clear_current_worker` calls in `shutdown` / `Drop`.
+        set_current_worker(self.idx);
         self.tls_installed = true;
+    }
+}
+
+/// Translate a batch of [`PendingOp`]s into SQEs on `reactor`'s ring.
+///
+/// The SQEs are staged but not submitted — they flush together with the
+/// next `submit_and_wait` (park) or explicit non-blocking submit.
+///
+/// Individual errors are logged-and-dropped: a failed register/deregister
+/// is at worst a missed readiness notification, which callers already have
+/// to cope with via the spurious-wake rules on `poll_*_ready`.
+fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) {
+    for op in pending {
+        let _ = match op {
+            PendingOp::Register { fd, interest, io } => reactor.register(fd, interest, &io),
+            // The reactor identifies the slab slot for this `io` via the
+            // `uring_slab_key` field that `register` stamped on it, then
+            // submits POLL_REMOVE. The Arc held inside the slab slot is
+            // dropped only when the kernel posts the terminal CQE for the
+            // multi-shot poll (no `IORING_CQE_F_MORE`); see
+            // `uring_reactor::Reactor::deregister`.
+            PendingOp::Deregister { io } => reactor.deregister(io),
+        };
     }
 }
 
@@ -216,10 +334,12 @@ impl Drop for UringParker {
         // not, we clear on this thread. If the parker is being dropped on
         // a different thread than it was installed on (not expected in
         // normal runtime shutdown — workers drop their own parkers), the
-        // `clear_local_reactor` call affects this thread's TLS, which is
-        // harmless because it was `null` to begin with.
+        // `clear_local_reactor` / `clear_current_worker` calls affect this
+        // thread's TLS, which is harmless because they were unset to begin
+        // with.
         if self.tls_installed {
             clear_local_reactor();
+            clear_current_worker();
             self.tls_installed = false;
         }
     }
@@ -229,7 +349,19 @@ impl UringUnparker {
     /// Unpark the associated worker. Fast path is an atomic flag flip; if
     /// the worker was actually parked, a `MSG_RING` (from a worker-thread
     /// caller) or `eventfd` (external) write delivers the wake.
+    ///
+    /// Self-wake short-circuit: when the calling thread *is* the target
+    /// worker, a wake is unnecessary. The worker is mid-task (otherwise it
+    /// couldn't be calling unpark), its `park_state` is `EMPTY`, and
+    /// whatever it just pushed to its own run queue will be picked up when
+    /// control returns to the worker loop. Skipping the `unpark` call here
+    /// avoids a needless `park_state` CAS and — under `W_ring == W_task`
+    /// placement — eliminates most of the post-wake overhead on the
+    /// hot path.
     pub(crate) fn unpark(&self, _driver: &driver::Handle) {
+        if current_worker_index() == Some(self.idx) {
+            return;
+        }
         self.handle.unpark(self.idx);
     }
 }

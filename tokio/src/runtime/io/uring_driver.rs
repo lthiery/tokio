@@ -37,20 +37,46 @@
 //! time windows are strictly non-overlapping on the same thread.
 
 use std::cell::{Cell, RefCell};
+use std::io;
+use std::os::fd::RawFd;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use crate::io::interest::Interest;
 use crate::loom::sync::Mutex;
 use crate::runtime::io::registration_set;
 use crate::runtime::io::uring_reactor::{ExternalWaker, Reactor};
-use crate::runtime::io::{IoDriverMetrics, RegistrationSet};
+use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 
 /// Park-state atomic values. Shape mirrors the mio parker's transitions so
 /// integration stays familiar.
 pub(crate) const EMPTY: usize = 0;
 pub(crate) const PARKED: usize = 1;
 pub(crate) const NOTIFIED: usize = 2;
+
+/// An operation that needs to be submitted on a specific worker's ring.
+///
+/// Cross-worker fd (de)registration goes through this queue because
+/// `IORING_OP_POLL_ADD` / `POLL_REMOVE` must be submitted on the ring where
+/// the registration lives (and `SINGLE_ISSUER` pins submission to the owning
+/// worker thread). Any thread — worker or external — can push ops here;
+/// only the owning worker drains.
+#[derive(Debug)]
+pub(crate) enum PendingOp {
+    /// Install a multi-shot POLL_ADD for `fd` / `interest`. The reactor
+    /// allocates a slab slot for the registration and stamps the slot key
+    /// onto `io.uring_slab_key`; the cloned `Arc` is held in the slab until
+    /// the registration's terminal CQE arrives.
+    Register {
+        fd: RawFd,
+        interest: Interest,
+        io: Arc<ScheduledIo>,
+    },
+    /// Submit a POLL_REMOVE matching the slab slot recorded on `io`. The
+    /// slot's Arc is released by the reactor on the terminal CQE, not here.
+    Deregister { io: Arc<ScheduledIo> },
+}
 
 /// Per-worker coordination slot. One of these per worker, indexed by worker
 /// id. All fields are thread-safe since multiple unparkers may target the
@@ -72,14 +98,23 @@ pub(crate) struct WorkerState {
     /// Eventfd handle for waking this worker from a non-worker thread.
     /// Published once, at worker startup.
     pub(crate) external_waker: OnceLock<ExternalWaker>,
+
+    /// Ops pending submission on this worker's ring. Any thread can push;
+    /// only the owning worker drains, on its next trip through park().
+    ///
+    /// A `Mutex<Vec<_>>` is coarse but fits the usage pattern: pushes are
+    /// rare (one per fd registration/deregistration), and the drain batch
+    /// happens once per park, not per SQE.
+    pub(crate) pending_ops: Mutex<Vec<PendingOp>>,
 }
 
 impl WorkerState {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             park_state: AtomicUsize::new(EMPTY),
             ring_fd: AtomicI32::new(-1),
             external_waker: OnceLock::new(),
+            pending_ops: Mutex::new(Vec::new()),
         }
     }
 }
@@ -97,11 +132,16 @@ pub(crate) struct UringHandle {
     /// worker count and does not change after construction.
     workers: Box<[WorkerState]>,
 
+    /// Round-robin counter for assigning newly registered fds to workers.
+    /// Bumped once per `add_source` call.
+    next_worker: AtomicUsize,
+
     /// Shared registration set (fd → ScheduledIo). Identical to the mio
-    /// driver's usage; the Arc-pinned `ScheduledIo` instances hold the
-    /// `user_data` pointers that our CQEs reference.
-    pub(crate) registrations: RegistrationSet,
-    pub(crate) synced: Mutex<registration_set::Synced>,
+    /// driver's usage; the Arc-pinned `ScheduledIo` instances are also
+    /// referenced from each per-worker reactor's slab while a registration
+    /// is live.
+    pub(super) registrations: RegistrationSet,
+    pub(super) synced: Mutex<registration_set::Synced>,
 
     pub(crate) metrics: IoDriverMetrics,
 }
@@ -123,6 +163,7 @@ impl UringHandle {
         let (registrations, synced) = RegistrationSet::new();
         Self {
             workers: workers.into_boxed_slice(),
+            next_worker: AtomicUsize::new(0),
             registrations,
             synced: Mutex::new(synced),
             metrics: IoDriverMetrics::default(),
@@ -212,6 +253,169 @@ impl UringHandle {
         // kernel released us will have already caused the CQE we're now
         // draining, so we're caught up.
         slot.park_state.store(EMPTY, Ordering::Release);
+    }
+
+    /// Register a raw fd for readiness notifications.
+    ///
+    /// Allocates a [`ScheduledIo`] from the shared registration set, picks a
+    /// worker to host the registration, and queues a [`PendingOp::Register`]
+    /// on that worker. The worker submits the actual `POLL_ADD_MULTI` SQE on
+    /// its next trip through park() (we unpark it here so that happens
+    /// immediately).
+    ///
+    /// # Placement policy
+    ///
+    /// On a work-stealing runtime, we want the ring that owns a fd's
+    /// registration (`W_ring`) to be the ring that also runs the task
+    /// awaiting it (`W_task`). When the two match, the wake path is
+    /// push-to-local-LIFO with zero syscalls; when they diverge, at worst
+    /// we pay a cross-worker `MSG_RING` and park→unpark round-trip.
+    ///
+    /// So: if the caller is currently executing on a worker thread, prefer
+    /// *that* worker. Tasks overwhelmingly register fds as part of their
+    /// own execution (e.g., `TcpStream::connect().await`), so the executing
+    /// worker is the best available predictor of where the registration
+    /// will be awaited next.
+    ///
+    /// Fall back to a round-robin counter only when the caller is off-worker
+    /// (external threads, `spawn_blocking` pools, main-thread `block_on`
+    /// initialization, etc.) — for those the current worker is unknown and
+    /// load-balancing across rings is a reasonable default.
+    ///
+    /// Returns the allocated `Arc<ScheduledIo>` together with the assigned
+    /// worker index. Callers must remember the index and pass it back into
+    /// [`Self::deregister_source`] so `POLL_REMOVE` lands on the same ring
+    /// as the original `POLL_ADD` (required by io_uring — remove ops are
+    /// scoped to their ring).
+    pub(crate) fn add_source(
+        &self,
+        fd: RawFd,
+        interest: Interest,
+    ) -> io::Result<(Arc<ScheduledIo>, usize)> {
+        let io = self.registrations.allocate(&mut self.synced.lock())?;
+
+        let worker_idx = self.pick_worker();
+
+        {
+            let slot = &self.workers[worker_idx];
+            let mut queue = slot.pending_ops.lock();
+            queue.push(PendingOp::Register {
+                fd,
+                interest,
+                io: Arc::clone(&io),
+            });
+        }
+
+        // Kick the target worker so it drains the queue. If it is parked in
+        // `io_uring_enter`, this wakes it; if it is currently executing, the
+        // notification is consumed on the next park.
+        self.unpark(worker_idx);
+
+        self.metrics.incr_fd_count();
+        Ok((io, worker_idx))
+    }
+
+    /// Select a worker index for a new fd registration.
+    ///
+    /// Prefer the current worker — see placement rationale on
+    /// [`Self::add_source`]. When the caller is not a worker thread, or
+    /// when the current worker index is out of range for this handle (which
+    /// would indicate a cross-runtime TLS leak — defensive but cheap to
+    /// check), fall back to a round-robin counter.
+    fn pick_worker(&self) -> usize {
+        // Locality-preferred path: register on the worker we're running on.
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        {
+            if let Some(idx) =
+                crate::runtime::scheduler::multi_thread::uring_park::current_worker_index()
+            {
+                if idx < self.workers.len() {
+                    return idx;
+                }
+            }
+        }
+
+        self.fallback_worker()
+    }
+
+    /// Placement fallback when the calling thread is not a worker of this
+    /// handle. Round-robin over `next_worker` — equivalent to the historic
+    /// placement policy, but now scoped to the off-worker minority.
+    ///
+    /// `fetch_add` is `Relaxed`: ordering of assignments does not affect
+    /// correctness, only balance, and we only need distinct calls to tend
+    /// toward distinct workers.
+    fn fallback_worker(&self) -> usize {
+        self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len()
+    }
+
+    /// Queue a `POLL_REMOVE` for `io` on the worker it was registered with.
+    ///
+    /// The caller must pass the `worker_idx` returned by [`Self::add_source`];
+    /// there is no fd→worker reverse lookup on the handle itself.
+    ///
+    /// This also enqueues `io` for release from the shared
+    /// [`RegistrationSet`] (matching the mio driver's semantics: the Arc
+    /// hangs around in `pending_release` until the driver's next cleanup
+    /// pass).
+    pub(crate) fn deregister_source(
+        &self,
+        io: &Arc<ScheduledIo>,
+        worker_idx: usize,
+    ) -> io::Result<()> {
+        // Queue the POLL_REMOVE first so that if the caller races with
+        // shutdown, the kernel-side cleanup still lands before the Arc is
+        // freed. The worker drains this at its next park() call.
+        if worker_idx < self.workers.len() {
+            let slot = &self.workers[worker_idx];
+            let mut queue = slot.pending_ops.lock();
+            queue.push(PendingOp::Deregister {
+                io: Arc::clone(io),
+            });
+        }
+
+        // Mark the registration for release; the worker-side drain of
+        // `pending_release` will drop the Arc after the POLL_REMOVE CQE.
+        let should_unpark = self.registrations.deregister(&mut self.synced.lock(), io);
+
+        // Always wake the target so it observes both the pending REMOVE and
+        // (if the registration set threshold tripped) the release signal.
+        if worker_idx < self.workers.len() {
+            self.unpark(worker_idx);
+        }
+        // Mirrors mio driver's extra unpark when the release threshold hits.
+        // On the uring side the "driver" is per-worker, so we re-kick the
+        // same worker — release work runs in its drain loop.
+        if should_unpark && worker_idx < self.workers.len() {
+            self.unpark(worker_idx);
+        }
+
+        self.metrics.dec_fd_count();
+        Ok(())
+    }
+
+    /// Drain and return the pending-ops queue for `worker_idx`. Intended to
+    /// be called by the owning worker's parker before submitting the next
+    /// `io_uring_enter` batch.
+    pub(crate) fn take_pending_ops(&self, worker_idx: usize) -> Vec<PendingOp> {
+        let slot = &self.workers[worker_idx];
+        let mut queue = slot.pending_ops.lock();
+        std::mem::take(&mut *queue)
+    }
+
+    /// Release any `ScheduledIo`s that have been queued for removal by
+    /// [`RegistrationSet::deregister`]. Called by the owning worker after
+    /// submitting any pending `POLL_REMOVE` ops so the Arcs are freed on
+    /// the worker's own thread.
+    pub(crate) fn release_pending_registrations(&self) {
+        if self.registrations.needs_release() {
+            self.registrations.release(&mut self.synced.lock());
+        }
     }
 
     /// Deliver a wake to a definitely-parked worker via the best available
@@ -323,10 +527,17 @@ impl Drop for LocalReactorGuard<'_> {
 /// in its `Drop` impl. Both calls happen on the worker thread.
 pub(crate) unsafe fn install_local_reactor_raw(ptr: *const RefCell<Reactor>) {
     LOCAL_REACTOR.with(|slot| {
-        debug_assert!(
-            slot.get().is_null(),
-            "another Reactor is already installed on this thread",
-        );
+        let existing = slot.get();
+        if !existing.is_null() {
+            let tname = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_owned();
+            panic!(
+                "another Reactor is already installed on thread {tname:?}: \
+                 existing={existing:p} new={ptr:p}",
+            );
+        }
         slot.set(ptr);
     });
 }

@@ -369,6 +369,13 @@ pub(super) fn create(
         seed_generator,
         timer_flavor,
         io_flavor,
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        uring_handle: uring_handle.clone(),
         #[cfg(all(tokio_unstable, feature = "time"))]
         is_shutdown: AtomicBool::new(false),
     });
@@ -553,6 +560,70 @@ fn run(worker: Arc<Worker>) {
     // debug assertions are enabled, we just abort the process.
     #[cfg(debug_assertions)]
     let _abort_on_panic = AbortOnPanic;
+
+    // Multi-thread workers are hosted on threads from the global blocking
+    // pool (`runtime::spawn_blocking`), which are reused across runtimes.
+    // The per-worker uring reactor stashes a pointer into thread-local
+    // storage, and `core.shutdown()` may run on a *different* worker thread
+    // (see `Handle::shutdown_core`, which drains all cores on the last
+    // worker to exit). That means the installed TLS pointer can outlive the
+    // runtime that created it. Clear at entry and exit so a recycled
+    // blocking thread never sees a stale pointer from a prior tenant.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    struct ClearUringTls;
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    impl Drop for ClearUringTls {
+        fn drop(&mut self) {
+            crate::runtime::io::uring_driver::clear_local_reactor();
+            crate::runtime::scheduler::multi_thread::uring_park::clear_current_worker();
+        }
+    }
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    {
+        crate::runtime::io::uring_driver::clear_local_reactor();
+        crate::runtime::scheduler::multi_thread::uring_park::clear_current_worker();
+    }
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    let _clear_uring_tls = ClearUringTls;
+
+    // Publish the worker index into `CURRENT_WORKER` *before* any task
+    // runs on this thread. This is what `UringHandle::add_source` reads to
+    // decide placement (`W_ring == W_task`). Installing inside the parker's
+    // first-park hook is too late: tasks that register fds before the
+    // worker's first park (common at startup and in short benchmarks) would
+    // fall through to round-robin and lose the locality property the
+    // placement policy is meant to establish.
+    //
+    // The `ClearUringTls` guard covers the teardown side.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    crate::runtime::scheduler::multi_thread::uring_park::set_current_worker_early(
+        worker.index,
+    );
 
     // Acquire a core. If this fails, then another thread is running this
     // worker and there is nothing further to do.

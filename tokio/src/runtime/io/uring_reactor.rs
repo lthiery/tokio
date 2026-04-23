@@ -10,27 +10,49 @@
 //! like `RECV_MULTI`, `SEND_ZC`, and `ACCEPT_MULTI` are out of scope and will
 //! layer on top later.
 //!
-//! # user_data encoding
+//! # `user_data` encoding
 //!
-//! CQE `user_data` is a 64-bit value. We use specific sentinels for
-//! internally-generated SQEs and reserve everything else for exposed
-//! [`ScheduledIo`] pointers:
+//! CQE `user_data` is a 64-bit value encoded as
+//! `(variant: u8, gen: u24, key: u32)`:
 //!
-//! - [`USER_DATA_EVENTFD`]  — an external-thread wake arrived on our eventfd.
-//! - [`USER_DATA_MSG_RING`] — a cross-worker `MSG_RING` wake.
-//! - [`USER_DATA_IGNORE`]   — the completion of a control SQE (POLL_REMOVE,
-//!   TIMEOUT cancel, etc.) whose result we don't care about.
-//! - Any other value is an exposed `*const ScheduledIo` via
-//!   [`super::EXPOSE_IO`].
+//! ```text
+//! bit 63       bit 56        bit 32                    bit 0
+//!  │            │             │                         │
+//!  ├────────────┼─────────────┼─────────────────────────┤
+//!  │  variant   │     gen     │           key           │
+//!  │  (8 bit)   │   (24 bit)  │        (32 bit)         │
+//!  └────────────┴─────────────┴─────────────────────────┘
+//! ```
 //!
-//! The sentinels occupy the top of the 64-bit range, well outside the
-//! canonical address range of any user-space pointer, so there is no
-//! collision risk.
+//! - `key` indexes into a per-reactor [`Slab`] of [`OpState`].
+//! - `gen` is a per-reactor monotonic generation counter, bumped on every
+//!   slab insert. Stale CQEs that arrive after a slot has been recycled are
+//!   detected by gen-mismatch and silently dropped. 24 bits gives ~16M
+//!   distinct generations; collision requires an in-flight CQE to survive
+//!   that many subsequent slab inserts, which is not physically achievable.
+//! - `variant` is a fast-path discriminator so the hot drain loop avoids an
+//!   enum match per CQE:
+//!     - [`VARIANT_POLL_MULTI`] — multi-shot `POLL_ADD` registration.
+//!     - [`VARIANT_CONTROL`] — one-shot control op (POLL_REMOVE ack,
+//!       TIMEOUT, MSG_RING send-ack) whose result we discard.
+//!     - [`VARIANT_EVENTFD`] — external-thread wake delivered via eventfd.
+//!     - [`VARIANT_MSG_RING_INCOMING`] — cross-worker wake delivered via
+//!       `MSG_RING` from a peer reactor.
+//!
+//! The encoding replaces the legacy `EXPOSE_IO`-pointer scheme: the kernel
+//! never sees a pointer, so pointer-reuse races are impossible. The
+//! [`OpState::PollMulti`] arm holds the registration's `Arc<ScheduledIo>`
+//! until the *terminal* CQE for that slot arrives (no `IORING_CQE_F_MORE`),
+//! at which point the slab entry is removed and the `Arc` is dropped. This
+//! is a deterministic, kernel-handshake-bounded lifetime — no time-based
+//! retention pipeline.
 //!
 //! [`Driver`]: super::driver::Driver
 //! [`ScheduledIo`]: super::ScheduledIo
+//! [`Slab`]: slab::Slab
 
-use io_uring::{opcode, types, IoUring};
+use io_uring::{cqueue, opcode, types, IoUring};
+use slab::Slab;
 
 use crate::io::{Interest, Ready};
 use crate::loom::sync::Arc;
@@ -39,6 +61,7 @@ use crate::runtime::io::ScheduledIo;
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// Submission queue depth. Per-worker, so small is fine.
@@ -48,20 +71,96 @@ const SQ_ENTRIES: u32 = 512;
 /// slow drains (4× the io_uring default of 2048).
 const CQ_ENTRIES: u32 = 8192;
 
-/// `user_data` sentinel for the per-worker eventfd's POLL_ADD_MULTI CQE.
-pub(crate) const USER_DATA_EVENTFD: u64 = u64::MAX;
+// ===== user_data variant tags =====
 
-/// `user_data` sentinel for cross-worker `MSG_RING` wakes.
-pub(crate) const USER_DATA_MSG_RING: u64 = u64::MAX - 1;
+/// Multi-shot `POLL_ADD` registration. The hot path.
+const VARIANT_POLL_MULTI: u8 = 0x00;
 
-/// `user_data` sentinel for control SQEs whose completion we ignore.
-pub(crate) const USER_DATA_IGNORE: u64 = u64::MAX - 2;
+/// One-shot control op (POLL_REMOVE ack, TIMEOUT, MSG_RING send-ack).
+const VARIANT_CONTROL: u8 = 0x01;
 
-/// Smallest reserved sentinel — anything `<` this is treated as a
-/// `ScheduledIo` pointer. Chosen to leave a comfortable gap above any
-/// plausible user-space pointer on 64-bit Linux (canonical addresses are at
-/// most 57 bits today).
-const RESERVED_SENTINEL_FLOOR: u64 = u64::MAX - 15;
+/// External-thread wake delivered via eventfd `POLL_ADD_MULTI`.
+const VARIANT_EVENTFD: u8 = 0x02;
+
+/// Cross-worker wake delivered via a peer's `MSG_RING`.
+const VARIANT_MSG_RING_INCOMING: u8 = 0x03;
+
+// ===== well-known slab keys =====
+//
+// These are populated as the very first inserts in `Reactor::new`, in this
+// order, so peers can encode the receiver's incoming-MSG_RING `user_data`
+// without per-worker advertisement.
+
+/// Slab key for the eventfd `POLL_ADD_MULTI` registration. Inserted first.
+const KEY_EVENTFD: u32 = 0;
+
+/// Slab key for the incoming-MSG_RING slot. Inserted second.
+const KEY_MSG_RING_INCOMING: u32 = 1;
+
+/// Encoded `user_data` value that peers stamp on `MsgRingData` SQEs targeting
+/// our ring. The slot is reactor-lifetime (gen never advances), so this is a
+/// universal constant — no per-peer advertisement is required.
+const MSG_RING_INCOMING_UD: u64 = encode(VARIANT_MSG_RING_INCOMING, 0, KEY_MSG_RING_INCOMING);
+
+/// Encoded `user_data` for the eventfd POLL_ADD_MULTI registration. Submitted
+/// once at construction and never re-issued.
+const EVENTFD_UD: u64 = encode(VARIANT_EVENTFD, 0, KEY_EVENTFD);
+
+// ===== encoding helpers =====
+
+/// Encode a `(variant, gen, key)` triple into a 64-bit `user_data`.
+///
+/// `gen` is masked to 24 bits; the caller is expected to keep it within
+/// range (the per-reactor counter wraps modulo 2^24).
+const fn encode(variant: u8, gen: u32, key: u32) -> u64 {
+    ((variant as u64) << 56) | (((gen as u64) & 0x00FF_FFFF) << 32) | (key as u64)
+}
+
+/// Decode a 64-bit `user_data` back into `(variant, gen, key)`.
+const fn decode(ud: u64) -> (u8, u32, u32) {
+    let variant = (ud >> 56) as u8;
+    let gen = ((ud >> 32) & 0x00FF_FFFF) as u32;
+    let key = ud as u32;
+    (variant, gen, key)
+}
+
+// ===== slab entry / op state =====
+
+/// Per-slot entry in the reactor's [`Slab`].
+struct SlotEntry {
+    /// Generation at which this slot was last inserted into. Compared
+    /// against the `gen` field decoded from incoming CQEs to detect stale
+    /// CQEs that arrived after a slot was recycled.
+    gen: u32,
+    state: OpState,
+}
+
+/// State stored alongside each in-flight io_uring op.
+enum OpState {
+    /// Multi-shot `POLL_ADD`. Lives from `register` until the kernel posts a
+    /// CQE without `IORING_CQE_F_MORE` (either `-ECANCELED` after our
+    /// `POLL_REMOVE`, or autonomous kernel cleanup, e.g. on `POLLHUP`).
+    PollMulti {
+        io: Arc<ScheduledIo>,
+        /// True once we've submitted `POLL_REMOVE` for this slot. Currently
+        /// informational only; kept for future diagnostics.
+        #[allow(dead_code)]
+        removing: bool,
+    },
+
+    /// One-shot control op. Removed on first CQE.
+    Control,
+
+    /// The eventfd `POLL_ADD_MULTI` registration. Inserted at `Reactor::new`
+    /// and never removed during the reactor's lifetime.
+    Eventfd,
+
+    /// Receive slot for incoming `MSG_RING` wakes from peer reactors.
+    /// Inserted at `Reactor::new` and never removed. The slot itself has no
+    /// kernel registration; peers encode this slot's key into the
+    /// `MsgRingData` SQEs they push on their own rings.
+    MsgRingIncoming,
+}
 
 /// Per-worker io_uring reactor.
 ///
@@ -77,13 +176,23 @@ pub(crate) struct Reactor {
     /// eventfd for external-thread wakeups. Held behind an `Arc` so
     /// [`ExternalWaker`]s can be handed out cheaply to non-worker threads.
     external_wake_fd: Arc<OwnedFd>,
+
+    /// Active op slab keyed by `u32` (cast on insert; we cap at `u32::MAX`
+    /// in practice since the slab is per-worker and bounded by active fd
+    /// count).
+    ops: Slab<SlotEntry>,
+
+    /// Monotonic generation counter, bumped on every slab insert. 24-bit
+    /// effective range (truncated by [`encode`]); wraparound is
+    /// astronomically unlikely to collide with an outstanding CQE.
+    next_gen: u32,
 }
 
 /// Thread-safe handle for waking a [`Reactor`] from a non-worker thread.
 ///
 /// A write to the underlying eventfd races with the reactor's `park()` call
 /// and causes the POLL_ADD_MULTI registration on the eventfd to fire, which
-/// posts a CQE with `USER_DATA_EVENTFD` and unblocks the park.
+/// posts a CQE with [`VARIANT_EVENTFD`] and unblocks the park.
 ///
 /// Cheap to clone — it's just an `Arc<OwnedFd>`.
 #[derive(Clone, Debug)]
@@ -152,11 +261,25 @@ impl Reactor {
             .build(SQ_ENTRIES)?;
 
         let external_wake_fd = make_eventfd()?;
+
+        // Pre-allocate the two reactor-lifetime slab slots in the order
+        // required by the well-known-key constants. Slab fills the lowest
+        // free index first, so a fresh slab gives us key=0 then key=1.
+        let mut ops: Slab<SlotEntry> = Slab::new();
+        let k_evt = ops.insert(SlotEntry { gen: 0, state: OpState::Eventfd });
+        let k_msg = ops.insert(SlotEntry { gen: 0, state: OpState::MsgRingIncoming });
+        debug_assert_eq!(k_evt as u32, KEY_EVENTFD, "well-known slab order changed");
+        debug_assert_eq!(k_msg as u32, KEY_MSG_RING_INCOMING, "well-known slab order changed");
+
         register_eventfd_multishot(&mut ring, external_wake_fd.as_raw_fd())?;
 
         Ok(Self {
             ring,
             external_wake_fd: Arc::new(external_wake_fd),
+            ops,
+            // Start at 1; gen=0 is reserved for the never-recycled
+            // well-known slots so they don't compete for the counter.
+            next_gen: 1,
         })
     }
 
@@ -191,14 +314,20 @@ impl Reactor {
     /// non-blocking syscall, comparable to an eventfd write.
     #[allow(dead_code)]
     pub(crate) fn send_msg_ring(&mut self, target_ring_fd: RawFd) -> io::Result<()> {
+        // Allocate a Control slot for our own send-ack; it'll be removed on
+        // first CQE in `drain_completions`.
+        let (ack_ud, _ack_key) = self.alloc_control_slot();
+
+        // The peer-side user_data is the universal MSG_RING_INCOMING_UD —
+        // every reactor pre-allocates that slot at the same well-known key.
         let sqe = opcode::MsgRingData::new(
             types::Fd(target_ring_fd),
-            0,                    // `result` — surfaces as CQE.result on receiver; unused.
-            USER_DATA_MSG_RING,   // CQE user_data posted on the *target* ring.
-            None,                 // no user_flags pass-through.
+            0,                       // `result` — surfaces as CQE.result on receiver; unused.
+            MSG_RING_INCOMING_UD,    // CQE user_data posted on the *target* ring.
+            None,                    // no user_flags pass-through.
         )
         .build()
-        .user_data(USER_DATA_IGNORE); // our own completion (MSG send ack) is discarded.
+        .user_data(ack_ud);
 
         // SAFETY: MsgRingData references no user buffers; always safe.
         unsafe { self.push_sqe(sqe)? };
@@ -210,55 +339,98 @@ impl Reactor {
 
     /// Register interest in readiness events for `fd`.
     ///
-    /// Pushes a multi-shot `POLL_ADD` SQE with `user_data` set to the exposed
-    /// pointer of `scheduled_io`. The SQE is staged in the submission ring but
+    /// Allocates a slab slot holding `Arc::clone(scheduled_io)`, stamps the
+    /// slot's key onto `scheduled_io.uring_slab_key`, and pushes a multi-shot
+    /// `POLL_ADD` SQE whose `user_data` encodes the `(variant, gen, key)`
+    /// tuple for that slot. The SQE is staged in the submission ring but
     /// not submitted; it flushes at the next park, or sooner if the SQ fills
     /// up.
     ///
-    /// # Safety of the `user_data` pointer
+    /// # Lifetime
     ///
-    /// `scheduled_io` is held behind an `Arc` by the [`RegistrationSet`]; it
-    /// will not be freed until it is removed from that set *and* the I/O
-    /// driver is not concurrently draining. Our deregister path issues
-    /// `POLL_REMOVE` before the `Arc` is dropped, and park drains all CQEs
-    /// synchronously, so the pointer remains valid for the lifetime of the
-    /// registration.
-    ///
-    /// [`RegistrationSet`]: super::RegistrationSet
+    /// The cloned `Arc` lives in the slab until the kernel posts a CQE for
+    /// this slot without `IORING_CQE_F_MORE` (terminal CQE), at which point
+    /// the drain loop removes the slot and drops the `Arc`. There is no
+    /// pointer-aliasing risk: the kernel only ever sees the encoded
+    /// `user_data`, never the `ScheduledIo` address.
     pub(crate) fn register(
         &mut self,
         fd: RawFd,
         interest: Interest,
-        scheduled_io: &ScheduledIo,
+        scheduled_io: &Arc<ScheduledIo>,
     ) -> io::Result<()> {
-        let user_data = token_for(scheduled_io);
-        debug_assert!(
-            user_data < RESERVED_SENTINEL_FLOOR,
-            "ScheduledIo pointer collides with a reserved user_data sentinel",
-        );
+        let gen = self.next_gen();
+        let key = self.ops.insert(SlotEntry {
+            gen,
+            state: OpState::PollMulti {
+                io: Arc::clone(scheduled_io),
+                removing: false,
+            },
+        });
+        let key_u32 = u32::try_from(key).expect("slab key exceeds u32");
 
+        // Publish the key onto the ScheduledIo so a later deregister can
+        // find this slot. Both writes and reads happen on the worker
+        // thread, so Relaxed is sufficient.
+        scheduled_io.uring_slab_key.store(key_u32, Ordering::Relaxed);
+
+        let user_data = encode(VARIANT_POLL_MULTI, gen, key_u32);
         let mask = poll_mask_from_interest(interest);
         let sqe = opcode::PollAdd::new(types::Fd(fd), mask)
             .multi(true)
             .build()
             .user_data(user_data);
 
-        // SAFETY: `sqe`'s operands are valid for the lifetime of the multi-shot
-        // registration. The fd is owned by the caller and deregister() issues
-        // a matching POLL_REMOVE before the ScheduledIo pointer is dropped.
+        // SAFETY: `sqe`'s operands (just an fd and a poll mask) are valid;
+        // the multi-shot registration carries no user-buffer references.
+        // The slab slot keeps the Arc alive until the terminal CQE.
         unsafe { self.push_sqe(sqe) }
     }
 
-    /// Deregister a previously-registered fd by submitting a `POLL_REMOVE`
-    /// keyed on the `ScheduledIo` pointer that was used as `user_data`.
+    /// Deregister a previously-registered fd.
     ///
-    /// The REMOVE's own completion is tagged with [`USER_DATA_IGNORE`] and
-    /// discarded during drain.
-    pub(crate) fn deregister(&mut self, scheduled_io: &ScheduledIo) -> io::Result<()> {
-        let target = token_for(scheduled_io);
-        let sqe = opcode::PollRemove::new(target).build().user_data(USER_DATA_IGNORE);
+    /// Looks up the slab key that `register` stored on `scheduled_io`,
+    /// marks the slot as `removing`, and submits a `POLL_REMOVE` keyed on
+    /// the slot's encoded `user_data`. The slot itself is **not** freed
+    /// here: it stays alive (with its `Arc<ScheduledIo>` clone) until the
+    /// kernel posts the terminal CQE for the multi-shot poll
+    /// (`-ECANCELED` without `IORING_CQE_F_MORE`), at which point
+    /// `drain_completions` removes it.
+    ///
+    /// The `POLL_REMOVE`'s own ack CQE is tagged with a fresh
+    /// [`VARIANT_CONTROL`] slot which is freed on its single completion.
+    pub(crate) fn deregister(&mut self, scheduled_io: Arc<ScheduledIo>) -> io::Result<()> {
+        let key = scheduled_io.uring_slab_key.load(Ordering::Relaxed);
+        if key == u32::MAX {
+            // Never registered (or already deregistered). No-op.
+            return Ok(());
+        }
+
+        // Find the slot, recover its current gen, and flip `removing` for
+        // diagnostic visibility. If the slot is already gone (e.g. a prior
+        // terminal CQE removed it autonomously), there's nothing to cancel.
+        let target_ud = match self.ops.get_mut(key as usize) {
+            Some(entry) => match &mut entry.state {
+                OpState::PollMulti { removing, .. } => {
+                    *removing = true;
+                    encode(VARIANT_POLL_MULTI, entry.gen, key)
+                }
+                _ => {
+                    // Slot was reused for a different op variant —
+                    // shouldn't happen with disciplined caller usage.
+                    debug_assert!(false, "deregister hit non-PollMulti slot");
+                    return Ok(());
+                }
+            },
+            None => return Ok(()),
+        };
+
+        let (ack_ud, _ack_key) = self.alloc_control_slot();
+        let sqe = opcode::PollRemove::new(target_ud).build().user_data(ack_ud);
+
         // SAFETY: `PollRemove` references no user buffers; it is always safe.
-        unsafe { self.push_sqe(sqe) }
+        unsafe { self.push_sqe(sqe)? };
+        Ok(())
     }
 
     /// Block until at least one CQE is available, then drain completions.
@@ -276,8 +448,8 @@ impl Reactor {
     /// blocking.
     ///
     /// Implemented by prepending a `TIMEOUT` SQE to the submission batch; the
-    /// timeout's own CQE is discarded. Using a linked timeout SQE rather than
-    /// the `io_uring_enter` `arg` parameter keeps the code path uniform.
+    /// timeout's own CQE is treated as a [`VARIANT_CONTROL`] completion and
+    /// freed in the drain.
     ///
     /// [`park`]: Reactor::park
     pub(crate) fn park_timeout(&mut self, timeout: Duration) -> io::Result<()> {
@@ -291,9 +463,8 @@ impl Reactor {
         let ts = types::Timespec::new()
             .sec(timeout.as_secs())
             .nsec(timeout.subsec_nanos());
-        let sqe = opcode::Timeout::new(&ts as *const _)
-            .build()
-            .user_data(USER_DATA_IGNORE);
+        let (ud, _key) = self.alloc_control_slot();
+        let sqe = opcode::Timeout::new(&ts as *const _).build().user_data(ud);
 
         // SAFETY: `ts` lives until submit_and_wait returns; the kernel copies
         // the Timespec value during submission.
@@ -305,61 +476,131 @@ impl Reactor {
     }
 
     /// Drain the completion queue, dispatching readiness to [`ScheduledIo`]s
-    /// and ignoring control-SQE completions.
-    ///
-    /// This is also the hook point for a future stealer: the logic here is
-    /// purely CQE-driven and would work just as well against a victim ring's
-    /// CQ once CAS-based head advancement is added.
+    /// and freeing slab slots as their terminal CQEs arrive.
     fn drain_completions(&mut self) {
         // Collect the eventfd fd up front so we can drain it without
         // borrowing `self` mutably while iterating the CQ.
         let external_fd = self.external_wake_fd.as_raw_fd();
         let mut saw_external_wake = false;
 
+        // Stage slab removals after the CQ borrow drops; we cannot mutate
+        // `self.ops` while the `cq` iterator borrows `self.ring`. Capacity
+        // hint avoids re-allocs in the common per-park burst.
+        let mut to_remove: Vec<u32> = Vec::with_capacity(16);
+        // Stage readiness deliveries the same way — `ScheduledIo::wake` may
+        // run arbitrary user code (waker callbacks), so we want it strictly
+        // outside the CQ-iterator borrow.
+        let mut readiness_deliveries: Vec<(Arc<ScheduledIo>, Ready)> = Vec::with_capacity(16);
+
         let cq = self.ring.completion();
         for cqe in cq {
-            match cqe.user_data() {
-                USER_DATA_EVENTFD => {
-                    // External-thread wake arrived. We drain the eventfd's
-                    // counter below (outside the CQ borrow) so subsequent
-                    // writes produce fresh CQEs. The POLL_ADD_MULTI
-                    // registration auto-rearms — no resubmission needed.
+            let (variant, gen, key) = decode(cqe.user_data());
+
+            match variant {
+                VARIANT_POLL_MULTI => {
+                    // Look up the slot; reject stale CQEs whose gen no
+                    // longer matches the slot's recorded gen (slot was
+                    // recycled between submission and completion).
+                    let entry = match self.ops.get(key as usize) {
+                        Some(e) if e.gen == gen => e,
+                        _ => continue, // stale CQE; drop.
+                    };
+                    let io_arc = match &entry.state {
+                        OpState::PollMulti { io, .. } => io.clone(),
+                        _ => continue, // defense-in-depth; gen check above should make this unreachable.
+                    };
+
+                    let result = cqe.result();
+                    let flags = cqe.flags();
+                    let has_more = cqueue::more(flags);
+
+                    if result >= 0 {
+                        let ready = ready_from_poll_flags(result);
+                        readiness_deliveries.push((io_arc, ready));
+                    }
+                    // result < 0 is typically -ECANCELED (our POLL_REMOVE
+                    // landed) or kernel-side autonomous cleanup. Either
+                    // way, no readiness to dispatch.
+
+                    if !has_more {
+                        // Terminal CQE for this slot. The Arc is dropped
+                        // when we remove it after the loop.
+                        to_remove.push(key);
+                    }
+                }
+
+                VARIANT_CONTROL => {
+                    // One-shot: free the slot. Stale CQEs (gen mismatch)
+                    // also clean up — we'd never reuse a Control slot for
+                    // anything else, so removal is safe either way.
+                    if let Some(entry) = self.ops.get(key as usize) {
+                        if entry.gen == gen {
+                            to_remove.push(key);
+                        }
+                    }
+                }
+
+                VARIANT_EVENTFD => {
+                    // Multi-shot, reactor-lifetime slot. Slot stays.
                     saw_external_wake = true;
                 }
-                USER_DATA_MSG_RING | USER_DATA_IGNORE => {
-                    // Cross-worker wake: nothing to dispatch here, the
-                    // scheduler handles the "check task queues" logic
-                    // *around* park(). Control SQE completions (POLL_REMOVE,
-                    // TIMEOUT, MSG_RING send-ack) are discarded.
+
+                VARIANT_MSG_RING_INCOMING => {
+                    // Cross-worker wake. No payload to dispatch — the
+                    // scheduler's task-queue checks happen around park().
+                    // Slot stays.
                 }
-                ptr_value => {
-                    let flags = cqe.result();
-                    if flags < 0 {
-                        // Negative result on POLL_ADD_MULTI means the
-                        // registration was cancelled (typically by our own
-                        // POLL_REMOVE, or by the kernel on shutdown). No
-                        // readiness to dispatch.
-                        continue;
-                    }
-                    let ready = ready_from_poll_flags(flags);
-                    // SAFETY: `ptr_value` is an exposed pointer published by
-                    // [`ScheduledIo::token`]. Its target is kept alive by the
-                    // `Arc` in the registration set until matching
-                    // POLL_REMOVE completes; see the `register` safety note.
-                    let io: &ScheduledIo =
-                        unsafe { &*super::EXPOSE_IO.from_exposed_addr(ptr_value as usize) };
-                    io.set_readiness(Tick::Set, |curr| curr | ready);
-                    io.wake(ready);
+
+                _ => {
+                    // Unknown variant — ignore. Could happen if a future
+                    // op type is introduced and an old binary sees its
+                    // CQEs (won't happen in practice; reactor and CQE
+                    // producers are versioned together).
                 }
             }
         }
-        // The iterator consumed `cq`, so its drop ran at the end of the
-        // `for` loop and the updated head pointer has already been written
-        // back to the kernel.
+        // Iterator drop syncs the CQ head pointer back to the kernel.
+
+        for key in to_remove {
+            // Slab::try_remove tolerates already-vacant slots (which can
+            // happen if a Control completion fires twice — defensive).
+            let _ = self.ops.try_remove(key as usize);
+        }
+
+        for (io, ready) in readiness_deliveries {
+            io.set_readiness(Tick::Set, |curr| curr | ready);
+            io.wake(ready);
+        }
 
         if saw_external_wake {
             drain_eventfd(external_fd);
         }
+    }
+
+    // ===== private helpers =====
+
+    /// Allocate a one-shot Control slot and return its encoded `user_data`
+    /// plus the slab key (caller may discard the key — it'll be freed when
+    /// the CQE arrives).
+    fn alloc_control_slot(&mut self) -> (u64, u32) {
+        let gen = self.next_gen();
+        let key = self.ops.insert(SlotEntry { gen, state: OpState::Control });
+        let key_u32 = u32::try_from(key).expect("slab key exceeds u32");
+        (encode(VARIANT_CONTROL, gen, key_u32), key_u32)
+    }
+
+    /// Bump and return the next generation. Wraps modulo 2^24 (the encoded
+    /// width); collision with an outstanding CQE on the same slot would
+    /// require ~16M intervening inserts and is not physically realizable.
+    fn next_gen(&mut self) -> u32 {
+        let g = self.next_gen;
+        // Wrap into the 24-bit encoded range.
+        self.next_gen = self.next_gen.wrapping_add(1) & 0x00FF_FFFF;
+        // Reserve 0 for well-known slots; skip it on wrap.
+        if self.next_gen == 0 {
+            self.next_gen = 1;
+        }
+        g
     }
 
     /// Push an SQE into the submission ring, flushing to the kernel if the
@@ -383,15 +624,10 @@ impl Reactor {
 
 impl std::fmt::Debug for Reactor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Reactor").finish_non_exhaustive()
+        f.debug_struct("Reactor")
+            .field("in_flight_ops", &self.ops.len())
+            .finish_non_exhaustive()
     }
-}
-
-/// Convert a `ScheduledIo` reference into the `u64` `user_data` we stash on
-/// its SQEs. Uses the same `EXPOSE_IO` mechanism as the mio path so both
-/// drivers can coexist and share the readiness machinery.
-fn token_for(scheduled_io: &ScheduledIo) -> u64 {
-    super::EXPOSE_IO.expose_provenance(scheduled_io) as u64
 }
 
 /// Create a non-blocking, close-on-exec eventfd for external-thread wakeups.
@@ -411,17 +647,17 @@ fn make_eventfd() -> io::Result<OwnedFd> {
 }
 
 /// Register `fd` on `ring` with a multi-shot POLL_ADD for readable events
-/// (the eventfd is only ever read-ready). Submits synchronously so the
-/// registration is live before `new()` returns.
+/// (the eventfd is only ever read-ready), tagged with [`EVENTFD_UD`].
+/// Submits synchronously so the registration is live before `new()` returns.
 fn register_eventfd_multishot(ring: &mut IoUring, fd: RawFd) -> io::Result<()> {
     let sqe = opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32)
         .multi(true)
         .build()
-        .user_data(USER_DATA_EVENTFD);
+        .user_data(EVENTFD_UD);
 
     // SAFETY: fd outlives the registration (stored on the Reactor as an
-    // OwnedFd); matching POLL_REMOVE is issued implicitly by ring teardown
-    // when the reactor is dropped.
+    // OwnedFd); the multi-shot registration is torn down by the kernel
+    // when the ring is closed at reactor drop.
     while unsafe { ring.submission().push(&sqe) }.is_err() {
         ring.submit()?;
     }
@@ -458,10 +694,65 @@ fn poll_mask_from_interest(interest: Interest) -> u32 {
     mask
 }
 
+/// Translate a CQE poll-result bitmask into tokio's [`Ready`].
+fn ready_from_poll_flags(flags: i32) -> Ready {
+    let flags = flags as i16;
+    let mut ready = Ready::EMPTY;
+    if flags & libc::POLLIN != 0 {
+        ready |= Ready::READABLE;
+    }
+    if flags & libc::POLLOUT != 0 {
+        ready |= Ready::WRITABLE;
+    }
+    if flags & libc::POLLRDHUP != 0 {
+        ready |= Ready::READ_CLOSED;
+    }
+    if flags & libc::POLLHUP != 0 {
+        // HUP fires on both sides of the connection; map to WRITE_CLOSED,
+        // matching mio's behavior on Linux.
+        ready |= Ready::WRITE_CLOSED;
+    }
+    if flags & libc::POLLERR != 0 {
+        ready |= Ready::ERROR;
+    }
+    if flags & libc::POLLPRI != 0 {
+        ready |= Ready::PRIORITY;
+    }
+    ready
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// `encode`/`decode` round-trips correctly across all variant tags and
+    /// boundary values for `gen` and `key`.
+    #[test]
+    fn slot_encoding_roundtrip() {
+        let cases = [
+            (VARIANT_POLL_MULTI, 0u32, 0u32),
+            (VARIANT_POLL_MULTI, 0x00FF_FFFF, u32::MAX),
+            (VARIANT_CONTROL, 0x12_3456, 0xDEAD_BEEF),
+            (VARIANT_EVENTFD, 0, KEY_EVENTFD),
+            (VARIANT_MSG_RING_INCOMING, 0, KEY_MSG_RING_INCOMING),
+        ];
+        for (v, g, k) in cases {
+            let ud = encode(v, g, k);
+            let (v2, g2, k2) = decode(ud);
+            assert_eq!((v, g, k), (v2, g2, k2), "round-trip failed for {ud:#x}");
+        }
+    }
+
+    /// The well-known constants are derived from the well-known keys at
+    /// compile time; verify the layout against the variant tags.
+    #[test]
+    fn well_known_constants_decode_correctly() {
+        let (v, g, k) = decode(MSG_RING_INCOMING_UD);
+        assert_eq!((v, g, k), (VARIANT_MSG_RING_INCOMING, 0, KEY_MSG_RING_INCOMING));
+        let (v, g, k) = decode(EVENTFD_UD);
+        assert_eq!((v, g, k), (VARIANT_EVENTFD, 0, KEY_EVENTFD));
+    }
 
     /// Ring construction succeeds on a supported kernel. Smoke test for the
     /// setup flags — if SINGLE_ISSUER/DEFER_TASKRUN aren't available we want
@@ -470,13 +761,14 @@ mod tests {
     fn reactor_new_succeeds() {
         let reactor = Reactor::new();
         match reactor {
-            Ok(_) => {}
+            Ok(r) => {
+                // Two well-known slots pre-allocated.
+                assert_eq!(r.ops.len(), 2);
+            }
             Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
-                // Kernel without io_uring support — skip.
                 eprintln!("skipping: io_uring not supported on this kernel");
             }
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-                // Older kernel missing one of our setup flags.
                 eprintln!("skipping: required io_uring setup flags unavailable ({e})");
             }
             Err(e) => panic!("unexpected error from Reactor::new: {e}"),
@@ -517,9 +809,6 @@ mod tests {
 
         handle.join().unwrap();
 
-        // Sanity: we should have blocked ~50ms, not 0 (which would mean the
-        // wake was already pending before park) and not hit an internal
-        // timeout (we have none). Allow wide slop for CI noise.
         assert!(
             elapsed >= Duration::from_millis(25),
             "park returned too quickly: {elapsed:?}",
@@ -531,12 +820,8 @@ mod tests {
     }
 
     /// A reactor can send a MSG_RING wake to another reactor and unblock
-    /// its park. Exercises the cross-worker wake path.
-    ///
-    /// Each reactor must be constructed on the same thread that will drive
-    /// it, because `IORING_SETUP_SINGLE_ISSUER` binds the ring's submitter
-    /// identity at the first `io_uring_enter` call. We pass the target
-    /// ring's fd across a channel rather than moving the receiver.
+    /// its park. Exercises the cross-worker wake path with the universal
+    /// `MSG_RING_INCOMING_UD` constant.
     #[test]
     fn msg_ring_wakes_peer() {
         use std::sync::mpsc;
@@ -544,10 +829,8 @@ mod tests {
         let (fd_tx, fd_rx) = mpsc::channel::<RawFd>();
         let (elapsed_tx, elapsed_rx) = mpsc::channel::<Duration>();
 
-        // Receiver thread: owns its own reactor end-to-end.
         let receiver_thread = std::thread::spawn(move || {
             let Ok(mut receiver) = Reactor::new() else {
-                // Propagate a dummy target so the sender side doesn't hang.
                 fd_tx.send(-1).unwrap();
                 return;
             };
@@ -567,15 +850,9 @@ mod tests {
 
         let Ok(mut sender) = Reactor::new() else {
             eprintln!("skipping: sender reactor unavailable");
-            // Send something to unblock the receiver (an external wake via
-            // a fresh eventfd would also work, but we're already here).
-            let _ = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(10));
-            });
             return;
         };
 
-        // Give the receiver time to enter park() before we send.
         std::thread::sleep(Duration::from_millis(50));
         sender.send_msg_ring(target_fd).expect("send_msg_ring should succeed");
 
@@ -591,31 +868,67 @@ mod tests {
             "receiver park took suspiciously long: {elapsed:?}",
         );
     }
-}
 
-/// Translate a CQE poll-result bitmask into tokio's [`Ready`].
-fn ready_from_poll_flags(flags: i32) -> Ready {
-    let flags = flags as i16;
-    let mut ready = Ready::EMPTY;
-    if flags & libc::POLLIN != 0 {
-        ready |= Ready::READABLE;
+    /// After register, the slab grows by one and the slab key is published
+    /// onto the `ScheduledIo`. After deregister + park-until-terminal-CQE,
+    /// the slab returns to its baseline size and the registration's `Arc`
+    /// strong count drops back to the caller-only count.
+    #[test]
+    fn deregister_releases_arc_on_terminal_cqe() {
+        use std::os::fd::{BorrowedFd, FromRawFd};
+
+        let Ok(mut reactor) = Reactor::new() else {
+            eprintln!("skipping: reactor unavailable");
+            return;
+        };
+
+        // Build a pipe to register against — a real fd avoids any
+        // -EBADF surprises and the read end is a legitimate POLLIN target.
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: standard pipe(2) call.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        assert_eq!(rc, 0, "pipe2 failed: {}", io::Error::last_os_error());
+        // SAFETY: we own both ends of the pipe.
+        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let _write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
+        let baseline = reactor.ops.len();
+
+        let io = Arc::new(ScheduledIo::default());
+        // SAFETY: read_end is alive and owned for the duration of this scope.
+        let borrowed = unsafe { BorrowedFd::borrow_raw(read_end.as_raw_fd()) };
+        reactor
+            .register(borrowed.as_raw_fd(), Interest::READABLE, &io)
+            .expect("register");
+        assert_eq!(reactor.ops.len(), baseline + 1, "register should add a slot");
+        assert_ne!(
+            io.uring_slab_key.load(Ordering::Relaxed),
+            u32::MAX,
+            "slab key should be published on ScheduledIo",
+        );
+
+        // Strong count: caller's `io` + the slab's clone = 2.
+        assert_eq!(Arc::strong_count(&io), 2);
+
+        // Submit POLL_REMOVE; the terminal CQE will arrive on the next
+        // park (the kernel posts -ECANCELED with F_MORE clear).
+        reactor.deregister(Arc::clone(&io)).expect("deregister");
+
+        // Drain until the PollMulti slot is gone. The Control ack and the
+        // PollMulti terminal CQE may arrive on different submits depending
+        // on kernel scheduling; loop with a bounded timeout to tolerate
+        // either ordering.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&io) > 1 && std::time::Instant::now() < deadline {
+            reactor
+                .park_timeout(Duration::from_millis(100))
+                .expect("park drain");
+        }
+
+        assert_eq!(
+            Arc::strong_count(&io),
+            1,
+            "PollMulti slot should have been freed by the terminal CQE",
+        );
     }
-    if flags & libc::POLLOUT != 0 {
-        ready |= Ready::WRITABLE;
-    }
-    if flags & libc::POLLRDHUP != 0 {
-        ready |= Ready::READ_CLOSED;
-    }
-    if flags & libc::POLLHUP != 0 {
-        // HUP fires on both sides of the connection; map to WRITE_CLOSED,
-        // matching mio's behavior on Linux.
-        ready |= Ready::WRITE_CLOSED;
-    }
-    if flags & libc::POLLERR != 0 {
-        ready |= Ready::ERROR;
-    }
-    if flags & libc::POLLPRI != 0 {
-        ready |= Ready::PRIORITY;
-    }
-    ready
 }

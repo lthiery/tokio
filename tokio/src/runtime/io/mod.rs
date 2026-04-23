@@ -6,7 +6,7 @@ mod driver;
 use driver::{Direction, Tick};
 pub(crate) use driver::{Driver, Handle, ReadyEvent};
 
-mod registration;
+pub(crate) mod registration;
 pub(crate) use registration::Registration;
 
 mod registration_set;
