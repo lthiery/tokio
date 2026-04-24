@@ -578,6 +578,18 @@ pub(crate) fn clear_local_reactor() {
 /// practice this cannot happen because worker threads are either executing
 /// a task (not inside `park`) or blocked in the kernel (not executing
 /// anything), never both.
+/// Cheap probe: is a `Reactor` currently installed on this thread?
+///
+/// Useful for code that wants to branch on "am I on a uring worker?"
+/// *before* moving owned values into a closure — `with_local_reactor`
+/// captures its closure by move, so if no reactor is installed the
+/// closure is never called and the values it captured are dropped
+/// with it. Callers that need to keep those values on the "not on a
+/// worker" branch should call this probe first.
+pub(crate) fn local_reactor_installed() -> bool {
+    LOCAL_REACTOR.with(|slot| !slot.get().is_null())
+}
+
 pub(crate) fn with_local_reactor<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&mut Reactor) -> R,

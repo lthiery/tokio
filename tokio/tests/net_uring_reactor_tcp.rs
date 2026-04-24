@@ -166,3 +166,217 @@ fn tcp_read_blocks_then_wakes() {
         server.await.unwrap();
     });
 }
+
+// ======================================================================
+// Owned-buffer `uring_send` / `uring_recv` tests. These exercise the
+// owned-Bytes ops path: the caller hands a buffer to the kernel, the
+// reactor holds it in its slab for the full SQE lifetime, and returns
+// it via the terminal CQE alongside the kernel's byte count. See
+// `runtime/io/uring_bytes_ops.rs` for the ownership model docs.
+// ======================================================================
+
+#[test]
+fn uring_send_recv_round_trip() {
+    use bytes::{Bytes, BytesMut};
+    let rt = build_rt(1);
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let buf = BytesMut::zeroed(64);
+            let (result, buf) = sock.uring_recv(buf).await;
+            let n = result.expect("recv ok");
+            assert_eq!(&buf[..n], b"ping");
+
+            let out = Bytes::from_static(b"pong!");
+            let (result, _buf) = sock.uring_send(out).await;
+            let n = result.expect("send ok");
+            assert_eq!(n, 5);
+        });
+
+        let client = tokio::spawn(async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+            let out = Bytes::from_static(b"ping");
+            let (result, out) = sock.uring_send(out).await;
+            let n = result.expect("client send ok");
+            assert_eq!(n, 4);
+            assert_eq!(&out[..], b"ping", "buffer returned intact");
+
+            let buf = BytesMut::zeroed(64);
+            let (result, buf) = sock.uring_recv(buf).await;
+            let n = result.expect("client recv ok");
+            assert_eq!(&buf[..n], b"pong!");
+        });
+
+        server.await.unwrap();
+        client.await.unwrap();
+    });
+}
+
+#[test]
+fn uring_recv_short_read_returns_partial_buffer() {
+    // Capacity 64, peer sends 3 bytes and closes — the kernel's recv
+    // returns 3, the buffer is 64 bytes long, and bytes [0..3] match
+    // the payload.
+    use bytes::{Bytes, BytesMut};
+    let rt = build_rt(1);
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (r, _) = sock.uring_send(Bytes::from_static(b"hey")).await;
+            r.expect("send");
+            drop(sock);
+        });
+
+        let client = tokio::spawn(async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+            let buf = BytesMut::zeroed(64);
+            let (result, buf) = sock.uring_recv(buf).await;
+            let n = result.expect("recv ok");
+            assert_eq!(n, 3, "partial read kernel byte count");
+            assert_eq!(&buf[..n], b"hey");
+            assert_eq!(buf.len(), 64, "buffer capacity preserved on short read");
+        });
+        client.await.unwrap();
+        server.await.unwrap();
+    });
+}
+
+#[test]
+fn uring_send_off_worker_returns_unsupported_with_buf() {
+    // Outside a uring worker (plain std thread), uring_send must not
+    // consume the buffer — it returns Unsupported and hands back the
+    // exact bytes we passed in. We still need a uring worker somewhere
+    // to construct a `TcpStream`, but the send itself is invoked from
+    // a spawn_blocking context (no local reactor installed).
+    use bytes::Bytes;
+    let rt = build_rt(1);
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let sock = TcpStream::connect(addr).await.unwrap();
+
+        let fut = tokio::task::spawn_blocking(move || {
+            let payload = Bytes::from_static(b"payload");
+            // Block on the future from the blocking thread — no uring
+            // reactor installed there.
+            let (result, recovered) = futures::executor::block_on(sock.uring_send(payload));
+            (result, recovered)
+        });
+        let (result, recovered) = fut.await.unwrap();
+        let err = result.expect_err("off-worker uring_send should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(&recovered[..], b"payload", "buffer returned on off-worker error");
+    });
+}
+
+#[test]
+fn uring_recv_multi_round_trip_and_eof() {
+    // Exercise the multishot recv path end-to-end:
+    //   1) Client arms `uring_recv_multi` on a connected socket.
+    //   2) Server `uring_send`s two messages, then closes.
+    //   3) Client drains the stream: two BufferLeases then None.
+    use bytes::Bytes;
+    let rt = build_rt(1);
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (r, _) = sock.uring_send(Bytes::from_static(b"hello ")).await;
+            r.expect("send1");
+            let (r, _) = sock.uring_send(Bytes::from_static(b"world")).await;
+            r.expect("send2");
+            drop(sock);
+        });
+
+        let client = tokio::spawn(async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+            let mut stream = sock.uring_recv_multi();
+
+            // Collect bytes until EOF. Short / coalesced reads are
+            // possible (kernel may merge the two sends into one
+            // delivery), so concatenate whatever we get.
+            let mut collected: Vec<u8> = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let next = tokio::time::timeout(timeout, stream.next()).await
+                    .expect("recv multi timed out");
+                match next {
+                    Some(Ok(lease)) => {
+                        collected.extend_from_slice(&lease[..]);
+                    }
+                    Some(Err(e)) => panic!("recv multi error: {e}"),
+                    None => break,
+                }
+            }
+            assert_eq!(&collected[..], b"hello world");
+        });
+
+        server.await.unwrap();
+        client.await.unwrap();
+    });
+}
+
+#[test]
+fn uring_send_future_drop_is_safe() {
+    // Drop the uring_send future *before* it completes. The buffer
+    // must not be freed until the terminal CQE (potentially
+    // `-ECANCELED` from our best-effort AsyncCancel) arrives. We
+    // verify safety by (a) immediately reusing the socket for another
+    // send + recv and (b) not crashing / not hanging. The best signal
+    // we have for "buffer released on terminal CQE" is the second op
+    // succeeding without corruption.
+    use bytes::{Bytes, BytesMut};
+    let rt = build_rt(1);
+    rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let buf = BytesMut::zeroed(1024);
+            let (r, buf) = sock.uring_recv(buf).await;
+            let n = r.expect("server recv ok");
+            // We don't care what landed — only that it didn't crash.
+            assert!(n >= 1 && buf.len() == 1024);
+        });
+
+        let client = tokio::spawn(async move {
+            let sock = TcpStream::connect(addr).await.unwrap();
+
+            // Issue a send and drop the future before polling it to
+            // completion. The buffer lives in the slab; our Drop impl
+            // submits AsyncCancel.
+            {
+                let payload = Bytes::from_static(b"doomed");
+                let _fut = sock.uring_send(payload);
+                // _fut drops here without awaiting.
+            }
+
+            // Issue a second send and wait for it. If the first op's
+            // buffer had been freed prematurely (UAF), this operation
+            // would likely fault or scramble; success means the
+            // ownership invariant held.
+            let (r, _) = sock.uring_send(Bytes::from_static(b"x")).await;
+            r.expect("second send ok");
+            drop(sock);
+        });
+
+        client.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("server didn't hang")
+            .unwrap();
+    });
+}

@@ -24,6 +24,9 @@ cfg_io_uring_reactor! {
     // is selected on the runtime builder.
     pub(crate) mod uring_reactor;
     pub(crate) mod uring_driver;
+    pub(crate) mod uring_bytes_ops;
+    pub(crate) mod uring_buf_ring;
+    pub(crate) mod uring_recv_multi;
 }
 
 use crate::util::ptr_expose::PtrExposeDomain;

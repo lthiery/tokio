@@ -120,6 +120,18 @@ const CQ_ENTRIES: u32 = 4096;
 /// in-process runtimes, etc.).
 static RING_SETUP_PERMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Staged multishot-recv CQE, handed from the CQ drain loop to the
+/// post-loop dispatcher where `Arc<BufferRing>` cloning and inbox
+/// pushes happen outside the CQ-iterator borrow.
+struct RecvMultiCompletion {
+    key: u32,
+    result: i32,
+    has_more: bool,
+    /// Present when `IORING_CQE_F_BUFFER` was set — always the case
+    /// for non-negative results of a `BUFFER_SELECT` op.
+    bid: Option<u16>,
+}
+
 // ===== user_data variant tags =====
 
 /// Multi-shot `POLL_ADD` registration. The hot path.
@@ -133,6 +145,27 @@ const VARIANT_EVENTFD: u8 = 0x02;
 
 /// Cross-worker wake delivered via a peer's `MSG_RING`.
 const VARIANT_MSG_RING_INCOMING: u8 = 0x03;
+
+/// Owned-buffer `Send` op. Slab slot holds the [`bytes::Bytes`] for the
+/// SQE's full lifetime and the [`CompleterShared`] used to deliver the
+/// result. Freed on the single terminal CQE (success, error, or
+/// `-ECANCELED` after an `AsyncCancel`).
+const VARIANT_SEND_BYTES: u8 = 0x04;
+
+/// Owned-buffer `Recv` op. Slab slot holds the [`bytes::BytesMut`] for
+/// the SQE's full lifetime and the [`CompleterShared`] used to deliver
+/// the result. Freed on the single terminal CQE.
+const VARIANT_RECV_BYTES: u8 = 0x05;
+
+/// Multi-shot `Recv` op backed by a provided-buffer ring (pbuf_ring).
+/// One SQE stays armed on the socket for its whole lifetime; each
+/// delivered message is a CQE whose `flags` name the selected
+/// buffer id (`IORING_CQE_F_BUFFER`). The slab slot holds an
+/// [`Arc<RecvInbox>`] through which deliveries are surfaced to user
+/// code. The slot is freed on the single terminal CQE (kernel posts
+/// a CQE without `IORING_CQE_F_MORE` after `-ECANCELED`, -ENOBUFS
+/// without more buffers, or peer close on 0-byte res + no F_MORE).
+const VARIANT_RECV_MULTI: u8 = 0x06;
 
 // ===== well-known slab keys =====
 //
@@ -213,6 +246,38 @@ enum OpState {
     /// kernel registration; peers encode this slot's key into the
     /// `MsgRingData` SQEs they push on their own rings.
     MsgRingIncoming,
+
+    /// Owned-buffer `Send` op. The [`bytes::Bytes`] is held here — and
+    /// *only* here, never in user code or in the awaiting future — for
+    /// the full lifetime of the SQE. This is the load-bearing invariant
+    /// that lets us hand a pointer to kernel: as long as the slab entry
+    /// lives, so does the allocation the kernel is reading from. The
+    /// slot is freed exactly once, on the terminal CQE.
+    SendBytes {
+        buf: bytes::Bytes,
+        shared: Arc<super::uring_bytes_ops::CompleterShared<super::uring_bytes_ops::SendResult>>,
+    },
+
+    /// Owned-buffer `Recv` op. Mirror of [`Self::SendBytes`] but with a
+    /// [`bytes::BytesMut`] (the kernel writes into it). Same slot-freed-
+    /// on-terminal-CQE invariant.
+    RecvBytes {
+        buf: bytes::BytesMut,
+        shared: Arc<super::uring_bytes_ops::CompleterShared<super::uring_bytes_ops::RecvResult>>,
+    },
+
+    /// Multi-shot `Recv` op. The slot lives for the whole multishot
+    /// lifetime — one slab entry per armed socket, not per message.
+    /// The `inbox` is how deliveries reach user code.
+    RecvMulti {
+        inbox: Arc<super::uring_recv_multi::RecvInbox>,
+        /// True once a best-effort cancel has been submitted via
+        /// [`Reactor::submit_cancel_fd`]; kernel-side CQEs arriving
+        /// in this window are delivered as usual (they already
+        /// happened), but once the terminal CQE (no `F_MORE`) lands
+        /// we remove the slot.
+        removing: bool,
+    },
 }
 
 /// Per-worker io_uring reactor.
@@ -239,6 +304,13 @@ pub(crate) struct Reactor {
     /// effective range (truncated by [`encode`]); wraparound is
     /// astronomically unlikely to collide with an outstanding CQE.
     next_gen: u32,
+
+    /// Provided-buffer ring for multishot recv. Lazily initialized on
+    /// first [`Self::submit_recv_multi`] — reactors that never see a
+    /// multishot recv pay no memory cost. Shared via `Arc` so
+    /// [`super::uring_buf_ring::BufferLease`]s can recycle their
+    /// buffer ids even after the reactor is torn down.
+    buf_ring: Option<Arc<super::uring_buf_ring::BufferRing>>,
 }
 
 /// Thread-safe handle for waking a [`Reactor`] from a non-worker thread.
@@ -343,6 +415,7 @@ impl Reactor {
             // Start at 1; gen=0 is reserved for the never-recycled
             // well-known slots so they don't compete for the counter.
             next_gen: 1,
+            buf_ring: None,
         })
     }
 
@@ -506,6 +579,239 @@ impl Reactor {
         Ok(())
     }
 
+    /// Submit an owned-buffer `Send` op on `fd`.
+    ///
+    /// The [`bytes::Bytes`] is moved into the reactor's slab and held
+    /// there for the entire lifetime of the SQE. Callers must NOT
+    /// retain any other reference to the underlying allocation — doing
+    /// so defeats the point of the owned-buffer model and does not
+    /// protect from the kernel-side access race this method is designed
+    /// to avoid.
+    ///
+    /// On success returns the encoded `user_data` of the submitted SQE;
+    /// the caller can pass this to [`Self::submit_async_cancel`] later
+    /// to request cancellation.
+    ///
+    /// On submission error the buffer is dropped with the slot (the
+    /// SQE never entered the kernel, so no in-flight access exists) and
+    /// `Err` is returned. The `shared` completer is not touched in this
+    /// case — the caller observes the error synchronously instead.
+    pub(crate) fn submit_send_bytes(
+        &mut self,
+        fd: RawFd,
+        buf: bytes::Bytes,
+        shared: Arc<super::uring_bytes_ops::CompleterShared<super::uring_bytes_ops::SendResult>>,
+    ) -> Result<u64, (io::Error, bytes::Bytes)> {
+        let gen = self.next_gen();
+        let ptr = buf.as_ptr();
+        let len = buf.len();
+        let key = self.ops.insert(SlotEntry {
+            gen,
+            state: OpState::SendBytes { buf, shared },
+        });
+        let key_u32 = u32::try_from(key).expect("slab key exceeds u32");
+        let user_data = encode(VARIANT_SEND_BYTES, gen, key_u32);
+
+        // SAFETY: `ptr` points into the `Bytes` we just moved into the
+        // slab slot. The slot owns the buffer for the full SQE lifetime
+        // — the kernel cannot observe the pointer after the slot is
+        // freed, and the slot is freed only on the terminal CQE. `len`
+        // is the buffer's live length.
+        let sqe = opcode::Send::new(types::Fd(fd), ptr, len as u32)
+            .build()
+            .user_data(user_data);
+
+        // SAFETY of push: buffer lifetime bound to slab slot (above).
+        match unsafe { self.push_sqe(sqe) } {
+            Ok(()) => Ok(user_data),
+            Err(e) => {
+                // Submission failed — roll back the slot insertion and
+                // hand the buffer back to the caller. The kernel never
+                // saw the SQE, so there is no in-flight access to
+                // synchronize with.
+                let recovered_buf = match self.ops.try_remove(key).map(|s| s.state) {
+                    Some(OpState::SendBytes { buf, .. }) => buf,
+                    // Should be unreachable — we just inserted this slot.
+                    _ => {
+                        debug_assert!(false, "roll-back lost SendBytes slot");
+                        bytes::Bytes::new()
+                    }
+                };
+                Err((e, recovered_buf))
+            }
+        }
+    }
+
+    /// Submit an owned-buffer `Recv` op on `fd`.
+    ///
+    /// Mirror of [`Self::submit_send_bytes`] for [`bytes::BytesMut`]:
+    /// the kernel writes into the buffer's spare capacity. The slab
+    /// holds the buffer by value for the full SQE lifetime; the caller
+    /// gets it back (with the kernel's `res` byte count) via the
+    /// [`CompleterShared`] on the terminal CQE.
+    ///
+    /// The buffer's `len()` defines the receive capacity; callers
+    /// wishing to receive into a larger window should `reserve()` /
+    /// `resize()` beforehand. We do not touch the buffer here.
+    pub(crate) fn submit_recv_bytes(
+        &mut self,
+        fd: RawFd,
+        mut buf: bytes::BytesMut,
+        shared: Arc<super::uring_bytes_ops::CompleterShared<super::uring_bytes_ops::RecvResult>>,
+    ) -> Result<u64, (io::Error, bytes::BytesMut)> {
+        let gen = self.next_gen();
+        let ptr = buf.as_mut_ptr();
+        let len = buf.len();
+        let key = self.ops.insert(SlotEntry {
+            gen,
+            state: OpState::RecvBytes { buf, shared },
+        });
+        let key_u32 = u32::try_from(key).expect("slab key exceeds u32");
+        let user_data = encode(VARIANT_RECV_BYTES, gen, key_u32);
+
+        // SAFETY: `ptr` points into the `BytesMut` we just moved into
+        // the slab slot. The slot owns the buffer for the full SQE
+        // lifetime; `len` is the buffer's live length and therefore a
+        // valid write-capacity for the kernel.
+        let sqe = opcode::Recv::new(types::Fd(fd), ptr, len as u32)
+            .build()
+            .user_data(user_data);
+
+        // SAFETY of push: as above.
+        match unsafe { self.push_sqe(sqe) } {
+            Ok(()) => Ok(user_data),
+            Err(e) => {
+                let recovered_buf = match self.ops.try_remove(key).map(|s| s.state) {
+                    Some(OpState::RecvBytes { buf, .. }) => buf,
+                    _ => {
+                        debug_assert!(false, "roll-back lost RecvBytes slot");
+                        bytes::BytesMut::new()
+                    }
+                };
+                Err((e, recovered_buf))
+            }
+        }
+    }
+
+    /// Submit an `AsyncCancel` SQE targeting a previously-submitted op
+    /// identified by its encoded `user_data`.
+    ///
+    /// The cancel is best-effort and fire-and-forget:
+    ///
+    /// * If the target op is still in flight, the kernel will try to
+    ///   stop it and post a terminal CQE (typically `-ECANCELED`). The
+    ///   target's slab slot is freed at that point, dropping its buffer.
+    /// * If the target op already completed, the cancel returns
+    ///   `-ENOENT` on its own CQE and has no other effect.
+    /// * If the `target_user_data` refers to an op that lives on a
+    ///   different ring (e.g. the future was dropped from a worker
+    ///   other than the one that submitted), the cancel finds nothing
+    ///   on this ring and returns `-ENOENT`. The target op completes
+    ///   naturally on its owning ring in due course — the buffer is
+    ///   still safely released, just not as promptly.
+    ///
+    /// The cancel's own CQE is tagged with a fresh
+    /// [`VARIANT_CONTROL`] slot which is freed on its single
+    /// completion — we do not care what the cancel result was.
+    pub(crate) fn submit_async_cancel(&mut self, target_user_data: u64) -> io::Result<()> {
+        let (ack_ud, _ack_key) = self.alloc_control_slot();
+        let sqe = opcode::AsyncCancel::new(target_user_data)
+            .build()
+            .user_data(ack_ud);
+        // SAFETY: AsyncCancel carries no user buffers.
+        unsafe { self.push_sqe(sqe)? };
+        // Don't wait here — the cancel will flush with the next park or
+        // with an explicit submit from the caller. For the
+        // future-drop path (the primary caller) we accept a ~one-park
+        // worst-case latency on the cancel reaching the kernel. If
+        // tighter latency is needed later, add a non-blocking submit
+        // here.
+        Ok(())
+    }
+
+    /// Lazily initialize and return the reactor's provided-buffer ring.
+    ///
+    /// The ring is constructed and registered with the kernel on first
+    /// call; subsequent calls return the cached Arc. Registration
+    /// happens on the owning worker's ring, so this must be called
+    /// from the worker thread.
+    fn ensure_buf_ring(
+        &mut self,
+    ) -> io::Result<Arc<super::uring_buf_ring::BufferRing>> {
+        if let Some(br) = &self.buf_ring {
+            return Ok(Arc::clone(br));
+        }
+        let br = Arc::new(super::uring_buf_ring::BufferRing::new_registered(&self.ring)?);
+        self.buf_ring = Some(Arc::clone(&br));
+        Ok(br)
+    }
+
+    /// Submit a multishot `Recv` on `fd`.
+    ///
+    /// The SQE stays armed on the socket until the kernel posts a
+    /// terminal CQE (one without `IORING_CQE_F_MORE`). Each non-
+    /// terminal CQE delivers one recv's worth of data into a buffer
+    /// picked by the kernel from the provided-buffer ring. The
+    /// [`RecvInbox`] is the handoff channel to user code.
+    ///
+    /// Callers should store the returned `user_data` if they want to
+    /// issue a targeted `AsyncCancel` later; otherwise
+    /// [`Self::submit_cancel_fd`] can be used to cancel by fd.
+    ///
+    /// [`RecvInbox`]: super::uring_recv_multi::RecvInbox
+    pub(crate) fn submit_recv_multi(
+        &mut self,
+        fd: RawFd,
+        inbox: Arc<super::uring_recv_multi::RecvInbox>,
+    ) -> io::Result<u64> {
+        let bgid = self.ensure_buf_ring()?.bgid();
+
+        let gen = self.next_gen();
+        let key = self.ops.insert(SlotEntry {
+            gen,
+            state: OpState::RecvMulti { inbox, removing: false },
+        });
+        let key_u32 = u32::try_from(key).expect("slab key exceeds u32");
+        let user_data = encode(VARIANT_RECV_MULTI, gen, key_u32);
+
+        // `RecvMulti::new` sets `IOSQE_BUFFER_SELECT` and
+        // `IORING_RECV_MULTISHOT` internally; we just name the
+        // buffer group.
+        let sqe = opcode::RecvMulti::new(types::Fd(fd), bgid)
+            .build()
+            .user_data(user_data);
+
+        // SAFETY: `RecvMulti` carries no user buffers — the kernel
+        // sources its destination buffer from the registered pbuf
+        // ring, which outlives the op via the `Arc<BufferRing>` kept
+        // on `self.buf_ring`.
+        unsafe { self.push_sqe(sqe)? };
+        Ok(user_data)
+    }
+
+    /// Cancel all in-flight ops on `fd` (our best-effort stream-drop
+    /// path for multishot recv).
+    ///
+    /// Uses `AsyncCancel2` with a `CancelBuilder::fd(fd).all()`
+    /// match, which the kernel translates into per-op `-ECANCELED`
+    /// CQEs for every matching in-flight op. The cancel's own ack
+    /// CQE is tagged with a fresh [`VARIANT_CONTROL`] slot.
+    ///
+    /// Must be called on the worker that owns the target op's ring
+    /// (same-ring cancellation). Cross-ring cancels silently return
+    /// `-ENOENT` on this ring; the multishot naturally completes
+    /// on its home ring.
+    pub(crate) fn submit_cancel_fd(&mut self, fd: RawFd) -> io::Result<()> {
+        let (ack_ud, _) = self.alloc_control_slot();
+        let builder = types::CancelBuilder::fd(types::Fd(fd)).all();
+        let sqe = opcode::AsyncCancel2::new(builder)
+            .build()
+            .user_data(ack_ud);
+        // SAFETY: AsyncCancel2 carries no user buffers.
+        unsafe { self.push_sqe(sqe)? };
+        Ok(())
+    }
+
     /// Block until at least one CQE is available, then drain completions.
     ///
     /// Performs one `io_uring_enter(submit=pending, min_complete=1,
@@ -564,6 +870,17 @@ impl Reactor {
         // run arbitrary user code (waker callbacks), so we want it strictly
         // outside the CQ-iterator borrow.
         let mut readiness_deliveries: Vec<(Arc<ScheduledIo>, Ready)> = Vec::with_capacity(16);
+        // Owned-buffer op completions. We cannot deliver them inside the
+        // CQ-iterator borrow: delivering means `try_remove`-ing the slab
+        // slot to extract the buffer, and the entry's `shared` Arc lives
+        // inside the slot. Record (key, raw_result) here and hand off
+        // after the loop, where we can mutate the slab freely.
+        let mut send_completions: Vec<(u32, i32)> = Vec::new();
+        let mut recv_completions: Vec<(u32, i32)> = Vec::new();
+        // Multishot recv deliveries. Each entry corresponds to one
+        // CQE; the post-loop dispatcher fans these out into
+        // `InboxEntry`s (BufferLease, Eof, Err).
+        let mut recv_multi_completions: Vec<RecvMultiCompletion> = Vec::new();
 
         let cq = self.ring.completion();
         for cqe in cq {
@@ -631,6 +948,67 @@ impl Reactor {
                     // Slot stays.
                 }
 
+                VARIANT_SEND_BYTES => {
+                    // One-shot. Gen-check to guard against stale CQEs
+                    // from a recycled slot; on match, stage for
+                    // post-loop delivery (which owns the buffer
+                    // release) and queue the slot for removal.
+                    let entry = match self.ops.get(key as usize) {
+                        Some(e) if e.gen == gen => e,
+                        _ => continue,
+                    };
+                    if !matches!(entry.state, OpState::SendBytes { .. }) {
+                        // Slot exists with matching gen but holds a
+                        // different op — cannot happen with disciplined
+                        // callers, but we defensively skip.
+                        debug_assert!(false, "SEND_BYTES CQE hit non-SendBytes slot");
+                        continue;
+                    }
+                    // Slot removal is deferred to the send-completion
+                    // loop below, which also extracts the buffer. Do
+                    // NOT push to `to_remove` here — that path drops
+                    // the slot without delivering the buffer.
+                    send_completions.push((key, cqe.result()));
+                }
+
+                VARIANT_RECV_BYTES => {
+                    let entry = match self.ops.get(key as usize) {
+                        Some(e) if e.gen == gen => e,
+                        _ => continue,
+                    };
+                    if !matches!(entry.state, OpState::RecvBytes { .. }) {
+                        debug_assert!(false, "RECV_BYTES CQE hit non-RecvBytes slot");
+                        continue;
+                    }
+                    // Same reasoning as SEND_BYTES — removal deferred.
+                    recv_completions.push((key, cqe.result()));
+                }
+
+                VARIANT_RECV_MULTI => {
+                    // Multi-shot recv — many CQEs per slot. Stage the
+                    // delivery so we can do the BufferLease allocation
+                    // (which takes an Arc clone of buf_ring) outside
+                    // the CQ-iterator borrow.
+                    let entry = match self.ops.get(key as usize) {
+                        Some(e) if e.gen == gen => e,
+                        _ => continue,
+                    };
+                    if !matches!(entry.state, OpState::RecvMulti { .. }) {
+                        debug_assert!(false, "RECV_MULTI CQE hit non-RecvMulti slot");
+                        continue;
+                    }
+                    let result = cqe.result();
+                    let flags = cqe.flags();
+                    let has_more = cqueue::more(flags);
+                    let bid = cqueue::buffer_select(flags);
+                    recv_multi_completions.push(RecvMultiCompletion {
+                        key,
+                        result,
+                        has_more,
+                        bid,
+                    });
+                }
+
                 _ => {
                     // Unknown variant — ignore. Could happen if a future
                     // op type is introduced and an old binary sees its
@@ -645,6 +1023,135 @@ impl Reactor {
             // Slab::try_remove tolerates already-vacant slots (which can
             // happen if a Control completion fires twice — defensive).
             let _ = self.ops.try_remove(key as usize);
+        }
+
+        // Deliver owned-buffer op completions. We pull each slot out of the
+        // slab here — `try_remove` hands us the full `SlotEntry` by value,
+        // which is what lets us move the buffer out of the `OpState` and
+        // into the result tuple without an extra allocation. The terminal
+        // CQE has already posted, so the kernel will never touch the
+        // pointer again: it is safe to release the buffer here regardless
+        // of whether the awaiter is still listening (abandoned completers
+        // drop the result inside `complete`).
+        for (key, res) in send_completions {
+            let entry = match self.ops.try_remove(key as usize) {
+                Some(e) => e,
+                // Shouldn't happen — we only push (key, res) for slots we
+                // just observed with matching gen. Defensive skip.
+                None => continue,
+            };
+            match entry.state {
+                OpState::SendBytes { buf, shared } => {
+                    let result: super::uring_bytes_ops::SendResult = if res >= 0 {
+                        (Ok(res as usize), buf)
+                    } else {
+                        (Err(io::Error::from_raw_os_error(-res)), buf)
+                    };
+                    shared.complete(result);
+                }
+                _ => debug_assert!(false, "send completion key hit non-SendBytes slot"),
+            }
+        }
+        for (key, res) in recv_completions {
+            let entry = match self.ops.try_remove(key as usize) {
+                Some(e) => e,
+                None => continue,
+            };
+            match entry.state {
+                OpState::RecvBytes { buf, shared } => {
+                    let result: super::uring_bytes_ops::RecvResult = if res >= 0 {
+                        (Ok(res as usize), buf)
+                    } else {
+                        (Err(io::Error::from_raw_os_error(-res)), buf)
+                    };
+                    shared.complete(result);
+                }
+                _ => debug_assert!(false, "recv completion key hit non-RecvBytes slot"),
+            }
+        }
+
+        // Multishot recv deliveries. Non-terminal CQEs push into
+        // the inbox; terminal CQEs (no F_MORE) additionally remove
+        // the slot and mark the inbox ended. The Arc<BufferRing>
+        // clone happens here (outside the CQ borrow) because
+        // constructing a BufferLease requires an Arc clone.
+        for completion in recv_multi_completions {
+            // Re-borrow the slot; if the slot has vanished (can
+            // happen if a prior CQE in this same drain already
+            // terminated and removed it), drop this delivery.
+            let Some(entry) = self.ops.get(completion.key as usize) else {
+                continue;
+            };
+            let inbox = match &entry.state {
+                OpState::RecvMulti { inbox, .. } => Arc::clone(inbox),
+                _ => {
+                    debug_assert!(false, "recv_multi post-loop hit non-RecvMulti slot");
+                    continue;
+                }
+            };
+
+            let entry_to_push: Option<super::uring_recv_multi::InboxEntry> = if completion.result < 0 {
+                Some(super::uring_recv_multi::InboxEntry::Err(
+                    io::Error::from_raw_os_error(-completion.result),
+                ))
+            } else if completion.result == 0 {
+                // Peer closed / graceful shutdown. Kernel typically
+                // posts no F_MORE along with this; either way, don't
+                // manufacture a zero-length BufferLease.
+                // The bid (if any) is handed back by running the
+                // BufferLease through its drop path immediately
+                // below.
+                if let Some(bid) = completion.bid {
+                    if let Some(br) = &self.buf_ring {
+                        // Recycle the bid — res=0 still consumed a
+                        // buffer in some kernel versions.
+                        br.release(bid);
+                    }
+                }
+                Some(super::uring_recv_multi::InboxEntry::Eof)
+            } else {
+                // Positive result — extract bid and construct lease.
+                let Some(bid) = completion.bid else {
+                    // Should not happen for BUFFER_SELECT ops.
+                    debug_assert!(false, "RECV_MULTI positive result without F_BUFFER");
+                    inbox.push(super::uring_recv_multi::InboxEntry::Err(io::Error::other(
+                        "RECV_MULTI missing buffer id",
+                    )));
+                    if !completion.has_more {
+                        inbox.mark_ended();
+                        let _ = self.ops.try_remove(completion.key as usize);
+                    }
+                    continue;
+                };
+                match &self.buf_ring {
+                    Some(br) => {
+                        let lease = super::uring_buf_ring::BufferLease::new(
+                            Arc::clone(br),
+                            bid,
+                            completion.result as u32,
+                        );
+                        Some(super::uring_recv_multi::InboxEntry::Data(lease))
+                    }
+                    None => {
+                        debug_assert!(false, "RECV_MULTI CQE with no buf_ring installed");
+                        None
+                    }
+                }
+            };
+
+            if let Some(e) = entry_to_push {
+                inbox.push(e);
+            }
+
+            if !completion.has_more {
+                // Terminal CQE — mark the inbox ended and remove the
+                // slot. Any in-flight CQEs that landed earlier in
+                // this drain are already queued into the inbox above
+                // (ordering is preserved because we process the CQs
+                // in-order).
+                inbox.mark_ended();
+                let _ = self.ops.try_remove(completion.key as usize);
+            }
         }
 
         for (io, ready) in readiness_deliveries {
