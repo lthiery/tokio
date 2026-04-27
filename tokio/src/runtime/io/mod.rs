@@ -30,5 +30,16 @@ cfg_io_uring_reactor! {
     pub(crate) mod uring_recv_multi;
 }
 
+// Backend-agnostic IoDriver (manual vtable). Step-1 scope: only the uring
+// vtable is populated; module gate matches `cfg_io_uring_reactor` for now.
+// As more backends are ported the gate widens.
+#[cfg(all(
+    tokio_unstable,
+    feature = "io-uring-reactor",
+    feature = "rt",
+    target_os = "linux",
+))]
+pub(crate) mod io_driver;
+
 use crate::util::ptr_expose::PtrExposeDomain;
 static EXPOSE_IO: PtrExposeDomain<ScheduledIo> = PtrExposeDomain::new();
