@@ -30,14 +30,23 @@ cfg_io_uring_reactor! {
     pub(crate) mod uring_recv_multi;
 }
 
-// Backend-agnostic IoDriver (manual vtable). Step-1 scope: only the uring
-// vtable is populated; module gate matches `cfg_io_uring_reactor` for now.
-// As more backends are ported the gate widens.
-#[cfg(all(
-    tokio_unstable,
-    feature = "io-uring-reactor",
-    feature = "rt",
-    target_os = "linux",
+cfg_io_sharded_mio! {
+    // Experimental per-worker mio::Poll reactor. Same per-worker sharding
+    // shape as the uring reactor, but the IO backend is mio rather than
+    // io_uring. Companion to uring-reactor for A/B-measuring driver
+    // sharding independently from io_uring. Consumed by the multi_thread
+    // scheduler's `ShardedMioParker` when `enable_sharded_mio()` is set
+    // on the runtime builder.
+    pub(crate) mod sharded_mio_reactor;
+    pub(crate) mod sharded_mio_driver;
+}
+
+// Backend-agnostic IoDriver (manual vtable). Available whenever any
+// per-worker (sharded) backend is in play. Currently only the uring
+// vtable is populated; sharded-mio vtable is added in step 2.
+#[cfg(any(
+    all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
+    all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
 ))]
 pub(crate) mod io_driver;
 

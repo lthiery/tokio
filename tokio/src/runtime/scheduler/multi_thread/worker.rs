@@ -287,6 +287,33 @@ pub(super) fn create(
         IoFlavor::UringPerWorker => Some(std::sync::Arc::new(
             crate::runtime::io::uring_driver::UringHandle::new(size),
         )),
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-sharded-mio",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        IoFlavor::ShardedMio => None,
+    };
+
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    let sharded_mio_handle = match io_flavor {
+        IoFlavor::Traditional => None,
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        IoFlavor::UringPerWorker => None,
+        IoFlavor::ShardedMio => Some(std::sync::Arc::new(
+            crate::runtime::io::sharded_mio_driver::ShardedMioHandle::new(size),
+        )),
     };
 
     // Create the local queues
@@ -307,6 +334,24 @@ pub(super) fn create(
                 );
                 WorkerParker::Uring(
                     crate::runtime::scheduler::multi_thread::uring_park::UringParker::new(
+                        worker_idx, handle,
+                    ),
+                )
+            }
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-sharded-mio",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            IoFlavor::ShardedMio => {
+                let handle = std::sync::Arc::clone(
+                    sharded_mio_handle
+                        .as_ref()
+                        .expect("sharded-mio handle constructed above"),
+                );
+                WorkerParker::ShardedMio(
+                    crate::runtime::scheduler::multi_thread::sharded_mio_park::ShardedMioParker::new(
                         worker_idx, handle,
                     ),
                 )
@@ -378,6 +423,13 @@ pub(super) fn create(
         io_driver: uring_handle
             .as_ref()
             .map(|h| crate::runtime::io::io_driver::IoDriver::from_uring(std::sync::Arc::clone(h))),
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-sharded-mio",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        sharded_mio_handle: sharded_mio_handle.clone(),
         #[cfg(all(tokio_unstable, feature = "time"))]
         is_shutdown: AtomicBool::new(false),
     });
@@ -608,6 +660,48 @@ fn run(worker: Arc<Worker>) {
     ))]
     let _clear_uring_tls = ClearUringTls;
 
+    // Sharded-mio counterpart to the uring TLS discipline above. The
+    // self-wake short-circuit in `ShardedMioUnparker::unpark` relies on
+    // `CURRENT_WORKER` being populated before any task can observe a
+    // wake on this thread. See the uring comment block above for the
+    // full rationale — the reasoning transfers verbatim.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    struct ClearShardedMioTls;
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    impl Drop for ClearShardedMioTls {
+        fn drop(&mut self) {
+            crate::runtime::io::sharded_mio_driver::clear_local_reactor();
+            crate::runtime::scheduler::multi_thread::sharded_mio_park::clear_current_worker();
+        }
+    }
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    {
+        crate::runtime::io::sharded_mio_driver::clear_local_reactor();
+        crate::runtime::scheduler::multi_thread::sharded_mio_park::clear_current_worker();
+    }
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    let _clear_sharded_mio_tls = ClearShardedMioTls;
+
     // Publish the worker index into `CURRENT_WORKER` *before* any task
     // runs on this thread. This is what `UringHandle::add_source` reads to
     // decide placement (`W_ring == W_task`). Installing inside the parker's
@@ -624,6 +718,16 @@ fn run(worker: Arc<Worker>) {
         target_os = "linux",
     ))]
     crate::runtime::scheduler::multi_thread::uring_park::set_current_worker_early(
+        worker.index,
+    );
+
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    crate::runtime::scheduler::multi_thread::sharded_mio_park::set_current_worker_early(
         worker.index,
     );
 

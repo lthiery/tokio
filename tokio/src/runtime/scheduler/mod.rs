@@ -88,6 +88,28 @@ impl Handle {
             Handle::Disabled => None,
         }
     }
+
+    /// The shared per-worker `mio::Poll` reactor handle, if the
+    /// runtime was built with `enable_sharded_mio()`. Returns `None`
+    /// otherwise. Used by [`crate::runtime::io::Registration`] to
+    /// route fd registrations onto the sharded-mio path when active.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    pub(crate) fn sharded_mio_handle(
+        &self,
+    ) -> Option<&crate::loom::sync::Arc<crate::runtime::io::sharded_mio_driver::ShardedMioHandle>> {
+        match self {
+            #[cfg(feature = "rt")]
+            Handle::CurrentThread(_) => None,
+            Handle::MultiThread(h) => h.sharded_mio_handle.as_ref(),
+            #[cfg(not(feature = "rt"))]
+            Handle::Disabled => None,
+        }
+    }
 }
 
 cfg_rt! {

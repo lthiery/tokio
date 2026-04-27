@@ -70,6 +70,18 @@ pub(crate) struct Handle {
     ))]
     pub(crate) io_driver: Option<crate::runtime::io::io_driver::IoDriver>,
 
+    /// Shared coordination handle for the per-worker sharded-mio
+    /// reactor backend. `Some` when `io_flavor == IoFlavor::ShardedMio`,
+    /// `None` otherwise.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    pub(crate) sharded_mio_handle:
+        Option<Arc<crate::runtime::io::sharded_mio_driver::ShardedMioHandle>>,
+
     #[cfg(all(tokio_unstable, feature = "time"))]
     /// Indicates that the runtime is shutting down.
     pub(crate) is_shutdown: AtomicBool,

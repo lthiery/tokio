@@ -2,7 +2,10 @@ use crate::io::interest::Interest;
 use crate::io::ready::Ready;
 use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::Mutex;
-#[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+#[cfg(any(
+    all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
+    all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+))]
 use std::sync::atomic::AtomicU32;
 use crate::runtime::io::{Direction, ReadyEvent, Tick};
 use crate::util::bit;
@@ -148,6 +151,26 @@ pub(crate) struct ScheduledIo {
     /// POLL_ADD).
     #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
     pub(super) uring_worker: AtomicU32,
+
+    /// Slab key assigned by the per-worker sharded-mio [`Reactor`] when
+    /// this `ScheduledIo` is registered. `u32::MAX` means "not
+    /// registered with the sharded-mio reactor".
+    ///
+    /// Unlike the uring counterpart, no generation bit is needed: mio
+    /// guarantees no further events will be surfaced once `deregister`
+    /// returns, so there is no stale-CQE race to detect.
+    ///
+    /// [`Reactor`]: crate::runtime::io::sharded_mio_reactor::Reactor
+    #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+    pub(super) sharded_mio_slab_key: AtomicU32,
+
+    /// Index of the sharded-mio worker whose `mio::Poll` currently owns
+    /// this registration. `u32::MAX` means "not registered". Written
+    /// once at `add_source` time; read at `deregister` time to route
+    /// the `Registry::deregister` call onto the same worker's
+    /// registry.
+    #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+    pub(super) sharded_mio_worker: AtomicU32,
 }
 
 type WaitList = LinkedList<Waiter, <Waiter as linked_list::Link>::Target>;
@@ -230,6 +253,10 @@ impl Default for ScheduledIo {
             uring_gen: AtomicU32::new(u32::MAX),
             #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
             uring_worker: AtomicU32::new(u32::MAX),
+            #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+            sharded_mio_slab_key: AtomicU32::new(u32::MAX),
+            #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+            sharded_mio_worker: AtomicU32::new(u32::MAX),
         }
     }
 }

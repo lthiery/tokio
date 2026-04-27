@@ -465,6 +465,50 @@ impl Builder {
         self
     }
 
+    /// Enable the experimental per-worker `mio::Poll` IO reactor.
+    ///
+    /// Mirror of [`enable_uring_reactor`] but using `mio::Poll` per
+    /// worker rather than `io_uring`. Intended for A/B-measuring how
+    /// much of the uring reactor's multi-worker wins come from
+    /// sharding the driver vs. from `io_uring` itself.
+    ///
+    /// Implies [`TimerFlavor::Alternative`] (per-worker timer wheels)
+    /// for the same reason uring does — a shared timer wheel would
+    /// serialize sleeps across workers.
+    ///
+    /// The two knobs ([`enable_uring_reactor`] and this one) are
+    /// last-write-wins: whichever is called last on the builder wins.
+    /// They are not a compile error to set both, deliberately, to keep
+    /// benchmark toggling ergonomic.
+    ///
+    /// Gated behind the `io-sharded-mio` Cargo feature + `--cfg
+    /// tokio_unstable`. Linux-only to keep the A/B fair on the bench
+    /// platform.
+    ///
+    /// [`enable_uring_reactor`]: Builder::enable_uring_reactor
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(
+            tokio_unstable,
+            feature = "io-sharded-mio",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        )))
+    )]
+    pub fn enable_sharded_mio(&mut self) -> &mut Self {
+        self.enable_io();
+        self.enable_time();
+        self.timer_flavor = TimerFlavor::Alternative;
+        self.io_flavor = IoFlavor::ShardedMio;
+        self
+    }
+
     /// Enable eager hand-off of the I/O and time drivers for multi-threaded
     /// runtimes, which is disabled by default.
     ///

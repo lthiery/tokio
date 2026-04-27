@@ -178,6 +178,17 @@ impl Registration {
             return Ok(Registration { handle, shared });
         }
 
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-sharded-mio",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        if let Some(sharded) = handle.sharded_mio_handle() {
+            let (shared, _worker_idx) = sharded.add_source(io, interest)?;
+            return Ok(Registration { handle, shared });
+        }
+
         let shared = handle.driver().io().add_source(io, interest)?;
 
         Ok(Registration { handle, shared })
@@ -217,6 +228,16 @@ impl Registration {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 as usize;
             return uring.deregister_source(&self.shared, worker_idx);
+        }
+
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-sharded-mio",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        if let Some(sharded) = self.handle.sharded_mio_handle() {
+            return sharded.deregister_source(&self.shared, io);
         }
 
         self.handle().deregister_source(&self.shared, io)
