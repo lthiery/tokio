@@ -126,16 +126,16 @@ pub(crate) struct ScheduledIo {
     pub(super) uring_slab_key: AtomicU32,
 
     /// Generation counter stamped at registration time. Combined with
-    /// `uring_slab_key` in the CQE `user_data` so that cross-worker
-    /// deregisters can detect a stale request (e.g. the slab slot was
-    /// already recycled by a new registration). `u32::MAX` means "not
+    /// `uring_slab_key` in the CQE `user_data` so that the deregister
+    /// path can detect a stale request (e.g. the slab slot was already
+    /// recycled by a new registration). `u32::MAX` means "not
     /// registered with the uring reactor".
     ///
     /// Writes happen on the owning worker thread in `Reactor::register`;
-    /// reads happen on the owning worker in `Reactor::deregister` and
-    /// cross-worker during a MSG_RING-mediated rebind. `Relaxed` is
-    /// sufficient because the only cross-thread visibility that matters
-    /// is already ordered by the MSG_RING CQE itself.
+    /// reads happen on the owning worker in `Reactor::deregister`.
+    /// `Relaxed` is sufficient because the only cross-thread visibility
+    /// that matters is already ordered by the slab/registration-set
+    /// publication.
     #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
     pub(super) uring_gen: AtomicU32,
 

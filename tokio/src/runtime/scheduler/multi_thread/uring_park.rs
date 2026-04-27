@@ -345,11 +345,10 @@ fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) {
             PendingOp::Register { fd, interest, io } => reactor.register(fd, interest, &io),
             // The caller snapshotted the slab identity at queue time.
             // `reactor.deregister` gen-checks this against the current slab
-            // state: a stale snapshot (the slot has been recycled, e.g. by
-            // a lazy rebind to another worker) is silently dropped rather
-            // than risking a mis-cancel. The Arc held inside the slab slot
-            // is released only when the kernel posts the terminal CQE for
-            // the multi-shot poll (no `IORING_CQE_F_MORE`); see
+            // state: a stale snapshot is silently dropped rather than
+            // risking a mis-cancel. The Arc held inside the slab slot is
+            // released only when the kernel posts the terminal CQE for the
+            // multi-shot poll (no `IORING_CQE_F_MORE`); see
             // `uring_reactor::Reactor::deregister`.
             PendingOp::Deregister { slab_key, slab_gen } => {
                 reactor.deregister(slab_key, slab_gen)

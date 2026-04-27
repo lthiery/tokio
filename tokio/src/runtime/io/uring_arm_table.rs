@@ -3,11 +3,10 @@
 //! Each [`POLL_ADD_MULTI`] registration lives in a slab slot owned
 //! exclusively by its issuing worker. That slab is `!Sync`: `slab::Slab`'s
 //! backing `Vec` may reallocate on insert, invalidating any reference a
-//! peer worker tried to hold onto. So to let peer workers affect a live
-//! registration — specifically, to set a "disarm this slot, cancel is
-//! inbound" flag when they take ownership of the fd via a rebind — we
-//! publish a parallel, stably-addressed table keyed on the same slab
-//! index.
+//! peer worker tried to hold onto. So to let cross-thread paths affect a
+//! live registration — specifically, to set a "disarm this slot, cancel
+//! is inbound" flag — we publish a parallel, stably-addressed table
+//! keyed on the same slab index.
 //!
 //! # Why not sharded-slab (the crate)?
 //!
@@ -20,8 +19,8 @@
 //! pure overhead on a path that runs once per readiness event.
 //!
 //! This table gives us the Sync structure we actually need: one
-//! `AtomicU64` per slot, no per-read refcount, stable addressing, and
-//! cross-worker reach for a single `fetch_or` at rebind time.
+//! `AtomicU64` per slot, no per-read refcount, and stable addressing
+//! reachable from any thread holding an `Arc<ArmTable>`.
 //!
 //! # Layout
 //!

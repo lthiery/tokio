@@ -137,36 +137,6 @@ cfg_io_driver! {
 
         /// Reference to state stored by the driver.
         shared: Arc<ScheduledIo>,
-
-        /// Raw fd of the registered resource. Needed by the uring backend's
-        /// v2 lazy-placement path: if a task is polled on a worker whose
-        /// ring does not own this fd's `POLL_ADD_MULTI`, we migrate the
-        /// registration to the polling worker's ring. Migration requires
-        /// re-submitting a `POLL_ADD_MULTI` on the new worker — which
-        /// needs the fd.
-        ///
-        /// Only used on the uring path; set to `-1` on non-uring runtimes.
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring-reactor",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        uring_fd: std::os::fd::RawFd,
-
-        /// `Interest` originally passed to `new_with_interest_and_handle`.
-        /// Same rationale as `uring_fd`: we need to replay the `POLL_ADD`
-        /// mask when moving the registration to a different ring.
-        ///
-        /// `None` on non-uring paths and for runtimes that don't use the
-        /// uring backend.
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring-reactor",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        uring_interest: Option<Interest>,
     }
 }
 
@@ -205,34 +175,12 @@ impl Registration {
         if let Some(uring) = handle.uring_handle() {
             let fd = io.registration_raw_fd();
             let (shared, _worker_idx) = uring.add_source(fd, interest)?;
-            return Ok(Registration {
-                handle,
-                shared,
-                uring_fd: fd,
-                uring_interest: Some(interest),
-            });
+            return Ok(Registration { handle, shared });
         }
 
         let shared = handle.driver().io().add_source(io, interest)?;
 
-        Ok(Registration {
-            handle,
-            shared,
-            #[cfg(all(
-                tokio_unstable,
-                feature = "io-uring-reactor",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
-            uring_fd: -1,
-            #[cfg(all(
-                tokio_unstable,
-                feature = "io-uring-reactor",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
-            uring_interest: None,
-        })
+        Ok(Registration { handle, shared })
     }
 
     /// Deregisters the I/O resource from the reactor it is associated with.
@@ -324,23 +272,6 @@ impl Registration {
         // Keep track of task budget
         let coop = ready!(crate::task::coop::poll_proceed(cx));
 
-        // v2 lazy placement: if we're running on a uring worker and this
-        // registration's `POLL_ADD_MULTI` lives on a different worker's
-        // ring, migrate it here before polling. The rebind is cheap (one
-        // local SQE, one MSG_RING SQE) and it serializes via CAS, so
-        // parallel pollers don't thrash.
-        //
-        // Errors are swallowed — a failed rebind leaves readiness on the
-        // old ring, which still delivers (just with an extra cross-worker
-        // hop). The next poll retries.
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring-reactor",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        self.maybe_rebind_to_current_worker();
-
         let ev = ready!(self.shared.poll_readiness(cx, direction));
 
         if ev.is_shutdown {
@@ -349,71 +280,6 @@ impl Registration {
 
         coop.made_progress();
         Poll::Ready(Ok(ev))
-    }
-
-    /// If the current thread is a uring worker and this registration is
-    /// owned by a *different* worker's ring, migrate it here.
-    ///
-    /// See [`UringHandle::rebind_source`] for the full protocol. The call
-    /// is a no-op when:
-    ///
-    /// - the runtime isn't using the uring backend (no `uring_handle`);
-    /// - the current thread isn't a worker (no `current_worker_index`);
-    /// - the registration was never established (`uring_fd < 0`, e.g.
-    ///   non-uring path construction);
-    /// - the registration is already owned by the current worker.
-    ///
-    /// Called from [`Self::poll_ready`] on every readiness poll. The
-    /// worker-index comparison is a single relaxed atomic load followed
-    /// by an integer compare, so the non-migration fast path costs ~no
-    /// cycles on the hot path.
-    ///
-    /// [`UringHandle::rebind_source`]:
-    ///     crate::runtime::io::uring_driver::UringHandle::rebind_source
-    #[cfg(all(
-        tokio_unstable,
-        feature = "io-uring-reactor",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    fn maybe_rebind_to_current_worker(&self) {
-        use crate::runtime::scheduler::multi_thread::uring_park::current_worker_index;
-        use std::sync::atomic::Ordering;
-
-        // Short-circuit if the original registration didn't go through
-        // the uring path. `uring_fd == -1` means the registration was
-        // built for the mio backend (or a test), and there is nothing to
-        // rebind. A missing `uring_interest` says the same thing.
-        if self.uring_fd < 0 {
-            return;
-        }
-        let Some(interest) = self.uring_interest else {
-            return;
-        };
-
-        // Are we on a uring worker right now?
-        let Some(current_worker) = current_worker_index() else {
-            return;
-        };
-
-        // Cheap check: does this registration already live on our ring?
-        // `Relaxed` is fine — a stale observation at worst triggers a
-        // superfluous `rebind_source` call, which itself CAS-serializes
-        // and will no-op on the match.
-        let owner = self.shared.uring_worker.load(Ordering::Relaxed);
-        if owner as usize == current_worker {
-            return;
-        }
-
-        // Runtime is using the uring backend? (Otherwise `uring_fd`
-        // wouldn't be set, but we check defensively.)
-        let Some(uring) = self.handle.uring_handle() else {
-            return;
-        };
-
-        // Fire the migration. Errors and "skipped" results are both fine
-        // — the next poll will re-evaluate.
-        let _ = uring.rebind_source(&self.shared, self.uring_fd, interest, current_worker);
     }
 
     fn poll_io<R>(
