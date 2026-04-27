@@ -20,9 +20,14 @@ use std::time::Duration;
 
 thread_local! {
     /// Current worker's index for the running thread, or `None` if not
-    /// on a sharded-mio worker. Used by [`ShardedMioUnparker::unpark`]
-    /// to short-circuit self-wakes, matching the uring parker's
-    /// [`uring_park::current_worker_index`][uci] pattern.
+    /// on a sharded-mio worker. Mirrors the uring parker's
+    /// [`uring_park::current_worker_index`][uci] TLS slot.
+    ///
+    /// Currently has no readers — `unpark` no longer short-circuits on
+    /// `current == self.idx` (the previous self-wake optimization was
+    /// unsound; see [`ShardedMioUnparker::unpark`]). Kept in place
+    /// because step 2c is expected to introduce caller-local placement
+    /// for fd registrations, mirroring uring's planned path.
     ///
     /// [uci]: super::uring_park::current_worker_index
     static CURRENT_WORKER: Cell<Option<usize>> = const { Cell::new(None) };
@@ -209,19 +214,27 @@ impl Drop for ShardedMioParker {
 impl ShardedMioUnparker {
     /// Unpark the associated worker.
     ///
-    /// Self-wake short-circuit: when the calling thread *is* the
-    /// target worker, a wake is unnecessary. The worker is mid-task
-    /// (otherwise it couldn't be calling unpark), its `park_state` is
-    /// `EMPTY`, and whatever it just pushed to its own run queue will
-    /// be picked up when control returns to the worker loop.
-    /// Skipping the `unpark` call here avoids a needless CAS and —
-    /// under `W_ring == W_task` placement — eliminates most post-wake
-    /// overhead on the hot path. See commit `e29114e1` on the uring
-    /// side for the original measurement motivating this.
+    /// We always go through `handle.unpark`, even when the caller is the
+    /// target worker itself. The `handle.unpark` path swaps `park_state`
+    /// to `NOTIFIED` and only issues a kernel wake when the previous
+    /// state was `PARKED` (i.e. a syscall is genuinely in progress on
+    /// some other thread), so the self-wake case still costs only an
+    /// atomic swap — never a syscall.
+    ///
+    /// An earlier version of this function short-circuited on
+    /// `current_worker_index() == Some(self.idx)` under the assumption
+    /// that the worker was mid-task and would observe whatever was just
+    /// pushed once control returned to the worker loop. That assumption
+    /// is unsound: `multi_thread::worker::transition_to_parked` calls
+    /// `notify_if_work_pending` → `notify_parked_local`, which can pop
+    /// the *calling* worker off the sleepers list and invoke its own
+    /// unparker. If we short-circuit there, `park_state` stays `EMPTY`,
+    /// the next `begin_park` CAS succeeds, the worker blocks in
+    /// `poll.poll`, and the idle state is left with
+    /// `num_searching == 1` so subsequent `notify_parked_remote` calls
+    /// from other workers are skipped by `notify_should_wakeup`. The
+    /// runtime then deadlocks. See `tests/rt_sharded_mio_repro.rs`.
     pub(crate) fn unpark(&self, _driver: &driver::Handle) {
-        if current_worker_index() == Some(self.idx) {
-            return;
-        }
         self.handle.unpark(self.idx);
     }
 }

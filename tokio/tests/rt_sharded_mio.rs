@@ -84,6 +84,81 @@ fn cross_worker_channel_round_trip() {
 }
 
 #[test]
+fn cross_worker_channel_round_trip_cap1_stress_2w() {
+    // Regression for a self-wake bug in `ShardedMioUnparker::unpark` /
+    // `UringUnparker::unpark` where the unparker would short-circuit on
+    // `current_worker_index() == Some(self.idx)`. That assumption was
+    // invalidated by `transition_to_parked → notify_if_work_pending →
+    // notify_parked_local`, which can pop the *calling* worker off the
+    // sleepers list and route a wake back to itself; short-circuiting
+    // there left `park_state == EMPTY`, the worker blocked in
+    // `poll.poll`, and `num_searching` was stuck at 1 so subsequent
+    // remote unparks were filtered out by `notify_should_wakeup`.
+    //
+    // Using `cap=1` forces strict ping-pong between sender and
+    // receiver, maximising the rate at which both workers traverse
+    // `transition_to_parked`, which is what makes this race trip
+    // reliably. Two workers + 200 sends × 50 trials hangs within
+    // seconds against the buggy unparker; with the fix it completes in
+    // < 0.2s.
+    for trial in 0..50 {
+        let rt = build_rt(2);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        rt.block_on(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
+            let consumer = tokio::spawn(async move {
+                let mut total = 0u32;
+                while let Some(v) = rx.recv().await {
+                    total += v;
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                total
+            });
+            for i in 1..=200u32 {
+                tx.send(i).await.unwrap();
+            }
+            drop(tx);
+            let total = consumer.await.unwrap();
+            assert_eq!(total, (1..=200u32).sum());
+        });
+        assert_eq!(count.load(Ordering::Relaxed), 200, "trial {trial}");
+    }
+}
+
+#[test]
+fn cross_worker_channel_round_trip_cap1_stress_4w() {
+    // Same regression as the 2-worker case but with a four-worker
+    // pool. Wider parallelism increases the chance that
+    // `notify_parked_local` pops a different sleeping worker rather
+    // than self, while still hitting the self-pop case often enough
+    // to deadlock against the buggy unparker.
+    for trial in 0..50 {
+        let rt = build_rt(4);
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        rt.block_on(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(1);
+            let consumer = tokio::spawn(async move {
+                let mut total = 0u32;
+                while let Some(v) = rx.recv().await {
+                    total += v;
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
+                total
+            });
+            for i in 1..=200u32 {
+                tx.send(i).await.unwrap();
+            }
+            drop(tx);
+            let total = consumer.await.unwrap();
+            assert_eq!(total, (1..=200u32).sum());
+        });
+        assert_eq!(count.load(Ordering::Relaxed), 200, "trial {trial}");
+    }
+}
+
+#[test]
 fn sleep_fires_via_alt_timer() {
     // `enable_sharded_mio()` implicitly enables `enable_alt_timer()`.
     // Confirm a per-worker timer wheel fires a sleep.
