@@ -416,20 +416,31 @@ pub(super) fn create(
         io_flavor,
         #[cfg(all(
             tokio_unstable,
-            feature = "io-uring-reactor",
+            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
             feature = "rt-multi-thread",
             target_os = "linux",
         ))]
-        io_driver: uring_handle
-            .as_ref()
-            .map(|h| crate::runtime::io::io_driver::IoDriver::from_uring(std::sync::Arc::clone(h))),
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-sharded-mio",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        sharded_mio_handle: sharded_mio_handle.clone(),
+        io_driver: match io_flavor {
+            IoFlavor::Traditional => None,
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            IoFlavor::UringPerWorker => uring_handle.as_ref().map(|h| {
+                crate::runtime::io::io_driver::IoDriver::from_uring(std::sync::Arc::clone(h))
+            }),
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-sharded-mio",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            IoFlavor::ShardedMio => sharded_mio_handle.as_ref().map(|h| {
+                crate::runtime::io::io_driver::IoDriver::from_sharded_mio(std::sync::Arc::clone(h))
+            }),
+        },
         #[cfg(all(tokio_unstable, feature = "time"))]
         is_shutdown: AtomicBool::new(false),
     });

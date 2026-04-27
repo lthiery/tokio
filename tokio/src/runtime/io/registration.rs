@@ -161,31 +161,21 @@ impl Registration {
         interest: Interest,
         handle: scheduler::Handle,
     ) -> io::Result<Registration> {
-        // When the runtime was built with `enable_uring_reactor()`, route
-        // the registration through the per-worker uring handle instead of
-        // mio. The uring path does not touch `mio::Registry`; the fd is
-        // passed in raw and a `POLL_ADD_MULTI` SQE is queued for the
-        // assigned worker.
+        // When the runtime was built with a non-traditional flavor
+        // (`enable_uring_reactor()` / `enable_sharded_mio()`), route
+        // the registration through the backend-agnostic vtable. Each
+        // backend's shim does the right thing with `io`: uring extracts
+        // the raw fd and queues a `POLL_ADD_MULTI` SQE, sharded-mio
+        // forwards the source through to its per-worker
+        // `mio::Registry::register`.
         #[cfg(all(
             tokio_unstable,
-            feature = "io-uring-reactor",
+            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
             feature = "rt-multi-thread",
             target_os = "linux",
         ))]
-        if let Some(uring) = handle.uring_handle() {
-            let fd = io.registration_raw_fd();
-            let (shared, _worker_idx) = uring.add_source(fd, interest)?;
-            return Ok(Registration { handle, shared });
-        }
-
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-sharded-mio",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        if let Some(sharded) = handle.sharded_mio_handle() {
-            let (shared, _worker_idx) = sharded.add_source(io, interest)?;
+        if let Some(driver) = handle.io_driver() {
+            let (shared, _worker_idx) = driver.add_source(io, interest)?;
             return Ok(Registration { handle, shared });
         }
 
@@ -211,33 +201,19 @@ impl Registration {
     ///
     /// `Err` is returned if an error is encountered.
     pub(crate) fn deregister(&mut self, io: &mut impl RegistrationSource) -> io::Result<()> {
+        // Same backend-agnostic vtable path as `new_with_interest_and_handle`.
+        // The uring shim ignores `io` (POLL_REMOVE is keyed off the
+        // `ScheduledIo`'s `uring_worker` field, which the shim reads
+        // internally) and the sharded-mio shim forwards `io` through
+        // to `mio::Registry::deregister`.
         #[cfg(all(
             tokio_unstable,
-            feature = "io-uring-reactor",
+            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
             feature = "rt-multi-thread",
             target_os = "linux",
         ))]
-        if let Some(uring) = self.handle.uring_handle() {
-            // Unused `io` on the uring path: mio's `Registry::deregister`
-            // is not involved — the worker will submit `POLL_REMOVE` on
-            // its ring when it drains the pending-ops queue.
-            let _ = io;
-            let worker_idx = self
-                .shared
-                .uring_worker
-                .load(std::sync::atomic::Ordering::Relaxed)
-                as usize;
-            return uring.deregister_source(&self.shared, worker_idx);
-        }
-
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-sharded-mio",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        if let Some(sharded) = self.handle.sharded_mio_handle() {
-            return sharded.deregister_source(&self.shared, io);
+        if let Some(driver) = self.handle.io_driver() {
+            return driver.deregister(&self.shared, io);
         }
 
         self.handle().deregister_source(&self.shared, io)

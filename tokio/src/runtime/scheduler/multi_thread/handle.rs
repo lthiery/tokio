@@ -53,34 +53,29 @@ pub(crate) struct Handle {
     #[allow(dead_code)]
     pub(crate) io_flavor: IoFlavor,
 
-    /// Backend-agnostic io-driver value (manual vtable). `Some` when the
-    /// runtime selected a non-traditional flavor (currently only
-    /// `IoFlavor::UringPerWorker`), `None` otherwise.
+    /// Backend-agnostic io-driver value (manual vtable). `Some` when
+    /// the runtime selected a non-traditional flavor — currently
+    /// `IoFlavor::UringPerWorker` (built from
+    /// [`IoDriver::from_uring`][fu]) or `IoFlavor::ShardedMio` (built
+    /// from [`IoDriver::from_sharded_mio`][fs]) — and `None` for
+    /// `IoFlavor::Traditional`.
     ///
-    /// Kept on the scheduler handle (rather than on `driver::Handle`) so
-    /// that `Registration::new_with_interest_and_handle` can reach it
-    /// without plumbing a new field into the pre-scheduler I/O stack.
+    /// Kept on the scheduler handle (rather than on `driver::Handle`)
+    /// so that `Registration::new_with_interest_and_handle` can reach
+    /// it without plumbing a new field into the pre-scheduler I/O
+    /// stack.
     ///
     /// See `tokio/docs/io-driver-vtable.md` for the design.
+    ///
+    /// [fu]: crate::runtime::io::io_driver::IoDriver::from_uring
+    /// [fs]: crate::runtime::io::io_driver::IoDriver::from_sharded_mio
     #[cfg(all(
         tokio_unstable,
-        feature = "io-uring-reactor",
+        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
         feature = "rt-multi-thread",
         target_os = "linux",
     ))]
     pub(crate) io_driver: Option<crate::runtime::io::io_driver::IoDriver>,
-
-    /// Shared coordination handle for the per-worker sharded-mio
-    /// reactor backend. `Some` when `io_flavor == IoFlavor::ShardedMio`,
-    /// `None` otherwise.
-    #[cfg(all(
-        tokio_unstable,
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    pub(crate) sharded_mio_handle:
-        Option<Arc<crate::runtime::io::sharded_mio_driver::ShardedMioHandle>>,
 
     #[cfg(all(tokio_unstable, feature = "time"))]
     /// Indicates that the runtime is shutting down.
