@@ -46,15 +46,16 @@ shared-mio driver could be wrapped to expose.
 
 ## Representation: manual vtable, not `Arc<dyn>`
 
-The driver object lives inside `runtime::Inner` and is dropped with the
-runtime. Handles into it are borrow-erased thin pointers + a `&'static`
-vtable. No `Arc<dyn>`, no per-handle allocation, no atomic refcount
-traffic on `Handle::clone()`.
+Handles into the driver are a thin pointer + a `&'static` vtable. The
+representation is structurally a do-it-ourselves trait object, but with
+our own layout (one shared `&'static` vtable per backend instead of the
+fat-pointer encoding `dyn` uses), inlining attributes on shims, and no
+`Send + Sync + 'static` plumbing on a trait declaration.
 
 ```rust
 pub(crate) struct IoDriver {
     vtable: &'static IoDriverVTable,
-    data:   NonNull<()>, // points into runtime::Inner; lives as long as it
+    data:   NonNull<()>,
 }
 
 unsafe impl Send for IoDriver {}
@@ -62,18 +63,52 @@ unsafe impl Sync for IoDriver {}
 
 pub(crate) struct IoDriverVTable {
     pub add_source: unsafe fn(
-        NonNull<()>, &mut dyn Source, Interest,
+        NonNull<()>, &mut dyn RegistrationSource, Interest,
     ) -> io::Result<(Arc<ScheduledIo>, usize)>,
 
     pub deregister: unsafe fn(
-        NonNull<()>, &mut dyn Source, usize,
-    ),
+        NonNull<()>, &Arc<ScheduledIo>, usize,
+    ) -> io::Result<()>,
 
-    pub unpark_worker: unsafe fn(NonNull<()>, usize),
+    pub unpark_worker: unsafe fn(NonNull<()>, usize) -> bool,
 
     pub num_workers:   unsafe fn(NonNull<()>) -> usize,
+
+    // Refcount lifecycle: each backend's `data` pointer is produced by
+    // `Arc::into_raw` on its concrete handle type, and `clone`/`drop`
+    // here do `Arc::increment_strong_count` / `Arc::decrement_strong_count`.
+    pub clone: unsafe fn(NonNull<()>) -> NonNull<()>,
+    pub drop:  unsafe fn(NonNull<()>),
 }
+
+impl Clone for IoDriver { /* via vtable.clone */ }
+impl Drop  for IoDriver { /* via vtable.drop  */ }
 ```
+
+### Why the vtable shape uses `&mut dyn RegistrationSource`
+
+The two backends today take different argument types in their inherent
+`add_source` impls — `UringHandle` takes `RawFd`, `ShardedMioHandle`
+takes `&mut dyn Source`. The existing `RegistrationSource` trait
+already bridges this: it extends `mio::event::Source` with
+`registration_raw_fd() -> RawFd`. The vtable signature uses
+`&mut dyn RegistrationSource` so each backend's shim extracts what it
+needs.
+
+### Step-1 ownership: still `Arc` internally
+
+The aspirational form of this design is: driver lives in
+`runtime::Inner`, no refcount, `IoDriver` values are pure borrow-erased
+references into it. That requires lifetime plumbing through
+`UringParker` (which today owns an `Arc<UringHandle>` field). Out of
+scope for step 1 because it isn't a no-behavior-change refactor.
+
+For step 1 the `data` pointer is produced by `Arc::into_raw` on the
+backend's concrete handle, and `IoDriver: Clone` bumps that Arc via the
+vtable. Dispatch and refcount cost match today's `Arc<UringHandle>`
+exactly; we gain layout control, inlining headroom, and the cleaner
+flavor-agnostic call sites in `registration.rs`. Eliminating the Arc
+entirely is filed as future work in the open-questions section.
 
 Each backend declares one `static` vtable that thin-wraps its inherent
 methods:
@@ -209,6 +244,12 @@ so future-us remembers the framing.
 
 ## Out of scope (filed for later)
 
+- **Eliminating the internal `Arc`.** The aspirational design has the
+  driver owned by `runtime::Inner` with `IoDriver` as a borrow-erased
+  reference (zero refcount traffic). Step 1 keeps the existing
+  `Arc<UringHandle>` ownership to stay no-behavior-change. The promotion
+  to borrow-only is a follow-up that requires reshaping `UringParker`'s
+  `handle: Arc<UringHandle>` field into a borrow.
 - Sharded-mio wake/drain optimizations (per-worker single-issuer slab,
   edge-triggered registration, wake coalescing, CPU pinning). Tracked
   separately; the vtable refactor must not depend on or block these.
