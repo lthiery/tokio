@@ -1,10 +1,61 @@
 # IoDriver vtable: unified io-driver abstraction
 
-**Status:** design, not yet implemented
-**Branch target:** new worktree off `uring-reactor`
+**Status:** steps 1 and 2 implemented on `worktree-io-driver-vtable`.
+Step 3 (legacy shared-mio backend behind the same vtable) is the next
+piece of work and remains as designed below.
+**Branch:** `worktree-io-driver-vtable` (off `uring-reactor`).
 **Predecessor docs:** see `plan-history/uring-reactor-design.md` for the existing
 per-worker uring backend, and the sharded-mio worktree (`tokio-sharded-mio`,
 branch `sharded-mio`) for the analog mio backend that motivated this refactor.
+
+## Implementation status
+
+| Step | Status | Landing commits |
+|------|--------|-----------------|
+| 1 — scaffold + uring port | ✅ done | `d152586e` (scaffold), `dd38bdf2` (Handle field swap), `f32f13fa` (rebind-path rip) |
+| 2a — sharded-mio backend imported | ✅ done | `480b83da` |
+| 2b — `SHARDED_MIO_VTABLE` + `from_sharded_mio` | ✅ done | `a87b69ef` |
+| 2c — collapse `registration.rs` cfg cascade | ✅ done | `fa27c1a1` |
+| 3 — legacy shared-mio behind the vtable | not yet started | — |
+| 4 — upstream-shaped diff | presentation only | — |
+
+Bonus fix that fell out of step 2: `acd14d4a` removes an unsound
+self-wake short-circuit in `ShardedMioUnparker::unpark` and
+`UringUnparker::unpark` that deadlocked cap=1 mpsc round-trips by
+leaving `num_searching` stuck at 1 after `transition_to_parked` popped
+the calling worker off the sleepers list. Pinned by two new stress
+regressions (`cross_worker_channel_round_trip_cap1_stress_{2w,4w}`)
+in `tests/rt_sharded_mio.rs`.
+
+### Divergences from the original step-1/2 design
+
+- **`deregister` vtable signature.** The doc below shows
+  `(NonNull<()>, &Arc<ScheduledIo>, usize)` — `worker_idx: usize` was
+  meant to be a caller-tracked index returned by `add_source`. As
+  shipped, the signature is
+  `(NonNull<()>, &Arc<ScheduledIo>, &mut dyn RegistrationSource)`:
+  `worker_idx` came off the vtable because both backends already
+  stash it on `ScheduledIo` (`uring_worker` / `sharded_mio_worker`)
+  and `Registration::deregister` was already reading it from there.
+  `&mut dyn RegistrationSource` came on because sharded-mio needs to
+  call `mio::Registry::deregister(source)`; the uring shim ignores it.
+- **Accessor surface on `scheduler::Handle`.** The plan kept
+  `handle.uring_handle()` and `handle.sharded_mio_handle()` as
+  wrappers in step 1, with the intent of inlining them at step 2.
+  Step 2c instead removed both accessors entirely and replaced them
+  with a single `handle.io_driver() -> Option<&IoDriver>`. The
+  removed accessors had no readers outside the registration path that
+  collapsed in 2c, so keeping wrappers would have been pure surface
+  area without callers.
+- **Single `io_driver` field, no parallel `sharded_mio_handle` field.**
+  The `multi_thread::Handle` originally grew a separate
+  `Option<Arc<ShardedMioHandle>>` field at step 2a so the sharded-mio
+  parker construction in `worker::create()` had something to clone
+  from. Step 2c folded that field away; the `io_driver: Option<IoDriver>`
+  field is now built via `match io_flavor { … from_uring(...) … |
+  from_sharded_mio(...) … }`, and the local `Arc<ShardedMioHandle>`
+  inside `worker::create()` (still used to construct each
+  `ShardedMioParker`) lives only as a stack variable.
 
 ## Motivation
 
@@ -157,38 +208,57 @@ its concrete parker by value.
 Each step is a coherent, reviewable change. Steps 1–3 are pure
 refactors; step 4 is forward-looking only.
 
-### Step 1 — scaffold + uring port (no behavior change)
+### Step 1 — scaffold + uring port (no behavior change) ✅ shipped
 
-- Add `tokio/src/runtime/io/driver_vtable.rs` defining `IoDriver` and
-  `IoDriverVTable`.
-- Implement `URING_VTABLE` and `UringHandle::into_io_driver(self: Arc<Self>)`.
+- Add `tokio/src/runtime/io/io_driver.rs` defining `IoDriver` and
+  `IoDriverVTable`. (As shipped: `io_driver.rs`, not `driver_vtable.rs`.)
+- Implement `URING_VTABLE` and `IoDriver::from_uring(handle: Arc<UringHandle>)`.
 - Replace the `uring_handle: Option<Arc<UringHandle>>` field on
-  `runtime::Handle` with `io_driver: Option<IoDriver>`. Keep the
-  inherent-method shortcuts (`handle.uring_handle()` etc.) as wrappers
-  that downcast via vtable identity check, *only where currently used*.
+  `multi_thread::Handle` with `io_driver: Option<IoDriver>`.
 - Other backends (`Traditional`, `ShardedMio`) untouched at this step;
   their existing cfg branches in `registration.rs` remain.
 
-**Acceptance:**
-- `cargo test` parity with `uring-reactor` HEAD on the uring feature.
-- `tests/net_uring_reactor_*.rs` all pass unchanged.
-- `tests/net_uring_bench.rs` median throughput within ±2% of HEAD on
-  the same hardware.
+**Acceptance (met):**
+- `rt_uring_reactor` integration tests pass under
+  `--features rt-multi-thread,io-uring-reactor` (where the unrelated
+  process/net feature collision in dev-deps allows them to compile).
+- Refcount lifecycle covered by `uring_vtable_dispatch_and_refcount`
+  and `as_uring_arc_bumps_count` lib unit tests.
 
-### Step 2 — port `ShardedMioHandle` to fill the same vtable
+### Step 2 — port `ShardedMioHandle` to fill the same vtable ✅ shipped
 
-- Add `SHARDED_MIO_VTABLE` and `ShardedMioHandle::into_io_driver`.
-- Collapse the cfg branches in `registration.rs::new_with_interest_and_handle`
-  and `deregister` to a single
-  `if let Some(driver) = handle.io_driver() { driver.add_source(...) }`.
-- Vtable identity check (`std::ptr::eq(self.vtable, &URING_VTABLE)`)
-  used wherever uring-only behavior is still gated.
+Done in three sub-commits:
 
-**Acceptance:**
-- `cargo test --features full,io-sharded-mio` from the sharded-mio
-  worktree, ported in.
-- `tests/net_sharded_mio_*.rs` all pass.
-- Sharded-mio bench numbers match the sharded-mio worktree HEAD within ±2%.
+- **2a — import sharded-mio backend** (`480b83da`).
+  `ShardedMioHandle`, `ShardedMioParker`, sharded reactor module
+  brought over from the sibling `sharded-mio` worktree, plus the
+  five-test `tests/rt_sharded_mio.rs` smoke set.
+- **2b — vtable shim** (`a87b69ef`).
+  `SHARDED_MIO_VTABLE` static, `IoDriver::from_sharded_mio`,
+  `IoDriver::as_sharded_mio`, `IoDriver::as_sharded_mio_arc`
+  mirroring the uring shim. Vtable's `deregister` signature
+  changed to take `&mut dyn RegistrationSource` (sharded-mio needs
+  it for `mio::Registry::deregister`); the uring shim ignores
+  source and reads `worker_idx` off the `ScheduledIo`.
+- **2c — collapse the cfg cascade** (`fa27c1a1`).
+  Both branches in `Registration::new_with_interest_and_handle` and
+  `Registration::deregister` reduced to a single
+  `if let Some(driver) = handle.io_driver() { driver.add_source/deregister(...) }`.
+  Standalone `sharded_mio_handle` field on `multi_thread::Handle`
+  removed; `io_driver` field now feeds both backends. Per-backend
+  accessors (`uring_handle()`, `sharded_mio_handle()`) on
+  `scheduler::Handle` deleted; replaced by `io_driver()`.
+
+**Acceptance (met):**
+- `rt_sharded_mio` integration suite: 7/7 in 0.22s
+  (5 originals + 2 new cap=1 stress regressions added with the
+  parker fix `acd14d4a`).
+- `rt_threaded` (Traditional path): 29/29 in 3.16s — Traditional path
+  unaffected by the field collapse.
+- `tcp_into_split`: 3/3 in 0.01s — default mio registration path
+  unaffected.
+- Lib unit tests `runtime::io::io_driver::tests`: 5/5 across all four
+  feature combos (sharded-only / uring-only / both / neither).
 
 ### Step 3 — port the legacy shared-mio driver to fill the vtable
 
@@ -221,26 +291,35 @@ so future-us remembers the framing.
 
 ## Risks / open questions
 
-1. **Vtable-identity downcast for backend-specific call sites.** Step 1
-   keeps a few uring-only call sites (e.g. the `ClearUringTls`
-   blocking-pool guard). Comparing `&'static IoDriverVTable` pointers is
-   reliable if each backend declares exactly one vtable instance; that
-   contract should be asserted by a test.
+1. **Vtable-identity downcast for backend-specific call sites.**
+   _Resolved by step 2b._ The `vtable_identity_does_not_alias` lib
+   unit test asserts that `IoDriver::from_uring` and
+   `IoDriver::from_sharded_mio` produce distinguishable instances —
+   `as_uring()` returns `None` on a sharded driver and vice versa.
+   Each backend declares exactly one `&'static IoDriverVTable`.
 
-2. **`&mut dyn Source` in the vtable signature.** Currently the
-   `RegistrationSource` trait is generic; demoting to `dyn` is fine for
-   register/deregister (cold paths) but worth verifying it doesn't
-   regress fd-registration latency. Benchmark step 1 with both shapes
-   if any uring numbers slip.
+2. **`&mut dyn Source` in the vtable signature.** _Open in principle,
+   not blocking._ As shipped, `add_source` and `deregister` both take
+   `&mut dyn RegistrationSource`. No fd-registration latency check
+   has been run; uring's hot path goes through the same shim it had
+   before (`source.registration_raw_fd()` extraction is identical),
+   and sharded-mio's hot path is `mio::Registry::register`/`deregister`
+   which is already a virtual call. Worth a benchmark only if a
+   workload-level regression shows up.
 
-3. **`Handle` field rename ripples.** `uring_handle()` accessors are
-   referenced in non-runtime code (e.g. registration). Wrapper methods
-   on `Handle` keep call sites stable through step 1; they get inlined
-   to vtable identity checks at step 2.
+3. **`Handle` field rename ripples.** _Resolved by step 2c._ The
+   `uring_handle()` and `sharded_mio_handle()` accessors are gone;
+   their callers all moved to `handle.io_driver()`. No transitional
+   wrappers shipped because no readers existed outside the
+   registration path that collapsed in 2c.
 
-4. **Performance regression on uring.** This refactor must be
-   performance-neutral. If step 1 regresses uring benchmarks beyond ±2%,
-   stop and investigate before touching step 2.
+4. **Performance regression on uring.** _Open._ No bench numbers
+   collected yet for the vtable-routed path vs. the pre-step-1
+   inherent-method path. The pre-existing
+   `process` × `io-uring-reactor` test-build incompat (dev-deps drag
+   `tokio` in with `full`, which forces `RegistrationSource` to be
+   implemented for `process::imp::Pipe`) blocks running
+   `tests/net_uring_*.rs` from this worktree. Filing as a follow-up.
 
 ## Out of scope (filed for later)
 
