@@ -53,20 +53,22 @@ pub(crate) struct Handle {
     #[allow(dead_code)]
     pub(crate) io_flavor: IoFlavor,
 
-    /// Shared coordination handle for the per-worker `io_uring` reactor
-    /// backend. `Some` when `io_flavor == IoFlavor::UringPerWorker`, `None`
-    /// otherwise.
+    /// Backend-agnostic io-driver value (manual vtable). `Some` when the
+    /// runtime selected a non-traditional flavor (currently only
+    /// `IoFlavor::UringPerWorker`), `None` otherwise.
     ///
     /// Kept on the scheduler handle (rather than on `driver::Handle`) so
     /// that `Registration::new_with_interest_and_handle` can reach it
     /// without plumbing a new field into the pre-scheduler I/O stack.
+    ///
+    /// See `tokio/docs/io-driver-vtable.md` for the design.
     #[cfg(all(
         tokio_unstable,
         feature = "io-uring-reactor",
         feature = "rt-multi-thread",
         target_os = "linux",
     ))]
-    pub(crate) uring_handle: Option<Arc<crate::runtime::io::uring_driver::UringHandle>>,
+    pub(crate) io_driver: Option<crate::runtime::io::io_driver::IoDriver>,
 
     #[cfg(all(tokio_unstable, feature = "time"))]
     /// Indicates that the runtime is shutting down.

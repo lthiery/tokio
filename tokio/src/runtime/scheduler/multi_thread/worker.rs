@@ -375,7 +375,9 @@ pub(super) fn create(
             feature = "rt-multi-thread",
             target_os = "linux",
         ))]
-        uring_handle: uring_handle.clone(),
+        io_driver: uring_handle
+            .as_ref()
+            .map(|h| crate::runtime::io::io_driver::IoDriver::from_uring(std::sync::Arc::clone(h))),
         #[cfg(all(tokio_unstable, feature = "time"))]
         is_shutdown: AtomicBool::new(false),
     });

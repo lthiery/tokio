@@ -79,11 +79,11 @@ impl Handle {
     ))]
     pub(crate) fn uring_handle(
         &self,
-    ) -> Option<&crate::loom::sync::Arc<crate::runtime::io::uring_driver::UringHandle>> {
+    ) -> Option<&crate::runtime::io::uring_driver::UringHandle> {
         match self {
             #[cfg(feature = "rt")]
             Handle::CurrentThread(_) => None,
-            Handle::MultiThread(h) => h.uring_handle.as_ref(),
+            Handle::MultiThread(h) => h.io_driver.as_ref().and_then(|d| d.as_uring()),
             #[cfg(not(feature = "rt"))]
             Handle::Disabled => None,
         }

@@ -20,7 +20,12 @@
 //! `Arc<UringHandle>` exactly. Eliminating the Arc entirely is filed as
 //! future work in the design doc.
 
-#![allow(dead_code)] // step-1 scaffolding; wired to call sites in step 1c.
+// Some helpers (e.g. `add_source`/`deregister`/`unpark_worker` invoked
+// through the vtable) are not yet wired into the rest of tokio in step 1
+// — only `from_uring`, `as_uring`, and the `Clone`/`Drop` lifecycle are
+// reachable from production code. They get used in steps 2/3 when the
+// flavor-agnostic call sites land.
+#![allow(dead_code)]
 
 use crate::io::interest::Interest;
 use crate::runtime::io::ScheduledIo;
