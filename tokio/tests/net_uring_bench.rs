@@ -29,6 +29,9 @@ fn build_rt(workers: usize) -> runtime::Runtime {
     let mut b = runtime::Builder::new_multi_thread();
     b.worker_threads(workers);
     b.enable_all();
+    // DIAG (temporary): raise stickiness intervals to starve work-stealing.
+    b.event_interval(1024);
+    b.global_queue_interval(1024);
 
     #[cfg(all(tokio_unstable, feature = "io-uring-reactor"))]
     {

@@ -40,12 +40,13 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::os::fd::RawFd;
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::io::interest::Interest;
 use crate::loom::sync::Mutex;
 use crate::runtime::io::registration_set;
+use crate::runtime::io::uring_arm_table::ArmTable;
 use crate::runtime::io::uring_reactor::{ExternalWaker, Reactor};
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 
@@ -54,6 +55,17 @@ use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 pub(crate) const EMPTY: usize = 0;
 pub(crate) const PARKED: usize = 1;
 pub(crate) const NOTIFIED: usize = 2;
+
+/// Sentinel value stored into `ScheduledIo::uring_worker` for the duration
+/// of a cross-ring rebind. Concurrent `rebind_source` attempts serialize on
+/// this via CAS: only one rebinder at a time installs `REBINDING_MARKER`;
+/// others see the mid-rebind value and back off.
+///
+/// Chosen to be distinct from both `u32::MAX` (the "never registered"
+/// default on `ScheduledIo::uring_worker`) and from any legitimate worker
+/// index (worker count is bounded by `num_cpus` in practice, always
+/// << 2^32).
+pub(crate) const REBINDING_MARKER: u32 = u32::MAX - 1;
 
 /// An operation that needs to be submitted on a specific worker's ring.
 ///
@@ -103,6 +115,19 @@ pub(crate) struct WorkerState {
     /// Published once, at worker startup.
     pub(crate) external_waker: OnceLock<ExternalWaker>,
 
+    /// Shared handle to this worker's arm table. Peer workers use this to
+    /// atomically flip the `DISARMED` bit on a slab slot during a
+    /// cross-ring rebind, without needing access to the owning worker's
+    /// `!Sync` [`Reactor`]. The `Arc<ArmTable>` is cloned from the reactor
+    /// at startup (`Reactor::arm_table()`) and stored here.
+    ///
+    /// Published once, at worker startup, by
+    /// [`UringHandle::register_worker`]. Remains `None` (empty `OnceLock`)
+    /// for workers that never brought a reactor up — in which case rebind
+    /// requests targeting that worker are silently dropped by
+    /// [`UringHandle::rebind_source`].
+    pub(crate) arm_table: OnceLock<Arc<ArmTable>>,
+
     /// Ops pending submission on this worker's ring. Any thread can push;
     /// only the owning worker drains, on its next trip through park().
     ///
@@ -118,6 +143,7 @@ impl WorkerState {
             park_state: AtomicUsize::new(EMPTY),
             ring_fd: AtomicI32::new(-1),
             external_waker: OnceLock::new(),
+            arm_table: OnceLock::new(),
             pending_ops: Mutex::new(Vec::new()),
         }
     }
@@ -169,6 +195,46 @@ pub(crate) struct UringHandle {
     /// `num_workers` blocking tasks and each calls [`Self::wait_for_start`]
     /// at the top of `worker::run`, satisfying that requirement.
     start_barrier: std::sync::Barrier,
+
+    // DIAG (temporary): rebind instrumentation. Remove before commit.
+    diag_rebind_entered: AtomicU64,
+    diag_rebind_already_on_target: AtomicU64,
+    diag_rebind_cas_lost: AtomicU64,
+    diag_rebind_committed: AtomicU64,
+    diag_rebind_register_err: AtomicU64,
+    diag_rebind_no_local_reactor: AtomicU64,
+    /// NxN transition matrix flattened: entry [old*N + new] counts commits.
+    diag_transitions: Box<[AtomicU64]>,
+}
+
+impl Drop for UringHandle {
+    fn drop(&mut self) {
+        // DIAG (temporary): dump rebind counters for perf investigation.
+        let entered = self.diag_rebind_entered.load(Ordering::Relaxed);
+        if entered == 0 {
+            return;
+        }
+        let committed = self.diag_rebind_committed.load(Ordering::Relaxed);
+        let already = self.diag_rebind_already_on_target.load(Ordering::Relaxed);
+        let cas_lost = self.diag_rebind_cas_lost.load(Ordering::Relaxed);
+        let reg_err = self.diag_rebind_register_err.load(Ordering::Relaxed);
+        let no_local = self.diag_rebind_no_local_reactor.load(Ordering::Relaxed);
+        eprintln!(
+            "# DIAG rebind: entered={entered} committed={committed} already_on_target={already} cas_lost={cas_lost} register_err={reg_err} no_local_reactor={no_local}"
+        );
+        let n = self.workers.len();
+        if n > 0 && committed > 0 {
+            eprintln!("# DIAG rebind transition matrix (rows=old_worker, cols=new_worker):");
+            for old in 0..n {
+                let mut row = String::new();
+                for new in 0..n {
+                    let v = self.diag_transitions[old * n + new].load(Ordering::Relaxed);
+                    row.push_str(&format!("{:>10} ", v));
+                }
+                eprintln!("#   W{old} -> {row}");
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for UringHandle {
@@ -189,6 +255,10 @@ impl UringHandle {
         // Barrier must have at least 1 participant; a handle with zero
         // workers is degenerate but we keep it constructible for tests.
         let barrier_count = num_workers.max(1);
+        let diag_transitions: Box<[AtomicU64]> = (0..num_workers * num_workers)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             workers: workers.into_boxed_slice(),
             next_worker: AtomicUsize::new(0),
@@ -196,6 +266,13 @@ impl UringHandle {
             synced: Mutex::new(synced),
             metrics: IoDriverMetrics::default(),
             start_barrier: std::sync::Barrier::new(barrier_count),
+            diag_rebind_entered: AtomicU64::new(0),
+            diag_rebind_already_on_target: AtomicU64::new(0),
+            diag_rebind_cas_lost: AtomicU64::new(0),
+            diag_rebind_committed: AtomicU64::new(0),
+            diag_rebind_register_err: AtomicU64::new(0),
+            diag_rebind_no_local_reactor: AtomicU64::new(0),
+            diag_transitions,
         }
     }
 
@@ -227,8 +304,19 @@ impl UringHandle {
         worker_idx: usize,
         ring_fd: std::os::fd::RawFd,
         external_waker: ExternalWaker,
+        arm_table: Arc<ArmTable>,
     ) {
         let slot = &self.workers[worker_idx];
+        // Publish the arm table *before* the ring_fd. Peer workers that
+        // observe `ring_fd >= 0` in `rebind_source` will want to also pull
+        // the arm_table; ordering the stores this way lets them assume
+        // that if `ring_fd` is visible, `arm_table` already is too. Both
+        // stores use `Release`; a paired `Acquire` load of `ring_fd` on the
+        // reader side is sufficient to synchronize with the `arm_table`
+        // `OnceLock::set` that happened-before it.
+        if slot.arm_table.set(arm_table).is_err() {
+            debug_assert!(false, "worker {worker_idx} published arm_table twice");
+        }
         // `Release` so the eventfd/ring-fd writes are visible to unparkers
         // that observe the ring_fd.
         slot.ring_fd.store(ring_fd, Ordering::Release);
@@ -302,20 +390,32 @@ impl UringHandle {
     ///
     /// # Placement policy
     ///
-    /// Round-robin across rings via [`Self::fallback_worker`]. This keeps
-    /// CQE drain load and ring-queue depth roughly balanced across workers,
-    /// which is the right default when the eventual `W_task` is unknown at
-    /// registration time.
+    /// **Caller-local if we're on a worker, round-robin otherwise.** The
+    /// calling thread's worker index is probed via
+    /// [`current_worker_index`][]; if set, the new registration lands on
+    /// that worker's ring. If not (external thread — `spawn_blocking`,
+    /// user code on `block_on`, etc.), we fall back to round-robin via
+    /// [`Self::fallback_worker`].
     ///
-    /// Task-local placement (`W_ring == W_task`) is addressed by v2 *lazy
-    /// re-registration*: on first poll from a worker whose index differs
-    /// from `ScheduledIo::registered_on`, the fd is migrated to the polling
-    /// worker's ring. That moves locality decisions from "predict where the
-    /// task will run at registration time" (v1, ineffective in the presence
-    /// of `tokio::spawn` distribution) to "observe where the task actually
-    /// polls" (v2), which is correct for every caller shape — including the
-    /// listener + `tokio::spawn(handler)` pattern that dominates
-    /// `net_uring_bench.rs`.
+    /// Rationale: task-local placement is the cheap default —
+    /// `SINGLE_ISSUER`-wise, the task is already polling *here*, so its
+    /// first `POLL_ADD_MULTI` should fire *here* too. When the task is
+    /// then work-stolen to another worker, the rebind path
+    /// ([`Self::rebind_source`], kicked by
+    /// [`Registration::poll_ready`][reg-poll]) migrates the registration
+    /// to wherever the task actually polls — including the historic
+    /// listener + `tokio::spawn(handler)` pathology where v1's caller-
+    /// local placement regressed because worker 0 owned every accepted
+    /// fd's `POLL_ADD_MULTI` (no rebind then; see commit `e29114e1`).
+    /// With the v2 rebind wired up, that pathology is now cancelled on
+    /// first-poll: the handler task's initial `poll_ready` on whichever
+    /// worker got the `tokio::spawn` job flips the registration to that
+    /// worker's ring before the kernel has even had a chance to post the
+    /// first CQE.
+    ///
+    /// [`current_worker_index`]:
+    ///     crate::runtime::scheduler::multi_thread::uring_park::current_worker_index
+    /// [reg-poll]: crate::runtime::io::Registration::poll_ready
     ///
     /// Returns the allocated `Arc<ScheduledIo>` together with the assigned
     /// worker index. Callers must remember the index and pass it back into
@@ -418,6 +518,240 @@ impl UringHandle {
 
         self.metrics.dec_fd_count();
         Ok(())
+    }
+
+    /// Migrate a live registration from its current owner worker onto
+    /// `target_worker`'s ring.
+    ///
+    /// This is the v2-placement hot path: when a task is polled on worker
+    /// `W_task` but its fd's `POLL_ADD_MULTI` lives on `W_ring != W_task`,
+    /// a call here moves the registration so that subsequent CQEs fire on
+    /// `W_task` (eliminating cross-ring wake hops).
+    ///
+    /// # Protocol
+    ///
+    /// 1. **Serialize with other rebinders.** CAS `io.uring_worker` from
+    ///    its current value → [`REBINDING_MARKER`]. A racing rebinder
+    ///    already holds the marker and will complete its own migration; we
+    ///    bail out (returning `Ok(false)`).
+    ///
+    /// 2. **Snapshot the old slot identity** (`old_slab_key`,
+    ///    `old_slab_gen`, `old_worker`) *before* mutating anything. These
+    ///    are what the peer reactor needs to cancel its `POLL_ADD_MULTI`.
+    ///
+    /// 3. **Register locally.** `Reactor::register` allocates a fresh
+    ///    slab slot on `target_worker`'s reactor, publishes the new
+    ///    `(key, gen)` onto `io`, and stages a `POLL_ADD_MULTI` SQE on our
+    ///    ring. From this moment forward, new kernel readiness fires on
+    ///    `target_worker`.
+    ///
+    /// 4. **Release the marker.** Store `target_worker` into
+    ///    `io.uring_worker` — concurrent pollers can now observe the new
+    ///    owner.
+    ///
+    /// 5. **Disarm + cancel the old slot.** Flip `DISARMED` on the old
+    ///    owner's [`ArmTable`] via [`ArmTable::try_disarm`]. If we win
+    ///    the race (`true` returned), we hold cancellation responsibility:
+    ///    we submit a `MSG_RING` carrying [`VARIANT_CROSS_DEREGISTER`] so
+    ///    the old owner's reactor will emit the local `POLL_REMOVE`. If
+    ///    `try_disarm` returns `false`, the old slot is already gone
+    ///    (gen mismatch after recycle) or has already been disarmed by a
+    ///    concurrent deregister — either way, the cancellation kick has
+    ///    an owner and we must not double-submit.
+    ///
+    /// # Correctness invariants
+    ///
+    /// - From step 3 onward, any CQE the old peer posts for the old slot
+    ///   will be observed as `DISARMED` (once step 5 commits) and
+    ///   **suppressed from waking the task**. That is the whole point of
+    ///   the arm table: it lets us cancel observation instantly, before
+    ///   the peer's `POLL_REMOVE` has even been submitted, let alone
+    ///   reaped.
+    ///
+    /// - The slab Arc on the old peer is released by the peer's own drain
+    ///   loop on the terminal CQE; not our responsibility.
+    ///
+    /// - If this method returns `Ok(false)` (no rebind happened, because
+    ///   a race was lost or no move was necessary), the registration is
+    ///   in a consistent pre-call state from the caller's perspective:
+    ///   either still owned by `old_worker` (CAS lost) or already owned
+    ///   by `target_worker` (value raced but equal).
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)`: the rebind committed. Subsequent polls on
+    ///   `target_worker` will observe readiness locally.
+    /// - `Ok(false)`: the rebind was skipped (already at target, race
+    ///   lost to a concurrent rebinder, or target worker has no reactor
+    ///   installed yet).
+    /// - `Err(..)`: a local SQE push failed. The CAS is rolled back before
+    ///   returning. No kernel-side state changed.
+    ///
+    /// # Caller contract
+    ///
+    /// - Must be called **on** the thread that owns `target_worker`'s
+    ///   reactor (i.e. with that reactor installed in `LOCAL_REACTOR`).
+    ///   `SINGLE_ISSUER` requires that the local `POLL_ADD_MULTI` be
+    ///   submitted on the current thread's own ring.
+    /// - `fd` and `interest` must match the original `add_source` call
+    ///   for this `io`. The caller typically keeps them on the
+    ///   `Registration` itself.
+    ///
+    /// [`ArmTable`]: crate::runtime::io::uring_arm_table::ArmTable
+    /// [`ArmTable::try_disarm`]:
+    ///     crate::runtime::io::uring_arm_table::ArmTable::try_disarm
+    pub(crate) fn rebind_source(
+        &self,
+        io: &Arc<ScheduledIo>,
+        fd: RawFd,
+        interest: Interest,
+        target_worker: usize,
+    ) -> io::Result<bool> {
+        self.diag_rebind_entered.fetch_add(1, Ordering::Relaxed);
+        if target_worker >= self.workers.len() {
+            return Ok(false);
+        }
+
+        // Observe current owner; the short-circuit below also handles the
+        // "never successfully registered" (u32::MAX) and mid-rebind
+        // (REBINDING_MARKER) cases.
+        let old_worker_raw = io.uring_worker.load(Ordering::Acquire);
+        if old_worker_raw == target_worker as u32 {
+            self.diag_rebind_already_on_target.fetch_add(1, Ordering::Relaxed);
+            // Already on target — nothing to do.
+            return Ok(false);
+        }
+        if old_worker_raw == REBINDING_MARKER || old_worker_raw == u32::MAX {
+            // Either another rebinder is mid-flight, or the registration
+            // has never been assigned a worker (pre-`add_source`). Bail.
+            return Ok(false);
+        }
+
+        // Claim the rebind with a CAS. Loss here means a concurrent
+        // rebinder beat us; their completion will publish the new owner
+        // and we back off. AcqRel pairs with the Acquire load above and
+        // with the Release store we do on success below (step 4).
+        if io
+            .uring_worker
+            .compare_exchange(
+                old_worker_raw,
+                REBINDING_MARKER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.diag_rebind_cas_lost.fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+
+        self.diag_rebind_committed.fetch_add(1, Ordering::Relaxed);
+        {
+            let n = self.workers.len();
+            let old = old_worker_raw as usize;
+            if old < n && target_worker < n {
+                self.diag_transitions[old * n + target_worker]
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Past this point we own the rebind. Snapshot the old slot
+        // identity *before* mutating. `uring_slab_key` / `uring_gen` are
+        // stamped by `Reactor::register`, so the register() call in step
+        // 3 will overwrite them — snapshot first.
+        //
+        // Relaxed is fine: these atomics were published by the *old*
+        // owner under its own Release (inside `Reactor::register`), and
+        // the CAS above — an AcqRel — synchronized us with that write
+        // transitively via `uring_worker`.
+        let old_slab_key = io.uring_slab_key.load(Ordering::Relaxed);
+        let old_slab_gen = io.uring_gen.load(Ordering::Relaxed);
+        let old_worker = old_worker_raw as usize;
+
+        // Step 3: register on the target (local) reactor. We must be on
+        // that worker's thread for SINGLE_ISSUER to accept our SQE.
+        //
+        // On failure, roll back `uring_worker` to the old value so the
+        // registration stays consistent (still owned by `old_worker`,
+        // no orphaned REBINDING_MARKER).
+        let register_result = with_local_reactor(|reactor| reactor.register(fd, interest, io));
+        match register_result {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                self.diag_rebind_register_err.fetch_add(1, Ordering::Relaxed);
+                io.uring_worker
+                    .store(old_worker_raw, Ordering::Release);
+                return Err(e);
+            }
+            None => {
+                self.diag_rebind_no_local_reactor.fetch_add(1, Ordering::Relaxed);
+                // Target worker's reactor isn't installed on this thread.
+                // We can't complete the rebind safely (SINGLE_ISSUER
+                // forbids registering fds from a non-owning thread).
+                // Treat as "skip" — caller will retry on next poll.
+                io.uring_worker
+                    .store(old_worker_raw, Ordering::Release);
+                return Ok(false);
+            }
+        }
+
+        // Step 4: publish the new owner. Release so other threads that
+        // observe this via Acquire see the fresh `uring_slab_key` /
+        // `uring_gen` stamped by `Reactor::register` above.
+        io.uring_worker
+            .store(target_worker as u32, Ordering::Release);
+
+        // Step 5: disarm + cancel the old registration.
+        //
+        // Lookup the old worker's arm table. If it isn't published yet
+        // (worker never brought a reactor up), there is no registration
+        // to cancel and we're done. In practice an old registration
+        // always means an old reactor, so this branch is defensive.
+        let Some(old_arm_table) = self.workers.get(old_worker).and_then(|w| w.arm_table.get())
+        else {
+            return Ok(true);
+        };
+
+        // If `old_slab_key` is the default `u32::MAX`, the registration
+        // was CAS'd during a prior failed rebind rollback or was never
+        // fully installed on `old_worker`. No disarm is needed.
+        if old_slab_key == u32::MAX {
+            return Ok(true);
+        }
+
+        if !old_arm_table.try_disarm(old_slab_key, old_slab_gen) {
+            // Someone else already owns cancellation responsibility —
+            // could be a concurrent `deregister_source`, or the slot has
+            // been recycled (gen mismatch). Either way, no kick needed.
+            return Ok(true);
+        }
+
+        // We own the cancellation kick. Fire a cross-ring MSG_RING
+        // carrying VARIANT_CROSS_DEREGISTER so the old owner's drain
+        // loop submits the local POLL_REMOVE against its ring. We must
+        // be on our own reactor (same precondition as step 3), which is
+        // satisfied by the caller contract.
+        let old_ring_fd = self.workers[old_worker].ring_fd.load(Ordering::Acquire);
+        if old_ring_fd < 0 {
+            // Old worker's reactor has been torn down. The slab entry,
+            // if any, will be cleaned up at reactor drop. DISARMED is
+            // already flipped, so no spurious wake can come from it.
+            return Ok(true);
+        }
+
+        let send_result = with_local_reactor(|reactor| {
+            reactor.send_msg_ring_deregister(old_ring_fd, old_slab_gen, old_slab_key)
+        });
+        match send_result {
+            Some(Ok(())) => Ok(true),
+            Some(Err(e)) => Err(e),
+            // `None` here means we lost the local reactor between steps
+            // 3 and 5 — essentially impossible (we just used it), but
+            // treat as success-with-no-kick: the peer's POLL_ADD_MULTI
+            // is disarmed (won't wake tasks), and the registration's
+            // Arc will be cleaned up by normal drop semantics.
+            None => Ok(true),
+        }
     }
 
     /// Drain and return the pending-ops queue for `worker_idx`. Intended to
@@ -648,7 +982,12 @@ mod tests {
                 let _ = ready_tx.send(false);
                 return;
             };
-            receiver_handle.register_worker(0, reactor.ring_fd(), reactor.external_waker());
+            receiver_handle.register_worker(
+                0,
+                reactor.ring_fd(),
+                reactor.external_waker(),
+                reactor.arm_table(),
+            );
             ready_tx.send(true).unwrap();
 
             // Simulate "enter park" protocol then actually park.
@@ -672,7 +1011,12 @@ mod tests {
             let Ok(reactor) = Reactor::new() else {
                 return false;
             };
-            sender_handle.register_worker(1, reactor.ring_fd(), reactor.external_waker());
+            sender_handle.register_worker(
+                1,
+                reactor.ring_fd(),
+                reactor.external_waker(),
+                reactor.arm_table(),
+            );
             let reactor_cell = RefCell::new(reactor);
             let _guard = LocalReactorGuard::install(&reactor_cell);
 
@@ -707,9 +1051,10 @@ mod tests {
         };
         let external_waker = reactor.external_waker();
         let ring_fd = reactor.ring_fd();
+        let arm_table = reactor.arm_table();
 
         let handle = UringHandle::new(1);
-        handle.register_worker(0, ring_fd, external_waker);
+        handle.register_worker(0, ring_fd, external_waker, arm_table);
 
         // Simulate the worker having entered park.
         assert!(!handle.begin_park(0));

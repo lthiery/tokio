@@ -304,8 +304,12 @@ impl UringParker {
         );
 
         // Publish ring_fd + external_waker so other threads can target us.
-        self.handle
-            .register_worker(self.idx, reactor.ring_fd(), reactor.external_waker());
+        self.handle.register_worker(
+            self.idx,
+            reactor.ring_fd(),
+            reactor.external_waker(),
+            reactor.arm_table(),
+        );
 
         let boxed = Box::new(RefCell::new(reactor));
         let cell_ptr: *const RefCell<Reactor> = &*boxed;

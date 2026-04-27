@@ -57,6 +57,7 @@ use slab::Slab;
 use crate::io::{Interest, Ready};
 use crate::loom::sync::Arc;
 use crate::runtime::io::driver::Tick;
+use crate::runtime::io::uring_arm_table::ArmTable;
 use crate::runtime::io::ScheduledIo;
 
 use std::io;
@@ -167,6 +168,19 @@ const VARIANT_RECV_BYTES: u8 = 0x05;
 /// without more buffers, or peer close on 0-byte res + no F_MORE).
 const VARIANT_RECV_MULTI: u8 = 0x06;
 
+/// Cross-ring deregister request, delivered via `MSG_RING` from a peer
+/// worker that has taken ownership of one of our [`PollMulti`] slots.
+/// The `user_data` encodes the `(gen, key)` of *our* slab slot;
+/// receipt triggers a local `POLL_REMOVE` submission on the slot (if
+/// it still exists with a matching gen). The peer has already flipped
+/// the slot's `DISARMED` bit in our [`ArmTable`] before sending the
+/// message, so any interleaved readiness CQEs on our ring will
+/// already be suppressed by the time we process this variant.
+///
+/// [`PollMulti`]: OpState::PollMulti
+/// [`ArmTable`]: crate::runtime::io::uring_arm_table::ArmTable
+const VARIANT_CROSS_DEREGISTER: u8 = 0x07;
+
 // ===== well-known slab keys =====
 //
 // These are populated as the very first inserts in `Reactor::new`, in this
@@ -222,16 +236,15 @@ enum OpState {
     /// Multi-shot `POLL_ADD`. Lives from `register` until the kernel posts a
     /// CQE without `IORING_CQE_F_MORE` (either `-ECANCELED` after our
     /// `POLL_REMOVE`, or autonomous kernel cleanup, e.g. on `POLLHUP`).
+    ///
+    /// Teardown state (the former `removing: bool`) now lives on the
+    /// [`ArmTable`] at this slot's key, so it can be flipped from peer
+    /// workers during a cross-ring rebind. The drain reads that bit to
+    /// decide whether to suppress the readiness wake.
+    ///
+    /// [`ArmTable`]: crate::runtime::io::uring_arm_table::ArmTable
     PollMulti {
         io: Arc<ScheduledIo>,
-        /// True once a local `deregister()` has scheduled this slot for
-        /// teardown but the kernel has not yet posted the terminal CQE.
-        /// The drain loop reads this flag in the `VARIANT_POLL_MULTI` arm
-        /// and suppresses readiness delivery on any in-flight CQEs that
-        /// land between `deregister` submission and the terminal
-        /// `-ECANCELED` — the caller has already dropped interest, so
-        /// delivering readiness would wake a stale task handle.
-        removing: bool,
     },
 
     /// One-shot control op. Removed on first CQE.
@@ -299,6 +312,16 @@ pub(crate) struct Reactor {
     /// in practice since the slab is per-worker and bounded by active fd
     /// count).
     ops: Slab<SlotEntry>,
+
+    /// Cross-ring arm table for [`OpState::PollMulti`] slots. Publishes
+    /// per-slot `(gen, DISARMED)` state in a `Sync` chunked layout so
+    /// peer workers can flip `DISARMED` when they take ownership of a
+    /// registered fd via a rebind. Held as `Arc` so the [`UringHandle`]
+    /// can keep a reference for its cross-worker `rebind_source` path
+    /// even after the owning worker is mid-park.
+    ///
+    /// [`UringHandle`]: super::uring_driver::UringHandle
+    arm_table: Arc<ArmTable>,
 
     /// Monotonic generation counter, bumped on every slab insert. 24-bit
     /// effective range (truncated by [`encode`]); wraparound is
@@ -412,6 +435,7 @@ impl Reactor {
             ring,
             external_wake_fd: Arc::new(external_wake_fd),
             ops,
+            arm_table: Arc::new(ArmTable::new()),
             // Start at 1; gen=0 is reserved for the never-recycled
             // well-known slots so they don't compete for the counter.
             next_gen: 1,
@@ -423,6 +447,17 @@ impl Reactor {
     /// submit `MSG_RING` SQEs targeting this reactor's CQ.
     pub(crate) fn ring_fd(&self) -> RawFd {
         self.ring.as_raw_fd()
+    }
+
+    /// Clone the reactor's arm table. The [`UringHandle`] holds one such
+    /// clone per worker so the cross-ring rebind path can flip
+    /// `DISARMED` on the old owner's slot without needing to reach the
+    /// owner's `Reactor` (which is `!Sync`). Called once at worker
+    /// startup, right after `ring_fd()` / `external_waker()`.
+    ///
+    /// [`UringHandle`]: super::uring_driver::UringHandle
+    pub(crate) fn arm_table(&self) -> Arc<ArmTable> {
+        Arc::clone(&self.arm_table)
     }
 
     /// Obtain a thread-safe waker that can unblock this reactor's `park()`
@@ -500,10 +535,15 @@ impl Reactor {
             gen,
             state: OpState::PollMulti {
                 io: Arc::clone(scheduled_io),
-                removing: false,
             },
         });
         let key_u32 = u32::try_from(key).expect("slab key exceeds u32");
+
+        // Publish arm-table state *before* submitting the SQE: any CQE
+        // the kernel posts against this slot will see a valid (gen,
+        // DISARMED=0) entry in the table. Release-ordered inside
+        // `publish`.
+        self.arm_table.publish(key_u32, gen);
 
         // Publish the (key, gen) onto the ScheduledIo so a later
         // deregister — local or cross-ring MSG_RING — can find this slot
@@ -551,23 +591,29 @@ impl Reactor {
             return Ok(());
         }
 
-        // Find the slot, gen-check it against the caller's snapshot, and
-        // flip `removing` for diagnostic visibility. If the slot is gone
-        // or has been recycled to a different op, there's nothing to do.
-        let target_ud = match self.ops.get_mut(slab_key as usize) {
-            Some(entry) if entry.gen == slab_gen => match &mut entry.state {
-                OpState::PollMulti { removing, .. } => {
-                    *removing = true;
-                    encode(VARIANT_POLL_MULTI, entry.gen, slab_key)
-                }
+        // Atomically flip DISARMED for the slot. On success we own the
+        // responsibility of submitting POLL_REMOVE; on failure either the
+        // slot is gone (gen mismatch after recycle) or another path —
+        // typically a concurrent cross-ring rebind — already claimed
+        // responsibility. Either way, no more work here.
+        if !self.arm_table.try_disarm(slab_key, slab_gen) {
+            return Ok(());
+        }
+
+        // Gen-check the slab slot too, as a defense against the corner
+        // case where the arm table was republished by a very fast
+        // recycle + new registration. If the slab slot isn't a
+        // `PollMulti` any longer (or the gen has moved on), drop the
+        // request rather than submit a POLL_REMOVE against the wrong
+        // user_data.
+        let target_ud = match self.ops.get(slab_key as usize) {
+            Some(entry) if entry.gen == slab_gen => match &entry.state {
+                OpState::PollMulti { .. } => encode(VARIANT_POLL_MULTI, entry.gen, slab_key),
                 _ => {
-                    // Gen matched but slot is not a PollMulti — shouldn't
-                    // happen with disciplined caller usage.
                     debug_assert!(false, "deregister hit non-PollMulti slot");
                     return Ok(());
                 }
             },
-            // Stale key or slot vacant: silently drop.
             _ => return Ok(()),
         };
 
@@ -576,6 +622,49 @@ impl Reactor {
 
         // SAFETY: `PollRemove` references no user buffers; it is always safe.
         unsafe { self.push_sqe(sqe)? };
+        Ok(())
+    }
+
+    /// Send a cross-ring deregister request to a peer reactor via
+    /// `MSG_RING`. The peer's CQE will be tagged [`VARIANT_CROSS_DEREGISTER`]
+    /// with the provided `(slab_gen, slab_key)` (peer-side coordinates)
+    /// in the `user_data`; the peer's `drain_completions` will then
+    /// perform the local gen-checked `POLL_REMOVE` on its own ring.
+    ///
+    /// The caller **must** have already flipped the `DISARMED` bit on
+    /// the peer's [`ArmTable`] for this slot via `try_disarm`. That flip
+    /// is what serializes cancellation-kick ownership across peers; this
+    /// method only carries the actual remove request to the ring that
+    /// owns the registration.
+    ///
+    /// Must be called from the worker that owns **this** reactor (the
+    /// migrating worker), on its own ring.
+    ///
+    /// Submits immediately so the peer sees the teardown request without
+    /// waiting on our own park cadence.
+    ///
+    /// [`ArmTable`]: crate::runtime::io::uring_arm_table::ArmTable
+    pub(crate) fn send_msg_ring_deregister(
+        &mut self,
+        target_ring_fd: RawFd,
+        slab_gen: u32,
+        slab_key: u32,
+    ) -> io::Result<()> {
+        let (ack_ud, _ack_key) = self.alloc_control_slot();
+        let peer_ud = encode(VARIANT_CROSS_DEREGISTER, slab_gen, slab_key);
+
+        let sqe = opcode::MsgRingData::new(
+            types::Fd(target_ring_fd),
+            0,
+            peer_ud,
+            None,
+        )
+        .build()
+        .user_data(ack_ud);
+
+        // SAFETY: MsgRingData references no user buffers; always safe.
+        unsafe { self.push_sqe(sqe)? };
+        self.ring.submit()?;
         Ok(())
     }
 
@@ -881,6 +970,12 @@ impl Reactor {
         // CQE; the post-loop dispatcher fans these out into
         // `InboxEntry`s (BufferLease, Eof, Err).
         let mut recv_multi_completions: Vec<RecvMultiCompletion> = Vec::new();
+        // Cross-ring deregister requests (peer worker has taken
+        // ownership of one of our PollMulti slots and is asking us to
+        // submit POLL_REMOVE). Carries the slab `(gen, key)` of *our*
+        // slot. Staged because we can't push SQEs while the CQ
+        // iterator borrows `self.ring`.
+        let mut cross_deregisters: Vec<(u32, u32)> = Vec::new();
 
         let cq = self.ring.completion();
         for cqe in cq {
@@ -895,8 +990,8 @@ impl Reactor {
                         Some(e) if e.gen == gen => e,
                         _ => continue, // stale CQE; drop.
                     };
-                    let (io_arc, removing) = match &entry.state {
-                        OpState::PollMulti { io, removing } => (io.clone(), *removing),
+                    let io_arc = match &entry.state {
+                        OpState::PollMulti { io } => io.clone(),
                         _ => continue, // defense-in-depth; gen check above should make this unreachable.
                     };
 
@@ -904,14 +999,21 @@ impl Reactor {
                     let flags = cqe.flags();
                     let has_more = cqueue::more(flags);
 
-                    // Skip delivery if the slot has been scheduled for
-                    // local teardown by `deregister()` — the caller has
-                    // already dropped interest, and waking a stale task
-                    // handle would be a spurious poll at best and a
-                    // use-after-free scheduler hazard at worst. The
-                    // terminal `-ECANCELED` CQE still frees the slot
-                    // below via `!has_more`.
-                    if result >= 0 && !removing {
+                    // Suppress wake delivery if this slot has been
+                    // disarmed — either by a local `deregister()` (the
+                    // caller dropped interest) or by a peer worker that
+                    // took ownership of the fd via a rebind. In the
+                    // rebind case the peer has already installed a live
+                    // POLL_ADD_MULTI on its own ring and any readiness
+                    // events will be delivered there; waking on *our*
+                    // ring would drag the task back and trigger the
+                    // ping-pong pathology this whole mechanism exists
+                    // to prevent.
+                    //
+                    // The terminal `-ECANCELED` CQE still frees the
+                    // slot below via `!has_more`.
+                    let disarmed = self.arm_table.is_disarmed(key);
+                    if result >= 0 && !disarmed {
                         let ready = ready_from_poll_flags(result);
                         readiness_deliveries.push((io_arc, ready));
                     }
@@ -921,7 +1023,8 @@ impl Reactor {
 
                     if !has_more {
                         // Terminal CQE for this slot. The Arc is dropped
-                        // when we remove it after the loop.
+                        // when we remove it after the loop; arm-table
+                        // slot is cleared at the same time.
                         to_remove.push(key);
                     }
                 }
@@ -946,6 +1049,27 @@ impl Reactor {
                     // Cross-worker wake. No payload to dispatch — the
                     // scheduler's task-queue checks happen around park().
                     // Slot stays.
+                }
+
+                VARIANT_CROSS_DEREGISTER => {
+                    // A peer worker has taken ownership of one of our
+                    // PollMulti registrations via rebind and is asking
+                    // us to tear down the stale POLL_ADD_MULTI on our
+                    // ring. The `(gen, key)` payload refers to *our*
+                    // slab.
+                    //
+                    // The peer flipped our ArmTable's DISARMED bit for
+                    // this slot *before* sending the MSG_RING, so any
+                    // readiness CQEs that landed between its rebind and
+                    // this message have already been suppressed by the
+                    // VARIANT_POLL_MULTI arm above — no ping-pong back
+                    // onto this worker.
+                    //
+                    // We defer the actual POLL_REMOVE submission until
+                    // after the CQ iterator releases `self.ring`;
+                    // gen-check happens there against the live slab
+                    // state.
+                    cross_deregisters.push((gen, key));
                 }
 
                 VARIANT_SEND_BYTES => {
@@ -1020,9 +1144,54 @@ impl Reactor {
         // Iterator drop syncs the CQ head pointer back to the kernel.
 
         for key in to_remove {
+            // Check whether this is a PollMulti slot before removing;
+            // only those slots have corresponding ArmTable state, and
+            // we want to avoid unnecessary cache-line traffic on
+            // Control/Eventfd/MsgRingIncoming slot removals.
+            let is_poll_multi = matches!(
+                self.ops.get(key as usize).map(|e| &e.state),
+                Some(OpState::PollMulti { .. }),
+            );
             // Slab::try_remove tolerates already-vacant slots (which can
             // happen if a Control completion fires twice — defensive).
             let _ = self.ops.try_remove(key as usize);
+            if is_poll_multi {
+                // Zero the arm-table slot so a future re-use of the
+                // same key (after a slab recycle for, say, a Control
+                // op) doesn't accidentally report DISARMED for the new
+                // op. A subsequent `publish` for a fresh PollMulti at
+                // this key resets both gen and flags.
+                self.arm_table.clear(key);
+            }
+        }
+
+        // Process cross-ring deregister requests. Each entry is the
+        // `(gen, key)` of one of our slab slots that a peer has taken
+        // ownership of; we submit POLL_REMOVE on our ring against the
+        // original PollMulti user_data. Gen-check against the slab
+        // guards the corner case where the slot was already terminal
+        // before the MSG_RING arrived.
+        for (dereg_gen, dereg_key) in cross_deregisters {
+            let target_ud = match self.ops.get(dereg_key as usize) {
+                Some(entry) if entry.gen == dereg_gen => match &entry.state {
+                    OpState::PollMulti { .. } => {
+                        encode(VARIANT_POLL_MULTI, entry.gen, dereg_key)
+                    }
+                    _ => continue,
+                },
+                _ => continue, // slot already terminal / recycled
+            };
+            let (ack_ud, _ack_key) = self.alloc_control_slot();
+            let sqe = opcode::PollRemove::new(target_ud).build().user_data(ack_ud);
+            // SAFETY: PollRemove references no user buffers.
+            if let Err(_e) = unsafe { self.push_sqe(sqe) } {
+                // Submission failure is recoverable: the registration
+                // will still complete (as readiness events on the old
+                // ring, which we now drop via the DISARMED bit) until
+                // some later path tears it down. Not ideal, but not
+                // unsafe.
+                debug_assert!(false, "cross-deregister SQE push failed");
+            }
         }
 
         // Deliver owned-buffer op completions. We pull each slot out of the
