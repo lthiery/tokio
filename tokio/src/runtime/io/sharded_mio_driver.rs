@@ -51,9 +51,17 @@ use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 
 /// Park-state atomic values. Shape mirrors the uring handle's
 /// transitions so scheduler integration stays familiar.
+///
+/// `STEALING` is added to support readiness stealing: a peer worker
+/// holds this state while it is mid-`epoll_wait` on our epoll fd. We
+/// must not call our own `epoll_wait` while a stealer is active, or we
+/// race the stealer for the kernel's exactly-once event delivery and
+/// risk being starved. `begin_park` waits out a `STEALING` state via a
+/// short spin before transitioning to `PARKED`.
 pub(crate) const EMPTY: usize = 0;
 pub(crate) const PARKED: usize = 1;
 pub(crate) const NOTIFIED: usize = 2;
+pub(crate) const STEALING: usize = 3;
 
 /// Cross-thread driver op queued onto a worker's
 /// [`WorkerState::pending_ops`].
@@ -245,29 +253,187 @@ impl ShardedMioHandle {
         true
     }
 
+    /// Try to harvest readiness from peer workers' epoll fds.
+    ///
+    /// Called from a worker's pre-park path when its own scheduler run
+    /// queue is empty. For each peer (round-robin starting from the
+    /// next index after `self_idx`) we issue a non-blocking
+    /// `libc::epoll_wait(peer.epoll_fd, buf, 0)` and dispatch any
+    /// returned events through the peer's [`SharedRegistry`].
+    ///
+    /// Why bypass mio's `Poll`: `Poll::poll` is `&mut self` and lives
+    /// on the owning worker thread. The `Registry` clone, by contrast,
+    /// is `Send + Sync` and gives us the same epoll fd. Calling raw
+    /// `epoll_wait` on it is sound — Linux guarantees exactly-once
+    /// delivery to `epoll_wait` callers, so a stealer racing the
+    /// peer's own `Poll::poll` cannot cause a double-fire.
+    ///
+    /// Returns the total number of events dispatched. The caller
+    /// generally doesn't need this — the wake side-effect is the
+    /// product — but it's surfaced for tests/metrics.
+    ///
+    /// `buf` is a caller-owned scratch buffer; sized once on the stack
+    /// (typically `[epoll_event; 32]`) to keep the steal pass
+    /// allocation-free.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn try_steal_pass(
+        &self,
+        self_idx: usize,
+        buf: &mut [libc::epoll_event],
+    ) -> usize {
+        use super::lazy_debug::{bump, COUNTERS};
+        bump(&COUNTERS.steal_pass_calls);
+
+        let n = self.workers.len();
+        if n <= 1 || buf.is_empty() {
+            return 0;
+        }
+        let mut total = 0usize;
+        // Round-robin over peers starting after self_idx so two
+        // adjacent stealers don't pile on the same victim every pass.
+        for offset in 1..n {
+            let victim_idx = (self_idx + offset) % n;
+            let slot = &self.workers[victim_idx];
+            let Some(registry) = slot.shared_registry.get() else {
+                // Peer hasn't published its registry yet (early
+                // startup). The start barrier prevents this in the
+                // steady state, but be defensive.
+                continue;
+            };
+
+            // Acquire the steal lock by CAS-ing peer.park_state
+            // EMPTY → STEALING. This blocks the peer from entering
+            // its own `epoll_wait` while we are mid-syscall, fixing
+            // the otherwise-unavoidable race where:
+            //
+            //   1. We load park_state (EMPTY) and proceed.
+            //   2. Peer CAS's EMPTY → PARKED and enters epoll_wait.
+            //   3. We also call epoll_wait on the same fd.
+            //   4. Kernel delivers each event to exactly one waiter;
+            //      we may starve the peer of its own readiness.
+            //
+            // If the CAS fails — peer is PARKED, NOTIFIED, or another
+            // stealer beat us to it — skip this victim. We don't spin
+            // because there's nothing useful to wait for: a PARKED
+            // peer is the right consumer for its own events, and a
+            // NOTIFIED peer is about to wake and consume them itself.
+            //
+            // Safety vs WAKER_TOKEN events on the peer's eventfd: a
+            // peer in EMPTY state has, by construction, drained any
+            // queued waker event in its last `Poll::poll` (which
+            // transitioned it out of PARKED). The next eventfd write
+            // happens inside `unpark`, which only fires when
+            // prev==PARKED — i.e. it can't fire while we hold
+            // STEALING because we hold the slot.
+            if slot
+                .park_state
+                .compare_exchange(EMPTY, STEALING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            bump(&COUNTERS.steal_pass_visits);
+
+            let epfd = registry.epoll_fd();
+            // SAFETY: epfd is the live cloned epoll fd held by
+            // `registry`; `buf` is a valid mutable buffer with `len`
+            // entries. Timeout 0 = non-blocking.
+            let rc = unsafe {
+                libc::epoll_wait(
+                    epfd,
+                    buf.as_mut_ptr(),
+                    buf.len() as libc::c_int,
+                    0,
+                )
+            };
+
+            // Release the steal lock before dispatch so a wake
+            // delivered into the peer's queue can take effect via
+            // `unpark` if the peer parks immediately after — we're
+            // out of its hair after this point. Dispatch happens
+            // outside the lock; the slab is independently protected
+            // by `ops.lock()` inside `steal_dispatch`.
+            //
+            // CAS rather than store: while we held STEALING, an
+            // `unpark` may have fired and `swap(NOTIFIED)`-ed past
+            // us. In that case the slot is now NOTIFIED and the peer
+            // worker should see it via its next `begin_park`. A naïve
+            // `store(EMPTY)` here would silently clobber the
+            // notification.
+            let _ = slot.park_state.compare_exchange(
+                STEALING,
+                EMPTY,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+
+            if rc < 0 {
+                let err = std::io::Error::last_os_error().raw_os_error();
+                if err == Some(libc::EINTR) {
+                    bump(&COUNTERS.steal_eintr);
+                } else {
+                    // EBADF can occur during shutdown; we just stop
+                    // visiting this victim. Anything else (rare:
+                    // EFAULT, EINVAL) is caller-bug territory and we
+                    // also just skip — the next park pass retries.
+                    bump(&COUNTERS.steal_errors);
+                }
+                continue;
+            }
+            if rc == 0 {
+                bump(&COUNTERS.steal_eagain);
+                continue;
+            }
+            let count = rc as usize;
+            COUNTERS
+                .steal_events_harvested
+                .fetch_add(count as u64, Ordering::Relaxed);
+            total += registry.steal_dispatch(&buf[..count]);
+        }
+        total
+    }
+
     /// Called by the worker on entry to park. Returns `true` if a wake
     /// was already pending, in which case park should skip the syscall
     /// and return immediately.
+    ///
+    /// If a peer worker is currently in the [`STEALING`] state on this
+    /// slot (mid `epoll_wait` on our epoll fd), we briefly spin waiting
+    /// for it to release. The stealer holds the lock only for the
+    /// duration of one non-blocking `epoll_wait` (~hundreds of ns), so
+    /// the spin is bounded.
     pub(crate) fn begin_park(&self, worker_idx: usize) -> bool {
         use super::lazy_debug::{bump, COUNTERS};
         bump(&COUNTERS.begin_park_calls);
         let slot = &self.workers[worker_idx];
-        match slot.park_state.compare_exchange(
-            EMPTY,
-            PARKED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                bump(&COUNTERS.begin_park_parked);
-                false
+        loop {
+            match slot.park_state.compare_exchange(
+                EMPTY,
+                PARKED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    bump(&COUNTERS.begin_park_parked);
+                    return false;
+                }
+                Err(NOTIFIED) => {
+                    bump(&COUNTERS.begin_park_fastpath);
+                    slot.park_state.store(EMPTY, Ordering::Release);
+                    return true;
+                }
+                Err(STEALING) => {
+                    // Peer is mid `epoll_wait(timeout=0)` on our
+                    // epoll fd. Bounded duration; spin until they
+                    // release back to EMPTY (or to NOTIFIED if a
+                    // wake races in) and retry the CAS.
+                    bump(&COUNTERS.begin_park_steal_spin);
+                    while slot.park_state.load(Ordering::Acquire) == STEALING {
+                        std::hint::spin_loop();
+                    }
+                }
+                Err(state) => panic!("inconsistent park_state on begin_park: {state}"),
             }
-            Err(NOTIFIED) => {
-                bump(&COUNTERS.begin_park_fastpath);
-                slot.park_state.store(EMPTY, Ordering::Release);
-                true
-            }
-            Err(state) => panic!("inconsistent park_state on begin_park: {state}"),
         }
     }
 

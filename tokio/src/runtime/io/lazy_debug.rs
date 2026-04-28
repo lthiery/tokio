@@ -165,6 +165,31 @@ counters! {
     /// included `WRITABLE`.
     sr_register_writable_interest,
 
+    // ---- readiness stealing ----
+    /// `try_steal_pass` entered (one per pre-park steal attempt).
+    steal_pass_calls,
+    /// Number of peer epoll fds visited across all steal passes.
+    steal_pass_visits,
+    /// Total events harvested across all steal passes.
+    steal_events_harvested,
+    /// Subset of harvested events where dispatch fired a waker.
+    steal_events_woken,
+    /// `epoll_wait(timeout=0)` returned 0 (no events ready on the peer).
+    steal_eagain,
+    /// `epoll_wait(timeout=0)` returned a negative errno other than EINTR.
+    steal_errors,
+    /// `epoll_wait(timeout=0)` returned EINTR (rare; treat as 0).
+    steal_eintr,
+    /// Steal observed an event whose slab entry was vacated.
+    steal_slab_miss,
+    /// Steal observed an event whose gen disagrees with the slab entry.
+    steal_gen_mismatch,
+    /// Steal observed the peer's WAKER_TOKEN (peer self-wake; ignored).
+    steal_waker_token,
+    /// `begin_park` observed a peer holding STEALING; spun until released.
+    begin_park_steal_spin,
+    /// Pre-park steal harvested >0 events; we skipped the actual park.
+    park_skip_after_steal,
 }
 
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();

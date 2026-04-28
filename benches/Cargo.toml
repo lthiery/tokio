@@ -113,5 +113,10 @@ name = "net_tcp_echo"
 path = "net_tcp_echo.rs"
 harness = false
 
+[[bench]]
+name = "io_busy_owner"
+path = "io_busy_owner.rs"
+harness = false
+
 [lints]
 workspace = true
