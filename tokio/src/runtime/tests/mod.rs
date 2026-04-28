@@ -67,6 +67,7 @@ cfg_loom! {
     mod loom_local;
     mod loom_multi_thread;
     mod loom_oneshot;
+    mod loom_registration;
 
     // Make sure debug assertions are enabled
     #[cfg(not(debug_assertions))]
