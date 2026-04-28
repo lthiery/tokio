@@ -506,6 +506,12 @@ impl Reactor {
     fn poll_and_dispatch(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         use super::lazy_debug::{bump, COUNTERS};
         bump(&COUNTERS.dispatch_calls);
+        // Resolve our worker idx once for per-worker attribution. TLS
+        // is set by `ShardedMioParker::ensure_reactor_installed`; this
+        // function only runs from a worker thread, so the lookup
+        // should succeed in the steady state.
+        let self_idx =
+            crate::runtime::scheduler::multi_thread::sharded_mio_park::current_worker_index();
         let events = &mut self.events;
         match self.poll.poll(events, timeout) {
             Ok(()) => {
@@ -564,6 +570,12 @@ impl Reactor {
             }
             let ready = Ready::from_mio(event);
             bump(&COUNTERS.dispatch_woken);
+            if let Some(idx) = self_idx {
+                super::lazy_debug::bump_per_worker(
+                    &super::lazy_debug::PER_WORKER.dispatch_woken,
+                    idx,
+                );
+            }
             if ready.is_readable() {
                 bump(&COUNTERS.dispatch_woken_readable);
             }

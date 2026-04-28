@@ -281,8 +281,9 @@ impl ShardedMioHandle {
         self_idx: usize,
         buf: &mut [libc::epoll_event],
     ) -> usize {
-        use super::lazy_debug::{bump, COUNTERS};
+        use super::lazy_debug::{bump, bump_per_worker, COUNTERS, PER_WORKER};
         bump(&COUNTERS.steal_pass_calls);
+        bump_per_worker(&PER_WORKER.try_steal_pass_calls, self_idx);
 
         let n = self.workers.len();
         if n <= 1 || buf.is_empty() {
@@ -434,7 +435,17 @@ impl ShardedMioHandle {
             COUNTERS
                 .steal_events_harvested
                 .fetch_add(count as u64, Ordering::Relaxed);
-            total += registry.steal_dispatch(&buf[..count]);
+            let woken = registry.steal_dispatch(&buf[..count]);
+            // Attribute steal-side wakes to the *stealer* (this
+            // worker), not the victim — matters for hypothesis 1
+            // (probe registration concentrated on burner-pinned
+            // workers means the stealer must do all the harvesting).
+            super::lazy_debug::add_per_worker(
+                &PER_WORKER.steal_events_woken,
+                self_idx,
+                woken as u64,
+            );
+            total += woken;
         }
         total
     }
@@ -449,8 +460,9 @@ impl ShardedMioHandle {
     /// duration of one non-blocking `epoll_wait` (~hundreds of ns), so
     /// the spin is bounded.
     pub(crate) fn begin_park(&self, worker_idx: usize) -> bool {
-        use super::lazy_debug::{bump, COUNTERS};
+        use super::lazy_debug::{bump, bump_per_worker, COUNTERS, PER_WORKER};
         bump(&COUNTERS.begin_park_calls);
+        bump_per_worker(&PER_WORKER.begin_park_calls, worker_idx);
         let slot = &self.workers[worker_idx];
         loop {
             match slot.park_state.compare_exchange(
@@ -641,6 +653,10 @@ impl ShardedMioHandle {
         match registry.register(&mut source, fd, interest, shared) {
             Ok(ok) => {
                 bump(&COUNTERS.register_on_worker_ok);
+                super::lazy_debug::bump_per_worker(
+                    &super::lazy_debug::PER_WORKER.register_per_worker,
+                    worker_idx,
+                );
                 shared
                     .sharded_mio_slab_key
                     .store(ok.slab_key, Ordering::Relaxed);
@@ -832,6 +848,10 @@ impl ShardedMioHandle {
         match registry.register(&mut source, fd, interest, &shared) {
             Ok(ok) => {
                 bump(&COUNTERS.apply_register_ok);
+                super::lazy_debug::bump_per_worker(
+                    &super::lazy_debug::PER_WORKER.register_per_worker,
+                    worker_idx,
+                );
                 // `sharded_mio_gen` was stamped on `shared` by
                 // `SharedRegistry::register`.
                 shared

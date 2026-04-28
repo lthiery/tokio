@@ -236,6 +236,65 @@ counters! {
 
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();
 
+/// Maximum worker index supported by the per-worker counter arrays.
+/// Bench scenarios use 4 workers; 16 covers reasonable headroom while
+/// keeping the static foot-print trivial.
+pub(crate) const MAX_WORKERS: usize = 16;
+
+/// Per-worker counter arrays. Indexed by worker idx as published by
+/// `ShardedMioParker` / `current_worker_index()`. Out-of-range indices
+/// are silently dropped at the bump sites.
+pub(crate) struct PerWorkerCounters {
+    /// Worker harvested ≥1 event from its *own* `mio::Poll::poll`
+    /// (the [`dispatch_woken`] counter, attributed by worker).
+    ///
+    /// [`dispatch_woken`]: LazyDebugCounters
+    pub(crate) dispatch_woken: [AtomicU64; MAX_WORKERS],
+    /// Worker (the *stealer*) harvested events from peer epoll fds.
+    /// Bumped by the stealer's idx, not the victim's.
+    pub(crate) steal_events_woken: [AtomicU64; MAX_WORKERS],
+    /// `begin_park` was called for this worker idx.
+    pub(crate) begin_park_calls: [AtomicU64; MAX_WORKERS],
+    /// `try_steal_pass` was called by this worker idx.
+    pub(crate) try_steal_pass_calls: [AtomicU64; MAX_WORKERS],
+    /// fd registered (via either `register_on_worker` sync fast path
+    /// or `apply_register` queued path) onto this worker.
+    pub(crate) register_per_worker: [AtomicU64; MAX_WORKERS],
+}
+
+impl PerWorkerCounters {
+    const fn new() -> Self {
+        Self {
+            dispatch_woken: [const { AtomicU64::new(0) }; MAX_WORKERS],
+            steal_events_woken: [const { AtomicU64::new(0) }; MAX_WORKERS],
+            begin_park_calls: [const { AtomicU64::new(0) }; MAX_WORKERS],
+            try_steal_pass_calls: [const { AtomicU64::new(0) }; MAX_WORKERS],
+            register_per_worker: [const { AtomicU64::new(0) }; MAX_WORKERS],
+        }
+    }
+}
+
+pub(crate) static PER_WORKER: PerWorkerCounters = PerWorkerCounters::new();
+
+/// Bump a per-worker counter slot. Out-of-range indices are no-ops
+/// (defensive — should not happen with `MAX_WORKERS=16` bench setups).
+#[inline]
+pub(crate) fn bump_per_worker(arr: &[AtomicU64; MAX_WORKERS], idx: usize) {
+    if let Some(slot) = arr.get(idx) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+    ensure_dumper();
+}
+
+/// Add `n` to a per-worker counter slot.
+#[inline]
+pub(crate) fn add_per_worker(arr: &[AtomicU64; MAX_WORKERS], idx: usize, n: u64) {
+    if let Some(slot) = arr.get(idx) {
+        slot.fetch_add(n, Ordering::Relaxed);
+    }
+    ensure_dumper();
+}
+
 static INIT: Once = Once::new();
 
 /// Bump a counter and ensure the periodic dumper is running (no-op if
@@ -339,6 +398,38 @@ static TRIAL_NUM: AtomicU64 = AtomicU64::new(0);
 /// the first dump.
 static PREV_SNAPSHOT: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
+/// Per-worker previous snapshot for delta computation. Populated on
+/// first dump.
+static PREV_PER_WORKER: Mutex<Option<PerWorkerSnapshot>> = Mutex::new(None);
+
+#[derive(Default, Clone)]
+struct PerWorkerSnapshot {
+    dispatch_woken: [u64; MAX_WORKERS],
+    steal_events_woken: [u64; MAX_WORKERS],
+    begin_park_calls: [u64; MAX_WORKERS],
+    try_steal_pass_calls: [u64; MAX_WORKERS],
+    register_per_worker: [u64; MAX_WORKERS],
+}
+
+impl PerWorkerSnapshot {
+    fn capture() -> Self {
+        let load_arr = |arr: &[AtomicU64; MAX_WORKERS]| {
+            let mut out = [0u64; MAX_WORKERS];
+            for (i, slot) in arr.iter().enumerate() {
+                out[i] = slot.load(Ordering::Relaxed);
+            }
+            out
+        };
+        Self {
+            dispatch_woken: load_arr(&PER_WORKER.dispatch_woken),
+            steal_events_woken: load_arr(&PER_WORKER.steal_events_woken),
+            begin_park_calls: load_arr(&PER_WORKER.begin_park_calls),
+            try_steal_pass_calls: load_arr(&PER_WORKER.try_steal_pass_calls),
+            register_per_worker: load_arr(&PER_WORKER.register_per_worker),
+        }
+    }
+}
+
 fn trial_size() -> u64 {
     let cur = TRIAL_SIZE.load(Ordering::Relaxed);
     if cur >= 0 {
@@ -407,4 +498,43 @@ pub(crate) fn maybe_dump_trial() {
         }
     }
     *prev = snap.into_iter().map(|(_, v)| v).collect();
+
+    // Per-worker deltas. Same boundary semantics: first dump shows
+    // absolute non-zero values, subsequent dumps show deltas.
+    let cur_pw = PerWorkerSnapshot::capture();
+    let mut prev_pw_guard = match PREV_PER_WORKER.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let render = |out: &mut std::io::StderrLock<'_>,
+                  name: &str,
+                  cur: &[u64; MAX_WORKERS],
+                  prev: Option<&[u64; MAX_WORKERS]>| {
+        // Only emit a line per worker idx if the value (delta or
+        // absolute) is non-zero. Keeps output compact.
+        for w in 0..MAX_WORKERS {
+            let v = match prev {
+                Some(p) => cur[w].wrapping_sub(p[w]),
+                None => cur[w],
+            };
+            if v != 0 {
+                let _ = writeln!(out, "  {name:32}[w{w}] {sign}{v}",
+                    sign = if prev.is_some() { "+" } else { "=" });
+            }
+        }
+    };
+
+    let prev_pw = prev_pw_guard.as_ref();
+    render(&mut out, "dispatch_woken_pw",
+        &cur_pw.dispatch_woken, prev_pw.map(|p| &p.dispatch_woken));
+    render(&mut out, "steal_events_woken_pw",
+        &cur_pw.steal_events_woken, prev_pw.map(|p| &p.steal_events_woken));
+    render(&mut out, "begin_park_calls_pw",
+        &cur_pw.begin_park_calls, prev_pw.map(|p| &p.begin_park_calls));
+    render(&mut out, "try_steal_pass_calls_pw",
+        &cur_pw.try_steal_pass_calls, prev_pw.map(|p| &p.try_steal_pass_calls));
+    render(&mut out, "register_per_worker_pw",
+        &cur_pw.register_per_worker, prev_pw.map(|p| &p.register_per_worker));
+
+    *prev_pw_guard = Some(cur_pw);
 }
