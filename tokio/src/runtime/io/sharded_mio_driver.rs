@@ -325,12 +325,28 @@ impl ShardedMioHandle {
             // happens inside `unpark`, which only fires when
             // prev==PARKED — i.e. it can't fire while we hold
             // STEALING because we hold the slot.
-            if slot
-                .park_state
-                .compare_exchange(EMPTY, STEALING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
+            match slot.park_state.compare_exchange(
+                EMPTY,
+                STEALING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {}
+                Err(prev) => {
+                    // Attribute the lock-out by observed state so we
+                    // can tell whether NOTIFIED-stuck busy peers (the
+                    // currently-suspected liveness bug) dominate, vs
+                    // peers genuinely PARKED (in which case they will
+                    // dispatch their own events soon), vs racing
+                    // stealers.
+                    match prev {
+                        PARKED => bump(&COUNTERS.steal_cas_fail_parked),
+                        NOTIFIED => bump(&COUNTERS.steal_cas_fail_notified),
+                        STEALING => bump(&COUNTERS.steal_cas_fail_stealing),
+                        _ => {}
+                    }
+                    continue;
+                }
             }
             bump(&COUNTERS.steal_pass_visits);
 
