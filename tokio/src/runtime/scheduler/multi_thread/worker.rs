@@ -1563,6 +1563,16 @@ impl Handle {
                 if self.ptr_eq(&cx.worker.handle) {
                     // And the current thread still holds a core
                     if let Some(core) = cx.core.borrow_mut().as_mut() {
+                        #[cfg(any(
+                            all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
+                            all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                        ))]
+                        if crate::runtime::io::lazy_debug::in_steal_dispatch() {
+                            crate::runtime::io::lazy_debug::bump(
+                                &crate::runtime::io::lazy_debug::COUNTERS
+                                    .steal_dispatch_local_schedule,
+                            );
+                        }
                         self.schedule_local(core, task, is_yield);
                         return;
                     }
@@ -1570,6 +1580,16 @@ impl Handle {
             }
 
             // Otherwise, use the inject queue.
+            #[cfg(any(
+                all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
+                all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+            ))]
+            if crate::runtime::io::lazy_debug::in_steal_dispatch() {
+                crate::runtime::io::lazy_debug::bump(
+                    &crate::runtime::io::lazy_debug::COUNTERS
+                        .steal_dispatch_remote_schedule,
+                );
+            }
             self.push_remote_task(task);
             self.notify_parked_remote();
         });

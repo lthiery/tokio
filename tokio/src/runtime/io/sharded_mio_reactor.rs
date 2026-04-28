@@ -398,8 +398,12 @@ impl SharedRegistry {
     /// with the owning worker via the existing `ops` mutex.
     #[cfg(target_os = "linux")]
     pub(crate) fn steal_dispatch(&self, events: &[libc::epoll_event]) -> usize {
-        use super::lazy_debug::{bump, COUNTERS};
+        use super::lazy_debug::{bump, StealDispatchGuard, COUNTERS};
         let state = self.ops.lock().expect("sharded-mio ops poisoned");
+        // Mark the calling thread as being inside steal_dispatch so the
+        // scheduler's `schedule_task` can attribute its local-vs-remote
+        // branch to this path. Dropped at end of function scope.
+        let _steal_guard = StealDispatchGuard::enter();
         let mut woken = 0usize;
         for ev in events {
             let token = Token(ev.u64 as usize);

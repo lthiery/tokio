@@ -145,6 +145,98 @@ instrument `transition_from_parked` — possible the stealer's
 barrier between `schedule_local`'s `push_lifo` and the read in
 `worker.rs::park`.
 
+### Result of the schedule-routing investigation (session 2)
+
+Counters added in lazy_debug:
+
+```
+steal_dispatch_local_schedule
+steal_dispatch_remote_schedule
+```
+
+Plus a thread-local `IN_STEAL_DISPATCH` flag (RAII guard
+`StealDispatchGuard::enter()` set inside `steal_dispatch`'s wake
+loop) so `Handle::schedule_task` in `multi_thread/worker.rs` can
+attribute its local-vs-remote branch to this path only.
+
+Full `cargo bench --bench io_busy_owner -- 'sharded_mio/busy_owner_3burners'`
+run, 163 iters (criterion warmup + 100 measurements), 16 fds/iter
+= 2608 fd registrations. Aggregate counters:
+
+| counter                          | total | per-trial |
+|----------------------------------|-------|-----------|
+| sr_register_calls                | 2608  | 16.0      |
+| dispatch_woken                   |  253  |  1.6      |
+| steal_events_woken               | 2355  | 14.4      |
+| **steal_dispatch_local_schedule**| **2355**| **14.4** |
+| **steal_dispatch_remote_schedule**| **0**  | **0**    |
+| steal_pass_calls                 | 6560  | 40.2      |
+| steal_pass_visits                | 2883  | 17.7      |
+| steal_events_harvested           | 2357  | 14.5      |
+| park_skip_after_steal            |  337  |  2.1      |
+| begin_park_steal_spin            |  217  |  1.3      |
+
+Two clean conclusions:
+
+1. **Hypothesis #2 (push_remote_task fall-through) is rejected.**
+   100 % of steal-woken tasks take the `schedule_local` branch.
+   Every harvested event lands on the stealing worker's local
+   queue, exactly as the design intends. No
+   `with_current`/core-borrow miss is happening.
+
+2. **Hypothesis #1 (half-harvested events) is also rejected at
+   full bench length.** 14.4 stolen + 1.6 dispatched = ~16.0 fd
+   events accounted for per trial. The earlier "8/trial" figure
+   came from the `--quick` run (10 trials only). Steady-state
+   harvesting works.
+
+So the steal mechanism is correct end-to-end: events get stolen,
+decoded, fired, and routed to the stealing worker's local run
+queue. **And yet trial 1+ still measures ~42 ms per iter
+(criterion mean 41.877 ms).** The bug is downstream of
+`schedule_task` — somewhere between "task on stealing worker's
+local run queue" and "probe handle's `await` resolving."
+
+### Next hypotheses (session 3)
+
+Working hypotheses for where the 42 ms is now hiding:
+
+* **A. Steal pass timing.** All 16 events get stolen per trial,
+  but maybe across many parks spread over the full BURNER_MS, not
+  in one batch. If the stealer (the only free worker, also the
+  one running `block_on`'s main task) is itself busy running
+  freshly-stolen probes between parks, peer events accumulate
+  briefly but the stealer doesn't get back to a park to harvest
+  them until the main task awaits the *next* probe handle.
+  Verify: dump per-trial deltas of `steal_pass_calls` /
+  `park_skip_after_steal` — if `park_skip_after_steal ≈ 2/trial`
+  but events come 2 at a time, that's the steady-state tax.
+  The `lazy_debug::snapshot_pub` extension this doc mentions is
+  the right next step.
+
+* **B. `transition_from_parked` ordering.** Tasks land on
+  `core.run_queue` from inside `steal_dispatch`, then the parker
+  returns up through `park_internal` and `park`'s while-loop calls
+  `transition_from_parked(&worker)`. If that check uses an idle
+  state field (e.g. `num_searching`) that doesn't reflect the
+  newly-pushed tasks until a separate barrier, the worker may
+  loop back into another `park_internal` with non-empty queue.
+  Instrument `transition_from_parked`'s return value across
+  back-to-back parks where steal happened.
+
+* **C. Probe-handle wake routing.** When a probe completes, its
+  `JoinHandle`'s waker fires `schedule_task` for the *main bench
+  task* (the one in `block_on`). If the main task's home-worker
+  association steers it to the inject queue (because the firing
+  thread's `cx` doesn't match), each probe completion costs a
+  full `notify_parked_remote` round-trip. Check
+  `scheduler_metrics.remote_schedule_count` per trial.
+
+The `IN_STEAL_DISPATCH` guard + `steal_dispatch_*_schedule`
+counters live in tree (293324f2…HEAD). Reuse for hypothesis-C
+investigation by widening the guard to also cover
+`JoinHandle::poll` or by adding a separate flag.
+
 ## File map
 
 ```

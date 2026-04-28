@@ -12,6 +12,7 @@
 //! The dump thread prints the full counter set to stderr every 250 ms.
 //! It exits when the process exits — we don't try to join it.
 
+use std::cell::Cell;
 use std::env;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -190,6 +191,17 @@ counters! {
     begin_park_steal_spin,
     /// Pre-park steal harvested >0 events; we skipped the actual park.
     park_skip_after_steal,
+    /// During `steal_dispatch`, the woken task's `schedule_task` took
+    /// the local-queue branch (current worker held its core, scheduler
+    /// matched). This is the desired path: the task lands on the
+    /// stealing worker's local queue.
+    steal_dispatch_local_schedule,
+    /// During `steal_dispatch`, the woken task's `schedule_task` fell
+    /// through to the inject queue (`push_remote_task` +
+    /// `notify_parked_remote`). Indicates either the current thread
+    /// was not a worker, the scheduler did not match, or the worker
+    /// no longer held its core when the waker fired.
+    steal_dispatch_remote_schedule,
 }
 
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();
@@ -223,6 +235,44 @@ fn spawn_dumper() {
             thread::sleep(Duration::from_millis(250));
             dump_to_stderr();
         });
+}
+
+thread_local! {
+    /// Set while a worker thread is running [`steal_dispatch`]'s wake
+    /// loop. Read by the scheduler's `schedule_task` to attribute the
+    /// local-vs-remote branch to the steal path. Defaults to `false`;
+    /// the [`StealDispatchGuard`] flips it true on construction and
+    /// back to false on drop.
+    ///
+    /// [`steal_dispatch`]: crate::runtime::io::sharded_mio_reactor::SharedRegistry::steal_dispatch
+    static IN_STEAL_DISPATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Returns `true` when the current thread is inside a
+/// `steal_dispatch` wake loop.
+#[inline]
+pub(crate) fn in_steal_dispatch() -> bool {
+    IN_STEAL_DISPATCH.with(Cell::get)
+}
+
+/// RAII guard that marks the current thread as being inside
+/// `steal_dispatch` for the lifetime of the guard. Use a single
+/// guard per `steal_dispatch` invocation, around the wake loop.
+pub(crate) struct StealDispatchGuard {
+    _priv: (),
+}
+
+impl StealDispatchGuard {
+    pub(crate) fn enter() -> Self {
+        IN_STEAL_DISPATCH.with(|c| c.set(true));
+        Self { _priv: () }
+    }
+}
+
+impl Drop for StealDispatchGuard {
+    fn drop(&mut self) {
+        IN_STEAL_DISPATCH.with(|c| c.set(false));
+    }
 }
 
 fn dump_to_stderr() {
