@@ -751,3 +751,28 @@ Both cross into P2 ("readiness stealing — wake propagation"). The
 Session 0 ground rules say "Don't start P2/P3/P4." Pausing here
 for user input on whether to land a bounded-timeout fix as part
 of P1, or carry the diagnosis into the P2 design.
+
+### P1 closeout decision
+
+**No fix landed in P1.** The bench regression is a known
+limitation of the current sharded-mio design under adversarial
+CPU-bound peer load: when a worker registers fds and another
+task on the same worker spins on CPU without yielding, kernel
+events queue on that worker's epoll fd with no in-process
+signal that can reach an idle peer. The waker layer sits
+downstream of `epoll_wait` and only fires once *some* worker
+drains its epoll, so it can't compensate for an owner that
+never parks.
+
+The principled fixes (EPOLL_EXCLUSIVE registration fanout, or a
+dedicated I/O worker that runs only `epoll_wait` + dispatch and
+never user tasks) move event delivery itself rather than
+patching the park loop. Both are architectural decisions and
+are deferred to P2 ("readiness stealing — wake propagation").
+A bounded-timeout park (1 ms idle re-poll) was considered and
+rejected: it adds steady idle wakeups in exchange for masking,
+not fixing, the gap.
+
+The per-worker lazy_debug counters (Session 7) stay in tree.
+They have no runtime cost when `TOKIO_LAZY_DEBUG` is unset and
+will be needed again when P2 begins. Marking P1 done.
