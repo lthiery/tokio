@@ -552,3 +552,99 @@ counter like `iter_kick_to_first_probe_us` and
 a counter for "task popped from inject" so we can see whether
 inject-drain delay is consuming the budget. Or instrument the
 2 ms / 1 ms `sleep` to record actual wall-clock duration.
+
+## Session 6 — per-phase wall-clock instrumentation (smoking gun)
+
+**Change applied:** `benches/io_busy_owner.rs` now records eight
+per-phase wall-clock measurements per `one_iter`, gated by
+`BENCH_PHASE_DEBUG=1`. Process-wide sums + counts dump on each
+bench function teardown:
+
+  * `spawn_probes_us`     — time to spawn 16 probes
+  * `pre_burner_sleep_us` — `tokio::time::sleep(2ms)` actual
+  * `spawn_burners_us`    — time to spawn 3 burners
+  * `post_burner_sleep_us`— `tokio::time::sleep(1ms)` actual
+  * `kicker_thread_us`    — kicker thread span
+  * `kick_to_first_wake_us`  — kick to *first* `.readable().await`
+                                 returning (shared `Mutex<Option<Instant>>`)
+  * `first_to_last_wake_us`  — first → last probe wake (sequential `h.await`)
+  * `iter_total_us`       — what the bench measures
+
+**Result for `sharded_mio/busy_owner_3burners` (means over 131
+trials):**
+
+| phase                  | µs    |
+|------------------------|-------|
+| spawn_probes_us        |   321 |
+| pre_burner_sleep_us    | 3 081 |
+| spawn_burners_us       |    10 |
+| post_burner_sleep_us   | 3 526 |
+| kicker_thread_us       |   256 |
+| kick_to_first_wake_us  |**46 118**|
+| first_to_last_wake_us  |    86 |
+| iter_total_us          |46 205 |
+
+**Per-trial detail:**
+
+```
+[phase] trial=1   probe_spawn= 150us pre_sleep=3088us burner_spawn=  6us post_sleep=2136us kicker= 224us k_to_1st=   224us 1st_to_last= 290us total=  514us
+[phase] trial=2   probe_spawn= 177us pre_sleep=3080us burner_spawn=  5us post_sleep=2182us kicker= 140us k_to_1st= 47828us 1st_to_last=  90us total=47919us
+[phase] trial=3   probe_spawn= 297us pre_sleep=3098us burner_spawn=  6us post_sleep=2207us kicker= 199us k_to_1st= 47792us 1st_to_last=  88us total=47881us
+[phase] trial=25+ ... k_to_1st = 47880-47900us (steady)
+```
+
+**Smoking gun:**
+
+* All pre-kick phases are *identical* between cold and warm trials.
+* `kick_to_first_wake_us` jumps from 224 µs (trial 1) to 47 800+ µs
+  (trials 2+). 200× regression on a single phase.
+* `first_to_last_wake_us` is consistently <300 µs in every trial,
+  including the slow ones — once *any* probe wakes, all 16 wake
+  within ~100 µs.
+* The 47.8 ms stall is precisely
+  `BURNER_MS - post_burner_sleep_us` ≈ 50 ms − 2.1 ms = 47.9 ms.
+  i.e. **probes wake at burner death, not at kick.**
+
+**Interpretation:** in trial 1 the steal harvest works: the cold
+runtime has the stealer parked on its own epoll fd, the kicker
+fires events on (some subset of) the four worker epoll fds, the
+stealer wakes, runs `try_steal_pass`, harvests peer events, all
+16 probes wake within 514 µs. In trials 2+, *something* prevents
+the stealer from waking on kick, so events sit on peer epoll fds
+until each peer's burner exits and the peer's own `poll.poll()`
+finally drains them.
+
+**Remaining question — why does the stealer fail to wake on kick
+in warm trials but not cold?** Pre-kick phase data is identical,
+so the registration path is the same. Possible causes:
+
+1. *Probe registration distribution drift.* If in warm trials all
+   16 probes happen to register on burner-pinned workers (zero on
+   the stealer), the kicker fires events only on peer epoll fds,
+   never on the stealer's. The stealer's `poll.poll(None)` never
+   wakes. The earlier process-wide counter `dispatch_woken=405`
+   over 110 trials = ~3.7/trial would *also* be consistent with
+   "almost no own-poll wake during the iter window — most events
+   only get drained at burner death via own-poll on the
+   burner-pinned worker's eventual park."
+2. *Stealer not actually parked at kick time.* If the stealer is
+   doing some other work (timer wheel maintenance, residual task)
+   between trials, it may be in the scheduler loop, miss the
+   `try_steal_pass` window, and only park *after* the kick — but
+   on its own epoll fd which has no events queued. It then sleeps
+   indefinitely until burner-death events hit peers.
+3. *Cross-thread waker not firing the stealer.* If `unpark` from
+   the kick path goes through `notify_parked_remote` but the
+   stealer is parked on `poll.poll(None)`, the WAKER_TOKEN should
+   wake it. If it doesn't, that's a sharded-mio waker integration
+   bug.
+
+**Suggested next step:** add per-worker `dispatch_woken` and
+`steal_events_woken` (small fixed-size atomic arrays indexed by
+worker idx) so we can see *which* worker harvested *what*, per
+trial. If the stealer's `dispatch_woken` is 0 across warm trials,
+hypothesis 1 is confirmed. If the stealer's `try_steal_pass`
+counter shows it stops calling `try_steal_pass` between kick and
+burner-death, hypothesis 2 is confirmed. Hypothesis 3 would show
+up as the stealer's `begin_park_calls` not incrementing during
+the 47 ms window.
