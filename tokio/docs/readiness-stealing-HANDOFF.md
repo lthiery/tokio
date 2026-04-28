@@ -1,0 +1,218 @@
+# Readiness Stealing P1 — Handoff
+
+**Status:** P1 landed at `293324f2` on `worktree-io-driver-vtable`.
+**Worktree:** `/home/louis/tokio/.claude/worktrees/io-driver-vtable`.
+**Design doc:** `tokio/docs/readiness-stealing.md`.
+
+## What works
+
+* Steal mechanism wired end-to-end:
+  * `SharedRegistry::epoll_fd()` (Linux) → exposes the cloned mio epoll fd.
+  * `ShardedMioHandle::try_steal_pass()` → round-robin non-blocking
+    `libc::epoll_wait(timeout=0)` on each peer.
+  * `SharedRegistry::steal_dispatch()` → decode tokens, gen-check, fire
+    ScheduledIo wakers under the existing `ops` lock.
+* Race-free park/steal interlock via a new `STEALING: usize = 3` park
+  state (lock CAS `EMPTY → STEALING`, release CAS `STEALING → EMPTY`
+  preserving any racing `NOTIFIED`). `begin_park` spins on `STEALING`.
+* Steal hook in `ShardedMioParker::park_internal` runs between
+  `drain_pending_ops` and `begin_park`; if events were harvested the
+  worker skips its own `poll.poll()` (`park_skip_after_steal`).
+* All sharded-mio integration tests pass under repeated runs:
+  * `rt_sharded_mio` — 7 / 7
+  * `net_sharded_mio_tcp` — 4 / 4 (parallel and `--test-threads=1`,
+    5×5 cycles each)
+  * No regressions vs. main.
+* Counters added (lazy_debug): `steal_pass_calls`, `steal_pass_visits`,
+  `steal_events_harvested`, `steal_events_woken`, `steal_eagain`,
+  `steal_errors`, `steal_eintr`, `steal_slab_miss`,
+  `steal_gen_mismatch`, `steal_waker_token`, `begin_park_steal_spin`,
+  `park_skip_after_steal`.
+* `io_busy_owner` bench wired (`benches/io_busy_owner.rs`,
+  `bench-sharded-mio` feature gates the sharded backend group).
+
+## Bench numbers
+
+`io_busy_owner`, 4 workers / 16 fds / 3 burners (50 ms each):
+
+| Backend / scenario                | latency       | vs idle |
+|-----------------------------------|---------------|---------|
+| traditional / idle                | ~baseline     | 1.0×    |
+| traditional / 3 burners           | ~baseline     | ~1.0×   |
+| sharded-mio / idle                | ~300 µs       | 1.0×    |
+| sharded-mio / busy, **trial 0**   | **392 µs**    | ~1.3×   |
+| sharded-mio / busy, trial 1+      | ~48 ms        | ~150×   |
+
+The cold-start trial proves the design hits its Phase-0 target
+(<1 ms vs the original 45.6 ms = ~115× win). Steady-state trials
+regress to BURNER_MS — see open issue below.
+
+## Open issue: trial-1+ steady-state regression
+
+After the first iter wins, every subsequent iter takes exactly the
+50 ms BURNER_MS. **It is not a deadlock** — the bench completes — but
+the steal-induced speedup only fires on the cold runtime.
+
+### What I confirmed
+
+* Counters show stealing IS firing on later trials:
+  * `steal_pass_calls = 209` across 10 trials (~21 / trial).
+  * `steal_events_harvested = 78` (~8 / trial — about half of the 16
+    events that the kicker fires per trial).
+  * `park_skip_after_steal = 11` (~1 / trial — the steal-then-skip
+    fast-path is taken once per trial).
+  * `begin_park_steal_spin = 7` (peer-vs-stealer interlock fires
+    rarely; bounded as designed).
+* `dispatch_woken = 2` across 10 trials — i.e. essentially no wakes
+  flow through the normal `poll.poll() → dispatch_events` path; almost
+  everything routes through steal.
+* All sharded_mio integration tests pass (so the steal logic itself is
+  not the regression).
+* Pattern holds with both per-trial `block_on` and a single outer
+  `block_on` containing 10 sub-iters.
+* Pattern holds at 4-worker / 16-fd / 3-burner *and* at
+  2-worker / 2-fd / 1-burner (in the latter, ~50 % of trials still
+  hit the 50 ms slow path — partial win).
+
+### Hypotheses I have NOT yet verified
+
+1. **Half-harvested events.** Counters say only ~8 of 16 events get
+   stolen per trial. Where do the other 8 go?
+   * `dispatch_woken = 2` across 10 trials, so they don't reach normal
+     dispatch either. Yet probes complete (else `h.await` would hang).
+   * Suspect: events are still on a busy peer's epoll fd when the
+     burner exits at 50 ms; the peer then enters its own park flow
+     and either dispatches them via `poll.poll()` (but counter says
+     no) or somehow short-circuits. Worth instrumenting
+     `dispatch_events_total` per-trial to disambiguate.
+
+2. **`schedule_local` placement.** Inside `steal_dispatch`,
+   `with_current()` should resolve to the stealer's worker context
+   and `schedule_local` should push to the *stealer's* LIFO/run
+   queue — verified via reading `multi_thread::worker::schedule_task`.
+   But if `cx.core.borrow_mut()` ever sees `None` during steal, we'd
+   fall through to `push_remote_task` (inject queue) and the task
+   would land somewhere idle workers can pick it up. With 3 burners,
+   only one idle worker exists — the stealer itself, which is mid-
+   `park_internal` and can't drain inject until it returns. **Worth
+   adding a counter for `schedule_local-vs-push_remote` choice during
+   our steal pass.**
+
+3. **`registers_local_calls` counter mismatch.** Across 10 trials we
+   should see 160 fd registrations; counter showed 96. Either the
+   dumper is racing `process exit` (250 ms cycle, total run ≈500 ms),
+   or AsyncFd::with_interest is short-circuiting in some trials.
+   Needs verification.
+
+4. **Cold-start specific path.** Trial 0 always wins (~400 µs).
+   Difference vs trial 1+: in trial 0 all 4 workers start parked, so
+   spawn-via-inject + notify_parked_remote distributes the 16 probes
+   roughly 4-per-worker — every worker's epoll fd has events, the
+   free worker's own `poll.poll()` handles its 4, and pre-park steal
+   harvests the other 12 in one batch. In trial 1, runtime is "warm"
+   and registration distribution may collapse onto one worker (the
+   one fastest to drain inject), which alters the steal arithmetic.
+
+### Recommended first investigation
+
+Add 2 cheap counters and re-run:
+
+```rust
+// in steal_dispatch / wherever io.wake fires
+COUNTERS.steal_dispatch_local_schedule    // schedule_local taken
+COUNTERS.steal_dispatch_remote_schedule   // push_remote_task taken
+```
+
+Plus per-trial counter snapshot via a small extension to
+`lazy_debug`:
+
+```rust
+pub(crate) fn snapshot_pub() -> Vec<(&'static str, u64)> {
+    COUNTERS.snapshot()
+}
+```
+
+Then dump deltas around each trial in a private repro (don't ship
+the snapshot API).
+
+If `steal_dispatch_remote_schedule` is non-zero, that's the bug:
+fix is to bias `with_current` lookup or call `schedule_local`
+directly with the stealer's `core`.
+
+If both counters show local placement and the mystery persists,
+instrument `transition_from_parked` — possible the stealer's
+`has_tasks()` is observing stale state due to a missed memory
+barrier between `schedule_local`'s `push_lifo` and the read in
+`worker.rs::park`.
+
+## File map
+
+```
+benches/Cargo.toml                                              [+5]
+benches/io_busy_owner.rs                                       [+235] new
+tokio/docs/readiness-stealing.md                               [+257] new (design)
+tokio/src/runtime/io/lazy_debug.rs                              [+25]
+tokio/src/runtime/io/sharded_mio_driver.rs                    [+196]
+tokio/src/runtime/io/sharded_mio_reactor.rs                   [+100]
+tokio/src/runtime/scheduler/multi_thread/sharded_mio_park.rs   [+35]
+```
+
+## Re-running everything
+
+```sh
+cd /home/louis/tokio/.claude/worktrees/io-driver-vtable
+. ~/.cargo/env
+
+# integration tests
+RUSTFLAGS="--cfg tokio_unstable" cargo test --release -p tokio \
+  --features full,io-sharded-mio --test rt_sharded_mio
+RUSTFLAGS="--cfg tokio_unstable" cargo test --release -p tokio \
+  --features full,io-sharded-mio --test net_sharded_mio_tcp
+
+# bench
+RUSTFLAGS="--cfg tokio_unstable" cargo build --release -p benches \
+  --bench io_busy_owner --features bench-sharded-mio
+BENCH=$(ls -t target/release/deps/io_busy_owner-* \
+        | grep -v '\.d$' | head -1)
+"$BENCH" --quick                       # all 4 groups
+TOKIO_LAZY_DEBUG=70 "$BENCH" --quick   # with counters
+
+# net_sharded_mio_tcp under high parallelism (was the original
+# concern about per-worker epoll behaviour)
+TCP=$(ls -t target/release/deps/net_sharded_mio_tcp-* \
+      | grep -v '\.d$' | head -1)
+for i in 1 2 3 4 5; do timeout 20 "$TCP" 2>&1 | tail -3; done
+```
+
+## Phases NOT yet started
+
+* **P2 — adaptive cadence.** Heuristic: only steal every Nth park, or
+  only when the per-worker `dispatch_woken` rate is below a threshold.
+  Reduces steal syscall overhead in the steady-state-busy idle case
+  where every worker is genuinely working its own queue.
+* **P3 — victim selection.** Replace round-robin with a
+  recently-active-but-not-parking heuristic (e.g. workers whose
+  `unpark_was_empty` count is climbing — proxy for "has events but
+  isn't polling").
+* **P4 — steal-on-block.** Allow the parked worker's `poll.poll()` to
+  be interrupted by a peer that wants to take over its epoll fd
+  during a long burner-induced stall. Requires the timeout-park dance
+  outlined in the design doc §4.4.
+
+The trial-1+ regression is in scope for "tightening P1", not P2/P3 —
+P1's contract is "always-on round-robin steal works correctly."
+
+## Loose ends
+
+* The dump thread is started lazily on first `bump`. For benches that
+  exit in <250 ms there's no dump. Consider an explicit
+  `lazy_debug::dump_now()` flushed on `Drop`.
+* `dispatch_woken = 2` over 10 trials in the bench is suspicious. May
+  indicate a counter-bump-site mismatch (only writeable bits get
+  counted? — unlikely, code increments unconditionally) or that
+  `poll.poll()` is genuinely never producing fd events in this
+  workload (everything was already stolen). Re-check after the
+  trial-1+ fix.
+* Earlier iteration tried gating steal via `peer.park_state == EMPTY`
+  load (without CAS) — that race is now closed by the STEALING lock.
+  No remnants in tree.
