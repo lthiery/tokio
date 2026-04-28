@@ -45,30 +45,14 @@ pub(crate) struct WorkerState {
     /// `shared_registry`; kept as a separate cheap-to-clone handle so
     /// `unpark` doesn't have to take any slab locks.
     pub(crate) external_waker: OnceLock<ExternalWaker>,
-
-    /// Per-shard registration set: linked list of `Arc<ScheduledIo>`
-    /// owned by this shard, plus its pending-release vec. Pulled out
-    /// of the global handle so `add_source`/`deregister_source` only
-    /// contend with operations targeting *this* shard, instead of
-    /// every shard sharing one global mutex. The mutex is retained
-    /// (rather than dropping to a thread-local cell) because it is
-    /// the synchronization point that enables future readiness
-    /// stealing — a foreign worker can `try_lock` a victim shard's
-    /// `synced` to drain ready entries without contending with the
-    /// owner most of the time.
-    pub(super) registrations: RegistrationSet,
-    pub(super) synced: Mutex<registration_set::Synced>,
 }
 
 impl WorkerState {
     fn new() -> Self {
-        let (registrations, synced) = RegistrationSet::new();
         Self {
             park_state: AtomicUsize::new(EMPTY),
             shared_registry: OnceLock::new(),
             external_waker: OnceLock::new(),
-            registrations,
-            synced: Mutex::new(synced),
         }
     }
 }
@@ -91,6 +75,13 @@ impl std::fmt::Debug for WorkerState {
 pub(crate) struct ShardedMioHandle {
     workers: Box<[WorkerState]>,
     next_worker: AtomicUsize,
+
+    /// Shared registration set (fd → ScheduledIo). Identical shape to
+    /// the uring driver's `UringHandle::registrations` — the Arc-pinned
+    /// `ScheduledIo` instances are also referenced from each
+    /// per-worker reactor's slab while a registration is live.
+    pub(super) registrations: RegistrationSet,
+    pub(super) synced: Mutex<registration_set::Synced>,
 
     pub(crate) metrics: IoDriverMetrics,
 
@@ -118,10 +109,13 @@ impl ShardedMioHandle {
         for _ in 0..num_workers {
             workers.push(WorkerState::new());
         }
+        let (registrations, synced) = RegistrationSet::new();
         let barrier_count = num_workers.max(1);
         Self {
             workers: workers.into_boxed_slice(),
             next_worker: AtomicUsize::new(0),
+            registrations,
+            synced: Mutex::new(synced),
             metrics: IoDriverMetrics::default(),
             start_barrier: std::sync::Barrier::new(barrier_count),
         }
@@ -208,39 +202,30 @@ impl ShardedMioHandle {
 
     /// Register `source` for readiness notifications.
     ///
-    /// Picks a worker via [`Self::placement_worker`] (caller-local
-    /// affinity when invoked from a worker thread, round-robin
-    /// otherwise), allocates a [`ScheduledIo`] from *that worker's*
-    /// per-shard registration set, then registers the source on the
-    /// same shard's `mio::Registry` in-place. No wakeup:
-    /// `Registry::register` is `epoll_ctl_add` under the hood and is
-    /// immediately effective on a concurrent `epoll_wait`.
+    /// Allocates a [`ScheduledIo`] from the shared registration set,
+    /// picks a worker via round-robin, registers the source on that
+    /// worker's `mio::Registry` in-place, and wakes the worker so its
+    /// next `poll()` picks up the new registration.
     ///
-    /// Affinity placement matters for the per-shard registration
-    /// set: when a worker thread registers an fd on its own shard,
-    /// the per-shard mutex is acquired by the same core that owns
-    /// the cache line, so it's both uncontended and cache-hot. With
-    /// pure round-robin, every register pulled a different shard's
-    /// mutex cache line, defeating the locality the per-shard split
-    /// is supposed to provide.
+    /// Round-robin placement matches uring's policy — fair ring load
+    /// rather than task-affinity. See the uring design doc §5 for the
+    /// rationale.
     pub(crate) fn add_source<S: RegistrationSource + ?Sized>(
         &self,
         source: &mut S,
         interest: Interest,
     ) -> io::Result<(Arc<ScheduledIo>, usize)> {
-        let worker_idx = self.placement_worker();
-        let slot = &self.workers[worker_idx];
+        let io = self.registrations.allocate(&mut self.synced.lock())?;
 
-        // Per-shard mutex: only contended with operations targeting
-        // this same shard, not all sharded-mio traffic.
-        let io = slot.registrations.allocate(&mut slot.synced.lock())?;
+        let worker_idx = self.fallback_worker();
 
         // Publish assigned worker onto the ScheduledIo so `deregister`
-        // can route to the same worker's registry + registration set
-        // without a reverse lookup on the handle.
+        // can route to the same worker's registry without a reverse
+        // lookup on the handle.
         io.sharded_mio_worker
             .store(worker_idx as u32, Ordering::Relaxed);
 
+        let slot = &self.workers[worker_idx];
         let registry = slot
             .shared_registry
             .get()
@@ -252,8 +237,8 @@ impl ShardedMioHandle {
                 // ScheduledIo isn't leaked when mio registration
                 // fails. Matches the mio driver's cleanup path.
                 unsafe {
-                    slot.registrations
-                        .remove(&mut slot.synced.lock(), &io);
+                    self.registrations
+                        .remove(&mut self.synced.lock(), &io);
                 }
                 return Err(e);
             }
@@ -261,37 +246,23 @@ impl ShardedMioHandle {
         io.sharded_mio_slab_key
             .store(slab_key, Ordering::Relaxed);
 
+        // No unpark on register: `Registry::register` (epoll_ctl_add
+        // under the hood) is immediately effective on a concurrent
+        // `epoll_wait`. The kernel updates the interest set live, so
+        // the target shard's worker picks the new fd up on its
+        // current or next poll without needing a wakeup. Waking
+        // unconditionally was pure overhead on registration-heavy
+        // workloads (TCP connect churn).
+
         self.metrics.incr_fd_count();
         Ok((io, worker_idx))
     }
 
-    /// Choose which shard to place a new registration on.
-    ///
-    /// - When called from a worker thread, return that worker's
-    ///   shard index. The new registration's per-shard mutex is then
-    ///   acquired on the same core that owns its cache line, so it
-    ///   is both uncontended and L1-resident. This is the common
-    ///   case and the reason the registration set is per-shard.
-    /// - When called from a non-worker thread (`block_on` caller,
-    ///   `spawn` from main, an external thread driving the runtime
-    ///   via `Handle`), fall back to round-robin so registrations
-    ///   are spread across shards rather than piling on shard 0.
-    fn placement_worker(&self) -> usize {
-        if let Some(idx) = crate::runtime::scheduler::multi_thread::sharded_mio_park::current_worker_index() {
-            if idx < self.workers.len() {
-                return idx;
-            }
-        }
+    fn fallback_worker(&self) -> usize {
         self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len()
     }
 
     /// Deregister `source` from the worker it was registered with.
-    ///
-    /// Reads the owning shard out of the `ScheduledIo` and operates
-    /// only on that shard's registry + registration set. The mio
-    /// deregistration is a single `epoll_ctl_del` and does not need
-    /// to wake the owning worker; the pending-release vec is drained
-    /// by the owning worker at its next park.
     pub(crate) fn deregister_source<S: RegistrationSource + ?Sized>(
         &self,
         io: &Arc<ScheduledIo>,
@@ -300,37 +271,38 @@ impl ShardedMioHandle {
         let worker_idx = io.sharded_mio_worker.load(Ordering::Relaxed) as usize;
         let slab_key = io.sharded_mio_slab_key.load(Ordering::Relaxed);
 
-        // Out-of-range worker_idx means the registration was never
-        // fully published (e.g. add_source failed on the registry
-        // step before storing the worker idx). Nothing to deregister.
-        if worker_idx >= self.workers.len() {
-            return Ok(());
-        }
-
-        let slot = &self.workers[worker_idx];
-
-        let deregister_result = if let Some(registry) = slot.shared_registry.get() {
-            registry.deregister::<S>(source, slab_key)
+        let deregister_result = if worker_idx < self.workers.len() {
+            let slot = &self.workers[worker_idx];
+            if let Some(registry) = slot.shared_registry.get() {
+                registry.deregister::<S>(source, slab_key)
+            } else {
+                Ok(())
+            }
         } else {
             Ok(())
         };
 
-        // Push onto the owning shard's pending-release vec. Drained
-        // by that shard's worker at its next park; we deliberately
-        // do not wake the worker just to free slab memory faster.
-        let _ = slot.registrations.deregister(&mut slot.synced.lock(), io);
+        // We intentionally do NOT unpark the shard's worker even if
+        // `RegistrationSet::deregister` reports pending releases.
+        // Pending `ScheduledIo` releases are not latency-critical —
+        // they are a few bytes of slab memory awaiting drain. The
+        // owning worker drains them naturally at its next park
+        // (see `release_pending_registrations`). Forcing a wake to
+        // free slab memory faster trades a real syscall for a
+        // microscopic memory-occupancy improvement, which is
+        // exactly the wrong tradeoff under TCP connect churn.
+        let _ = self.registrations.deregister(&mut self.synced.lock(), io);
 
         self.metrics.dec_fd_count();
         deregister_result
     }
 
-    /// Release any `ScheduledIo`s queued for removal on the given
-    /// shard. Called by the owning worker after park; each worker
-    /// drains only its own shard's pending-release vec.
-    pub(crate) fn release_pending_registrations(&self, worker_idx: usize) {
-        let slot = &self.workers[worker_idx];
-        if slot.registrations.needs_release() {
-            slot.registrations.release(&mut slot.synced.lock());
+    /// Release any `ScheduledIo`s queued for removal by
+    /// [`RegistrationSet::deregister`]. Called by the owning worker
+    /// after park.
+    pub(crate) fn release_pending_registrations(&self) {
+        if self.registrations.needs_release() {
+            self.registrations.release(&mut self.synced.lock());
         }
     }
 }
