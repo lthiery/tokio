@@ -246,9 +246,13 @@ impl ShardedMioHandle {
         io.sharded_mio_slab_key
             .store(slab_key, Ordering::Relaxed);
 
-        // Wake the worker so it re-polls and picks up the new
-        // registration. `unpark` is a no-op if the worker isn't parked.
-        self.unpark(worker_idx);
+        // No unpark on register: `Registry::register` (epoll_ctl_add
+        // under the hood) is immediately effective on a concurrent
+        // `epoll_wait`. The kernel updates the interest set live, so
+        // the target shard's worker picks the new fd up on its
+        // current or next poll without needing a wakeup. Waking
+        // unconditionally was pure overhead on registration-heavy
+        // workloads (TCP connect churn).
 
         self.metrics.incr_fd_count();
         Ok((io, worker_idx))
@@ -278,10 +282,16 @@ impl ShardedMioHandle {
             Ok(())
         };
 
-        let should_unpark = self.registrations.deregister(&mut self.synced.lock(), io);
-        if should_unpark && worker_idx < self.workers.len() {
-            self.unpark(worker_idx);
-        }
+        // We intentionally do NOT unpark the shard's worker even if
+        // `RegistrationSet::deregister` reports pending releases.
+        // Pending `ScheduledIo` releases are not latency-critical —
+        // they are a few bytes of slab memory awaiting drain. The
+        // owning worker drains them naturally at its next park
+        // (see `release_pending_registrations`). Forcing a wake to
+        // free slab memory faster trades a real syscall for a
+        // microscopic memory-occupancy improvement, which is
+        // exactly the wrong tradeoff under TCP connect churn.
+        let _ = self.registrations.deregister(&mut self.synced.lock(), io);
 
         self.metrics.dec_fd_count();
         deregister_result
