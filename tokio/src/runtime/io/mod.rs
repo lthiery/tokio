@@ -50,5 +50,15 @@ cfg_io_sharded_mio! {
 ))]
 pub(crate) mod io_driver;
 
+// Process-wide counters for the lazy-on-first-poll registration path.
+// Available under the same cfg as `io_driver`. Always incremented;
+// stderr dump activates only when `TOKIO_LAZY_DEBUG=1` is set in the
+// environment.
+#[cfg(any(
+    all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
+    all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+))]
+pub(crate) mod lazy_debug;
+
 use crate::util::ptr_expose::PtrExposeDomain;
 static EXPOSE_IO: PtrExposeDomain<ScheduledIo> = PtrExposeDomain::new();
