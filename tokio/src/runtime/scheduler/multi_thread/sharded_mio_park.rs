@@ -161,7 +161,7 @@ impl ShardedMioParker {
 
         drop(reactor);
 
-        self.handle.release_pending_registrations();
+        self.handle.release_pending_registrations(self.idx);
         self.handle.end_park(self.idx);
     }
 
