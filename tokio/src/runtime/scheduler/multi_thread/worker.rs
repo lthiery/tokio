@@ -1558,6 +1558,16 @@ impl Worker {
 impl Handle {
     pub(super) fn schedule_task(&self, task: Notified, is_yield: bool) {
         with_current(|maybe_cx| {
+            // Track the reason we fall through to the inject queue,
+            // for the `lazy_debug` counters below. Computed cheap and
+            // gate-elided when the cfg is off.
+            #[cfg(any(
+                all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
+                all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+            ))]
+            #[allow(unused_assignments)]
+            let mut remote_reason: Option<&'static core::sync::atomic::AtomicU64> = None;
+
             if let Some(cx) = maybe_cx {
                 // Make sure the task is part of the **current** scheduler.
                 if self.ptr_eq(&cx.worker.handle) {
@@ -1567,15 +1577,51 @@ impl Handle {
                             all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
                             all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
                         ))]
-                        if crate::runtime::io::lazy_debug::in_steal_dispatch() {
+                        {
                             crate::runtime::io::lazy_debug::bump(
                                 &crate::runtime::io::lazy_debug::COUNTERS
-                                    .steal_dispatch_local_schedule,
+                                    .schedule_local_total,
                             );
+                            if crate::runtime::io::lazy_debug::in_steal_dispatch() {
+                                crate::runtime::io::lazy_debug::bump(
+                                    &crate::runtime::io::lazy_debug::COUNTERS
+                                        .steal_dispatch_local_schedule,
+                                );
+                            }
                         }
                         self.schedule_local(core, task, is_yield);
                         return;
                     }
+                    #[cfg(any(
+                        all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
+                        all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                    ))]
+                    {
+                        remote_reason = Some(
+                            &crate::runtime::io::lazy_debug::COUNTERS.schedule_remote_no_core,
+                        );
+                    }
+                } else {
+                    #[cfg(any(
+                        all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
+                        all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                    ))]
+                    {
+                        remote_reason = Some(
+                            &crate::runtime::io::lazy_debug::COUNTERS
+                                .schedule_remote_other_scheduler,
+                        );
+                    }
+                }
+            } else {
+                #[cfg(any(
+                    all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
+                    all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                ))]
+                {
+                    remote_reason = Some(
+                        &crate::runtime::io::lazy_debug::COUNTERS.schedule_remote_no_cx,
+                    );
                 }
             }
 
@@ -1584,11 +1630,16 @@ impl Handle {
                 all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
                 all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
             ))]
-            if crate::runtime::io::lazy_debug::in_steal_dispatch() {
-                crate::runtime::io::lazy_debug::bump(
-                    &crate::runtime::io::lazy_debug::COUNTERS
-                        .steal_dispatch_remote_schedule,
-                );
+            {
+                if let Some(c) = remote_reason {
+                    crate::runtime::io::lazy_debug::bump(c);
+                }
+                if crate::runtime::io::lazy_debug::in_steal_dispatch() {
+                    crate::runtime::io::lazy_debug::bump(
+                        &crate::runtime::io::lazy_debug::COUNTERS
+                            .steal_dispatch_remote_schedule,
+                    );
+                }
             }
             self.push_remote_task(task);
             self.notify_parked_remote();

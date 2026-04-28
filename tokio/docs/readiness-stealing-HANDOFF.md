@@ -474,3 +474,81 @@ scheduling when the original owner is `STEALING|PARKED|busy`.
 If the counter says the outer-task wake is also local, the
 bottleneck is something more subtle (queue drain ordering inside
 the stealer when it has 17+ tasks queued, perhaps).
+
+## Session 5 — schedule_task attribution (outer-task hypothesis falsified)
+
+**Change applied:** added counters
+`schedule_local_total`, `schedule_remote_no_cx`,
+`schedule_remote_other_scheduler`, `schedule_remote_no_core`
+to `Handle::schedule_task` in
+`tokio/src/runtime/scheduler/multi_thread/worker.rs`.
+
+**Per-trial deltas (consistent across trials 2-N):**
+
+| counter                          | delta |
+|----------------------------------|-------|
+| schedule_local_total             | 16    |
+| schedule_remote_no_cx            | 19    |
+| schedule_remote_other_scheduler  | 0     |
+| schedule_remote_no_core          | 0     |
+
+19 = NUM_PROBES (16) + num_burners (3). **All 19 per-trial
+spawns** route through `push_remote_task` because the bench's
+outer iter loop runs on the bench thread, not on a worker:
+multi_thread's `block_on` polls the future on the calling thread
+(see `MultiThread::block_on`'s doc:
+"The future will execute on the current thread, but all spawned
+tasks will be executed on the thread pool"). `tokio::spawn`'s
+internal `with_scheduler(...)` finds no `MultiThread` scheduler
+context on the bench thread, so spawn → `schedule_task` → no cx →
+inject queue.
+
+**This is by design, not a bug.** Inject-queue tasks are picked up
+promptly by any free worker. The 16 probes register in the 2 ms
+pre-burner window when all 4 workers are free; they fan out
+roughly uniformly. The 3 burners then pin 3 workers, leaving 1
+stealer.
+
+**The outer-task wake hypothesis is therefore wrong.** The outer
+task is *not* a Tokio task — it's polled via `block_on`'s parker
+on the calling thread, woken by an `Unpark` notification, not by
+`schedule_task`. Each probe completion fires a `JoinHandle` waker
+that schedules the outer task by unparking the bench thread
+directly (the JoinHandle waker on a non-task future is a thread
+parker waker), not via the inject queue.
+
+**So the bottleneck is somewhere else.** Per-trial counters look
+*identical* between the cold trial (~400 µs) and warm trials
+(~48 ms). Same `steal_events_woken=16`, same
+`schedule_local_total=16`, same fall-through pattern. Whatever
+turns 400 µs into 48 ms is not visible in any current counter.
+
+**Plausible remaining suspects:**
+
+1. *Burner pinning timing.* In the cold trial the runtime is
+   fresh; burners may not yet be pinned to workers when the kicker
+   fires. In warm trials previous iters' bookkeeping (drains,
+   deregisters, owner queues) may bias which workers grab burners
+   and which pick up the new probes — possibly pushing all probes
+   onto burner-pinned workers' registry, which then needs to be
+   stolen.
+2. *Timer driver pin.* `tokio::time::sleep(2ms).await` and
+   `sleep(1ms).await` both drive timers. If the worker that owns
+   the timer wheel becomes burner-pinned in trial N, the 2 ms
+   sleep can stretch to 50 ms — kicker fires *before* probes have
+   registered.
+3. *Inject queue drain order.* In warm trials, the inject queue
+   may already have residual tasks (deregister callbacks?) that
+   delay probe pickup.
+4. *Burner deadline arithmetic.* `burner_deadline = now() + 50ms`
+   computed *before* the 1 ms pre-kick sleep. If the
+   pre-kick sleep itself stretches, the deadline becomes much
+   closer than 50 ms — but that would *shorten* not lengthen the
+   measured time.
+
+**Suggested next step:** add a per-trial trace marker (or a
+counter like `iter_kick_to_first_probe_us` and
+`iter_first_to_last_probe_us`) bracketed inside `one_iter`, plus
+a counter for "task popped from inject" so we can see whether
+inject-drain delay is consuming the budget. Or instrument the
+2 ms / 1 ms `sleep` to record actual wall-clock duration.

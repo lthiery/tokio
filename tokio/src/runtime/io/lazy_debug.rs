@@ -216,6 +216,22 @@ counters! {
     /// `try_steal_pass` skipped a peer because its `park_state` was
     /// `STEALING` (another peer is already mid-steal on this slot).
     steal_cas_fail_stealing,
+    /// `Handle::schedule_task` took the local-queue branch (current
+    /// thread is on a worker of this scheduler and holds its core).
+    /// Counted regardless of steal-dispatch context.
+    schedule_local_total,
+    /// `Handle::schedule_task` fell through to the inject queue
+    /// because `with_current` returned `None` — caller is not on any
+    /// worker thread (cross-thread waker, blocking pool, etc.).
+    schedule_remote_no_cx,
+    /// `Handle::schedule_task` fell through to the inject queue
+    /// because the current worker belongs to a *different*
+    /// scheduler (multi-runtime case).
+    schedule_remote_other_scheduler,
+    /// `Handle::schedule_task` fell through to the inject queue
+    /// because the current worker no longer holds its core (mid
+    /// hand-off / blocking-pool transition).
+    schedule_remote_no_core,
 }
 
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();
