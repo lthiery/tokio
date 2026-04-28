@@ -648,3 +648,106 @@ counter shows it stops calling `try_steal_pass` between kick and
 burner-death, hypothesis 2 is confirmed. Hypothesis 3 would show
 up as the stealer's `begin_park_calls` not incrementing during
 the 47 ms window.
+
+---
+
+## Session 7 — Per-worker counters confirm hypothesis 1
+
+**Instrumentation added.** `tokio/src/runtime/io/lazy_debug.rs` now
+exposes `PerWorkerCounters` — five `[AtomicU64; MAX_WORKERS]` arrays
+(`MAX_WORKERS = 16`):
+
+* `dispatch_woken` — bumped per dispatched event in
+  `Reactor::poll_and_dispatch`, indexed by `current_worker_index()`.
+* `steal_events_woken` — bumped by `woken` count after each
+  `registry.steal_dispatch()` in `try_steal_pass(self_idx, …)`.
+* `try_steal_pass_calls` — bumped on every `try_steal_pass` entry.
+* `register_per_worker` — bumped on the success arms of
+  `register_on_worker` / `apply_register`.
+* `begin_park_calls` — bumped at the top of `begin_park(worker_idx)`.
+
+`maybe_dump_trial` snapshots and renders deltas as e.g.
+`dispatch_woken_pw [w2]+7 [w0]+9` so each trial dump shows which
+worker did the work.
+
+**Tests still pass.** `cargo test -p tokio --features
+io-sharded-mio --test rt_sharded_mio` → 7/7,
+`cargo test -p tokio --features io-sharded-mio --test
+net_sharded_mio_tcp` → 4/4.
+
+**Smoking gun.** Running
+`TOKIO_LAZY_DEBUG=1 TOKIO_LAZY_DEBUG_TRIAL=16 BENCH_PHASE_DEBUG=1
+cargo bench -p benches --bench io_busy_owner --features
+bench-sharded-mio` and lining up bench-trial timings against
+lazy-debug trial dumps:
+
+```
+SLOW trial #2  (k_to_1st = 47.9 ms):
+  register_per_worker_pw  [w0]+11 [w2]+2 [w3]+3       (w1 = 0)
+  dispatch_woken_pw       (none)                      (everywhere = 0)
+  steal_events_woken_pw   [w0]+2 [w2]+3 [w3]+11       (cascade at burner death)
+  begin_park_calls_pw     [w1]+1 [w0]+5 [w2]+5 [w3]+5
+
+FAST trial #25 (k_to_1st = 118 µs):
+  register_per_worker_pw  [w2]+7  …
+  dispatch_woken_pw       [w2]+7                      (stealer's own poll fires)
+  steal_events_woken_pw   [w2]+9                      (stealer harvests peers)
+```
+
+The discriminator is `register_per_worker_pw[stealer]`. When the
+stealer (the worker not pinned to a burner) holds zero probes,
+`dispatch_woken_pw` stays zero across **all** workers for the full
+50 ms window, and the 16 events only surface as a cascade of
+`steal_events_woken_pw` once burners die and burner-pinned workers
+re-enter `try_steal_pass`. When the stealer holds even one probe,
+its own `poll.poll()` fires on kick, the stealer runs
+`try_steal_pass`, and the remaining peer events are harvested
+within microseconds.
+
+**Root cause (confirmed).** Hypothesis 1 from Session 6. Probe
+registration is not load-balanced across workers; in most warm
+trials all probes land on the three burner-pinned workers and the
+stealer is parked in `poll.poll(None)` on an empty epoll fd. The
+kicker's writes produce kernel events only on the burner-pinned
+workers' epoll fds, but those workers are spinning in CPU-burn
+loops and never drain epoll. The stealer cannot wake from its own
+`poll.poll(None)` because no event ever lands on its fd, and
+nothing else (eventfd, mio waker, peer unpark) reaches into peer
+epolls. So the stealer sleeps until burner death, at which point
+the burner-pinned workers re-enter park, `try_steal_pass` cascades
+across peers, and 16 events come out at once.
+
+Hypothesis 2 (stealer not parked) is ruled out:
+`begin_park_calls_pw[stealer]` ticks normally. Hypothesis 3
+(cross-thread waker not firing) is moot — nothing in the bench
+path issues a waker for the stealer's mio Poll on kick.
+
+**Caveat — the dump itself perturbs the bench.** With
+`TOKIO_LAZY_DEBUG_TRIAL=16` set, the per-trial dump goes through
+the stderr lock + a `Mutex<PerWorkerSnapshot>` and adds ~20 lines
+of `eprintln!` between trials. That's enough to shift the
+inter-trial deregister phase and bring the slow trials down to
+~16-22 ms in roughly 70 % of runs (without the env var, all warm
+trials are ~46 ms). Future diagnostics in this codepath should
+either snapshot to a ring buffer and dump after the bench
+finishes, or accept that turning the dump on changes what's being
+measured.
+
+**Fix direction (P2-territory — flagged for user judgment).**
+Two reasonable fixes:
+
+1. **Park-with-bounded-timeout.** Replace `poll.poll(None)` in
+   the sharded-mio park path with a small timeout (e.g. 1 ms)
+   so the stealer periodically retries `try_steal_pass`. Cheap,
+   localized, but adds steady idle wakeups.
+
+2. **Cross-worker register-wake.** When a worker registers an fd,
+   fan out a lightweight `unpark`/mio-waker poke to peers (or at
+   least to a known stealer slot) so the empty-stealer scenario
+   gets a chance to run `try_steal_pass` once probes have landed.
+   More invasive but no idle wakeups.
+
+Both cross into P2 ("readiness stealing — wake propagation"). The
+Session 0 ground rules say "Don't start P2/P3/P4." Pausing here
+for user input on whether to land a bounded-timeout fix as part
+of P1, or carry the diagnosis into the P2 design.
