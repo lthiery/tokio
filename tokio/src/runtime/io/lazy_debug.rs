@@ -206,13 +206,13 @@ counters! {
     /// `PARKED`. Expected case — peer is the right consumer for its
     /// own readiness; we leave it alone.
     steal_cas_fail_parked,
-    /// `try_steal_pass` skipped a peer because its `park_state` was
-    /// `NOTIFIED`. Indicates a stuck-NOTIFIED busy peer (e.g. CPU
-    /// burner that received cross-thread unparks but never reached
-    /// `begin_park` to drain them). High counts here mean the
-    /// stealer is being locked out from peers whose epoll fds we
-    /// could otherwise harvest safely.
-    steal_cas_fail_notified,
+    /// `try_steal_pass` successfully entered a peer's slot from
+    /// `NOTIFIED` (CAS `NOTIFIED -> STEALING` succeeded). The
+    /// peer was either notified-while-running (no eventfd byte) or
+    /// notified-after-park (eventfd byte queued; we re-fire the
+    /// peer's external waker after the steal to compensate for any
+    /// `WAKER_TOKEN` event we may have consumed).
+    steal_entered_notified,
     /// `try_steal_pass` skipped a peer because its `park_state` was
     /// `STEALING` (another peer is already mid-steal on this slot).
     steal_cas_fail_stealing,

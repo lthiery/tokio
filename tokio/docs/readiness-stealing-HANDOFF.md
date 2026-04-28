@@ -394,3 +394,83 @@ P1's contract is "always-on round-robin steal works correctly."
 * Earlier iteration tried gating steal via `peer.park_state == EMPTY`
   load (without CAS) — that race is now closed by the STEALING lock.
   No remnants in tree.
+
+## Session 4 — CAS relaxation + outer-task hypothesis
+
+**Change applied:** `try_steal_pass` no longer rejects `NOTIFIED`
+peers. The entry CAS is a load-and-CAS loop that accepts both
+`EMPTY` and `NOTIFIED` as valid origin states; the release CAS
+restores the original. After stealing from a `NOTIFIED`-origin
+peer we re-fire the peer's `external_waker` to compensate for any
+queued `WAKER_TOKEN` byte we may have consumed (kernel
+exactly-once delivery on the shared epoll fd). The
+`steal_cas_fail_notified` counter was repurposed/renamed to
+`steal_entered_notified` (success-path).
+
+**Tests:** `rt_sharded_mio` 7/7 + `net_sharded_mio_tcp` 4/4 still
+pass.
+
+**Bench result:** Negligible. `sharded_mio/busy_owner_3burners`
+remains pinned at the burner deadline (~43 ms across two 20-sample
+runs, vs. ~45 ms pre-fix). One 10-sample run measured ~21 ms but
+did not reproduce.
+
+**Per-trial counter deltas (BURNER_MS=50, 16 probes, 3 burners),
+trial #118:**
+
+| counter                       | delta |
+|-------------------------------|-------|
+| steal_pass_calls              | 48    |
+| steal_pass_visits             | 73    |
+| steal_events_harvested        | 50    |
+| steal_events_woken            | 16    |
+| steal_entered_notified        | 38    |
+| steal_cas_fail_parked         | 62    |
+| steal_cas_fail_stealing       | 10    |
+| steal_dispatch_local_schedule | 16    |
+
+Across the full run: `steal_events_woken=1483 + dispatch_woken=405
+= 1888 = rin_calls`. **Every probe is being woken**, ~78 % via
+the steal path and ~22 % via the stealer's own `poll.poll()`.
+None are stuck waiting for a burner to die.
+
+**So why is the iter still 43 ms?** New hypothesis: the bottleneck
+is not probe wake — it's the *outer iter task*. `one_iter` awaits
+`probe_handles` sequentially:
+
+```rust
+for h in probe_handles {
+    h.await.expect("probe");
+}
+```
+
+The outer task lives on whichever worker `block_on` parks on. If
+that worker is one of the three running a burner, every
+`h.await` resume is scheduled onto a burner-pinned queue.
+`schedule_task` → `with_current` finds the current cx (the worker
+running the *probe* task on the stealer), `ptr_eq` succeeds (same
+scheduler), and `schedule_local` pushes the outer task to the
+*stealer's* queue — which should be fine. But if the wake fires
+from outside a worker context (e.g., the `JoinHandle`'s waker is
+invoked from a non-Tokio thread, or the probe task is mid-tear-
+down on a different worker), it falls through to
+`push_remote_task` → inject queue → next worker to drain inject
+picks it up. With 3/4 workers spinning, that next-worker pickup
+could easily be 50 ms away.
+
+This is consistent with the bench shape (always = burner deadline)
+and with the counters (every probe wakes). It also explains why
+the cold trial is fast (no burner pressure) but warm trials are
+not.
+
+**Suggested next step (still inside "tighten P1" scope):**
+instrument `Handle::schedule_task`'s remote fallback with a
+counter for the *non-steal-dispatch* case — i.e. how often the
+ordinary scheduler routes a task to the inject queue under this
+bench. If that counter is 16-ish per trial, the outer-task
+hypothesis is confirmed and the fix is to prefer local-or-stealer
+scheduling when the original owner is `STEALING|PARKED|busy`.
+
+If the counter says the outer-task wake is also local, the
+bottleneck is something more subtle (queue drain ordering inside
+the stealer when it has 17+ tasks queued, perhaps).

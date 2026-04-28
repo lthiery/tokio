@@ -291,7 +291,7 @@ impl ShardedMioHandle {
         let mut total = 0usize;
         // Round-robin over peers starting after self_idx so two
         // adjacent stealers don't pile on the same victim every pass.
-        for offset in 1..n {
+        'peers: for offset in 1..n {
             let victim_idx = (self_idx + offset) % n;
             let slot = &self.workers[victim_idx];
             let Some(registry) = slot.shared_registry.get() else {
@@ -301,53 +301,73 @@ impl ShardedMioHandle {
                 continue;
             };
 
-            // Acquire the steal lock by CAS-ing peer.park_state
-            // EMPTY → STEALING. This blocks the peer from entering
-            // its own `epoll_wait` while we are mid-syscall, fixing
-            // the otherwise-unavoidable race where:
+            // Acquire the steal lock by CAS-ing peer.park_state into
+            // STEALING. We accept *both* EMPTY and NOTIFIED as valid
+            // entry states:
             //
-            //   1. We load park_state (EMPTY) and proceed.
-            //   2. Peer CAS's EMPTY → PARKED and enters epoll_wait.
-            //   3. We also call epoll_wait on the same fd.
-            //   4. Kernel delivers each event to exactly one waiter;
-            //      we may starve the peer of its own readiness.
+            // * EMPTY: peer is running tasks (the common busy-burner
+            //   case).
+            // * NOTIFIED: peer was either previously running and got
+            //   an `unpark` (no eventfd write — peer.park_state went
+            //   EMPTY→NOTIFIED, harmless to steal from) OR was
+            //   previously parked and got an `unpark` (eventfd byte
+            //   written; peer's `poll.poll()` is about to return).
             //
-            // If the CAS fails — peer is PARKED, NOTIFIED, or another
-            // stealer beat us to it — skip this victim. We don't spin
-            // because there's nothing useful to wait for: a PARKED
-            // peer is the right consumer for its own events, and a
-            // NOTIFIED peer is about to wake and consume them itself.
+            // We skip PARKED (peer is the right consumer for its own
+            // events; the kernel delivers exactly-once and harvesting
+            // here would starve `poll.poll()`) and STEALING (another
+            // stealer beat us to this slot).
             //
-            // Safety vs WAKER_TOKEN events on the peer's eventfd: a
-            // peer in EMPTY state has, by construction, drained any
-            // queued waker event in its last `Poll::poll` (which
-            // transitioned it out of PARKED). The next eventfd write
-            // happens inside `unpark`, which only fires when
-            // prev==PARKED — i.e. it can't fire while we hold
-            // STEALING because we hold the slot.
-            match slot.park_state.compare_exchange(
-                EMPTY,
-                STEALING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {}
-                Err(prev) => {
-                    // Attribute the lock-out by observed state so we
-                    // can tell whether NOTIFIED-stuck busy peers (the
-                    // currently-suspected liveness bug) dominate, vs
-                    // peers genuinely PARKED (in which case they will
-                    // dispatch their own events soon), vs racing
-                    // stealers.
-                    match prev {
-                        PARKED => bump(&COUNTERS.steal_cas_fail_parked),
-                        NOTIFIED => bump(&COUNTERS.steal_cas_fail_notified),
-                        STEALING => bump(&COUNTERS.steal_cas_fail_stealing),
-                        _ => {}
+            // The original-state we entered from is preserved on
+            // release: if we entered from NOTIFIED, the slot returns
+            // to NOTIFIED so the peer's next `begin_park` still
+            // fastpaths. If we entered from EMPTY we restore EMPTY.
+            //
+            // Safety vs WAKER_TOKEN events on the peer's eventfd:
+            // when entering from NOTIFIED there *may* be a queued
+            // eventfd byte that our `epoll_wait` would consume,
+            // racing the peer's own `poll.poll()` (kernel exactly-
+            // once delivery). To stay safe we re-fire the peer's
+            // external waker after the steal, putting a fresh byte
+            // back on the eventfd — peer's poll either already
+            // returned (and our re-fire becomes a harmless spurious
+            // wake on its next park) or is still blocked (and our
+            // re-fire is what unblocks it). EMPTY-original peers
+            // have no eventfd byte queued by construction so no
+            // re-fire is needed.
+            let original = loop {
+                let prev = slot.park_state.load(Ordering::Acquire);
+                match prev {
+                    PARKED => {
+                        bump(&COUNTERS.steal_cas_fail_parked);
+                        continue 'peers;
                     }
-                    continue;
+                    STEALING => {
+                        bump(&COUNTERS.steal_cas_fail_stealing);
+                        continue 'peers;
+                    }
+                    EMPTY | NOTIFIED => {
+                        if slot
+                            .park_state
+                            .compare_exchange(
+                                prev,
+                                STEALING,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            if prev == NOTIFIED {
+                                bump(&COUNTERS.steal_entered_notified);
+                            }
+                            break prev;
+                        }
+                        // CAS lost the race; reload and retry.
+                        continue;
+                    }
+                    _ => continue 'peers,
                 }
-            }
+            };
             bump(&COUNTERS.steal_pass_visits);
 
             let epfd = registry.epoll_fd();
@@ -363,6 +383,16 @@ impl ShardedMioHandle {
                 )
             };
 
+            // If we entered from NOTIFIED, re-fire peer's external
+            // waker before releasing. See the WAKER_TOKEN safety
+            // note on the entry CAS above. Cheap (one eventfd
+            // write); only paid on NOTIFIED-original visits.
+            if original == NOTIFIED {
+                if let Some(waker) = slot.external_waker.get() {
+                    let _ = waker.wake();
+                }
+            }
+
             // Release the steal lock before dispatch so a wake
             // delivered into the peer's queue can take effect via
             // `unpark` if the peer parks immediately after — we're
@@ -374,11 +404,11 @@ impl ShardedMioHandle {
             // `unpark` may have fired and `swap(NOTIFIED)`-ed past
             // us. In that case the slot is now NOTIFIED and the peer
             // worker should see it via its next `begin_park`. A naïve
-            // `store(EMPTY)` here would silently clobber the
-            // notification.
+            // `store(original)` here would silently clobber any such
+            // racing notification.
             let _ = slot.park_state.compare_exchange(
                 STEALING,
-                EMPTY,
+                original,
                 Ordering::Release,
                 Ordering::Relaxed,
             );
