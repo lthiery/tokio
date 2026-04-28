@@ -156,13 +156,25 @@ pub(crate) struct ScheduledIo {
     /// this `ScheduledIo` is registered. `u32::MAX` means "not
     /// registered with the sharded-mio reactor".
     ///
-    /// Unlike the uring counterpart, no generation bit is needed: mio
-    /// guarantees no further events will be surfaced once `deregister`
-    /// returns, so there is no stale-CQE race to detect.
+    /// Combined with [`Self::sharded_mio_gen`] in the kernel-side mio
+    /// `Token` so dispatch can detect events whose slab slot was
+    /// reassigned between kernel queueing and dispatcher reading.
     ///
     /// [`Reactor`]: crate::runtime::io::sharded_mio_reactor::Reactor
     #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
     pub(super) sharded_mio_slab_key: AtomicU32,
+
+    /// Generation counter stamped at registration time by the
+    /// sharded-mio reactor. Bumped on every fresh `slab.insert` at the
+    /// same key. `0` means "not registered". Combined with
+    /// [`Self::sharded_mio_slab_key`] in the mio token so the dispatch
+    /// loop can reject stale events queued against an older incarnation
+    /// of the slot, and so [`apply_deregister`] can reject queued ops
+    /// whose slot was reassigned to a fresh registration.
+    ///
+    /// [`apply_deregister`]: crate::runtime::io::sharded_mio_driver::ShardedMioHandle::apply_deregister
+    #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+    pub(super) sharded_mio_gen: AtomicU32,
 
     /// Index of the sharded-mio worker whose `mio::Poll` currently owns
     /// this registration. `u32::MAX` means "not registered". Written
@@ -255,6 +267,8 @@ impl Default for ScheduledIo {
             uring_worker: AtomicU32::new(u32::MAX),
             #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
             sharded_mio_slab_key: AtomicU32::new(u32::MAX),
+            #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+            sharded_mio_gen: AtomicU32::new(0),
             #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
             sharded_mio_worker: AtomicU32::new(u32::MAX),
         }

@@ -378,6 +378,64 @@ impl UringHandle {
         Ok((io, worker_idx))
     }
 
+    /// Lazy first-poll register entry-point used by the vtable shim.
+    /// Mirrors [`Self::add_source`] but takes a caller-allocated
+    /// `Arc<ScheduledIo>` rather than allocating one internally —
+    /// [`super::registration::Registration`] now owns the Arc and only
+    /// asks the driver to register/queue the SQE.
+    ///
+    /// The implementation does the same shared-set bookkeeping
+    /// `add_source` did; the only structural difference is the caller
+    /// already has the Arc, so we use [`RegistrationSet::allocate_existing`]
+    /// rather than [`RegistrationSet::allocate`].
+    ///
+    /// Note: at present only the sharded-mio backend is genuinely lazy
+    /// (its registry mutation is per-shard). The uring backend already
+    /// queues the SQE and lets the worker submit it, so eager and lazy
+    /// look identical from io_uring's perspective. We expose the shape
+    /// uniformly so the vtable stays clean.
+    pub(crate) fn register_local(
+        &self,
+        shared: &Arc<ScheduledIo>,
+        fd: RawFd,
+        interest: Interest,
+    ) -> io::Result<usize> {
+        // Reuse the global `RegistrationSet` for shutdown tracking;
+        // identical semantics to `add_source` for an externally-owned
+        // Arc.
+        self.registrations
+            .allocate_existing(&mut self.synced.lock(), shared)?;
+
+        let worker_idx = self.fallback_worker();
+
+        shared
+            .uring_worker
+            .store(worker_idx as u32, Ordering::Relaxed);
+
+        {
+            let slot = &self.workers[worker_idx];
+            let mut queue = slot.pending_ops.lock();
+            queue.push(PendingOp::Register {
+                fd,
+                interest,
+                io: Arc::clone(shared),
+            });
+        }
+
+        self.unpark(worker_idx);
+
+        self.metrics.incr_fd_count();
+        Ok(worker_idx)
+    }
+
+    /// Allocate a fresh `Arc<ScheduledIo>` without doing any
+    /// driver-side work yet. The vtable's `allocate_scheduled_io`
+    /// shim forwards to this; the actual register call comes later
+    /// via [`Self::register_local`].
+    pub(crate) fn allocate_scheduled_io(&self) -> Arc<ScheduledIo> {
+        Arc::new(ScheduledIo::default())
+    }
+
     /// Pick a worker by round-robin across `next_worker`. `fetch_add` is
     /// `Relaxed`: ordering of assignments does not affect correctness, only
     /// balance, and we only need distinct calls to tend toward distinct

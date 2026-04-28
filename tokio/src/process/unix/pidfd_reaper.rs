@@ -85,6 +85,18 @@ impl Source for Pidfd {
     }
 }
 
+#[cfg(all(
+    tokio_unstable,
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
+impl crate::runtime::io::registration::RegistrationSource for Pidfd {
+    fn registration_raw_fd(&self) -> RawFd {
+        self.as_raw_fd()
+    }
+}
+
 #[derive(Debug)]
 struct PidfdReaperInner<W>
 where

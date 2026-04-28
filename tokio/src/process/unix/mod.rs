@@ -270,6 +270,18 @@ impl Source for Pipe {
     }
 }
 
+#[cfg(all(
+    tokio_unstable,
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
+impl crate::runtime::io::registration::RegistrationSource for Pipe {
+    fn registration_raw_fd(&self) -> RawFd {
+        self.as_raw_fd()
+    }
+}
+
 pub(crate) struct ChildStdio {
     inner: PollEvented<Pipe>,
 }

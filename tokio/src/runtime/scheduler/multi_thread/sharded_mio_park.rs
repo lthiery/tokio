@@ -139,10 +139,16 @@ impl ShardedMioParker {
         // observed as `PARKED`.
         self.ensure_reactor_installed();
 
+        // Drain cross-thread driver ops (foreign-thread Registers,
+        // Deregisters from any thread) before parking so that the
+        // pending kernel-side state is up to date before we block in
+        // `epoll_wait`. Done unconditionally — even on the notified
+        // fast path — so a Register that arrived just before the
+        // notification still becomes effective immediately.
+        self.handle.drain_pending_ops(self.idx);
+
         if self.handle.begin_park(self.idx) {
-            // Notified fast-path: no syscall needed. Unlike the uring
-            // parker we have no pending-ops queue to drain here —
-            // `add_source` registered with mio directly when it ran.
+            // Notified fast-path: no syscall needed.
             return;
         }
 
@@ -161,7 +167,6 @@ impl ShardedMioParker {
 
         drop(reactor);
 
-        self.handle.release_pending_registrations(self.idx);
         self.handle.end_park(self.idx);
     }
 

@@ -32,6 +32,7 @@ use crate::runtime::io::ScheduledIo;
 use crate::runtime::io::registration::RegistrationSource;
 
 use std::io;
+use std::os::fd::RawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -60,14 +61,36 @@ unsafe impl Sync for IoDriver {}
 /// Function-pointer table specifying how each operation dispatches to a
 /// concrete backend. One `&'static` instance per backend.
 pub(crate) struct IoDriverVTable {
-    /// Register `source` with `interest`. Returns the `ScheduledIo` arc
-    /// the caller will park readiness against, plus the worker index the
-    /// fd was placed on (for `deregister` / `unpark` later).
-    pub add_source: unsafe fn(
+    /// Allocate a fresh `Arc<ScheduledIo>` without binding it to any
+    /// worker yet. Used by [`Registration::new_with_interest_and_handle`][reg]
+    /// at construction time when the backend defers actual driver
+    /// work to the first poll.
+    ///
+    /// Both backends implement this by `Arc::new(ScheduledIo::default())`.
+    /// Kept in the vtable so future backends with non-trivial Arc
+    /// initialisation (e.g. interior init that depends on driver
+    /// state) have a hook.
+    ///
+    /// [reg]: super::registration::Registration::new_with_interest_and_handle
+    pub allocate_scheduled_io: unsafe fn(NonNull<()>) -> Arc<ScheduledIo>,
+
+    /// Register a previously-allocated `Arc<ScheduledIo>` with `fd` /
+    /// `interest`. Returns the worker index the registration was
+    /// bound to.
+    ///
+    /// The sharded-mio backend tries the worker-local fast path
+    /// (caller-thread is a sharded-mio worker → register directly on
+    /// that worker's registry); on miss, queues a Register op onto a
+    /// round-robin-picked worker. The uring backend always queues a
+    /// `POLL_ADD_MULTI` SQE onto a round-robin-picked ring (uring
+    /// SQEs must be submitted by the ring's owning worker, so there
+    /// is no in-place fast path).
+    pub register_local: unsafe fn(
         NonNull<()>,
-        &mut dyn RegistrationSource,
+        &Arc<ScheduledIo>,
+        RawFd,
         Interest,
-    ) -> io::Result<(Arc<ScheduledIo>, usize)>,
+    ) -> io::Result<usize>,
 
     /// Deregister a previously-registered `ScheduledIo`. The owning
     /// worker index lives on the `ScheduledIo` itself (`uring_worker` /
@@ -127,13 +150,26 @@ impl IoDriver {
         unsafe { (self.vtable.num_workers)(self.data) }
     }
 
-    pub(crate) fn add_source(
-        &self,
-        source: &mut dyn RegistrationSource,
-        interest: Interest,
-    ) -> io::Result<(Arc<ScheduledIo>, usize)> {
+    /// Allocate a fresh `Arc<ScheduledIo>` for a brand-new
+    /// registration. Pairs with [`Self::register_local`] — the caller
+    /// keeps ownership of the Arc between the two calls so they can
+    /// stash it in the registration even if `register_local` is
+    /// deferred to a later poll.
+    pub(crate) fn allocate_scheduled_io(&self) -> Arc<ScheduledIo> {
         // SAFETY: see `num_workers`.
-        unsafe { (self.vtable.add_source)(self.data, source, interest) }
+        unsafe { (self.vtable.allocate_scheduled_io)(self.data) }
+    }
+
+    /// Register `shared`/`fd`/`interest`. Returns the worker the
+    /// registration was bound to.
+    pub(crate) fn register_local(
+        &self,
+        shared: &Arc<ScheduledIo>,
+        fd: RawFd,
+        interest: Interest,
+    ) -> io::Result<usize> {
+        // SAFETY: see `num_workers`.
+        unsafe { (self.vtable.register_local)(self.data, shared, fd, interest) }
     }
 
     pub(crate) fn deregister(
@@ -188,12 +224,13 @@ cfg_io_uring_reactor! {
     /// pointer back to `*const UringHandle` and forwards to the inherent
     /// method.
     pub(crate) static URING_VTABLE: IoDriverVTable = IoDriverVTable {
-        add_source:    uring_add_source,
-        deregister:    uring_deregister,
-        unpark_worker: uring_unpark_worker,
-        num_workers:   uring_num_workers,
-        clone_data:    uring_clone_data,
-        drop_data:     uring_drop_data,
+        allocate_scheduled_io: uring_allocate_scheduled_io,
+        register_local:        uring_register_local,
+        deregister:            uring_deregister,
+        unpark_worker:         uring_unpark_worker,
+        num_workers:           uring_num_workers,
+        clone_data:            uring_clone_data,
+        drop_data:             uring_drop_data,
     };
 
     #[inline]
@@ -207,14 +244,19 @@ cfg_io_uring_reactor! {
         unsafe { &*(data.as_ptr() as *const UringHandle) }
     }
 
-    unsafe fn uring_add_source(
-        data: NonNull<()>,
-        source: &mut dyn RegistrationSource,
-        interest: Interest,
-    ) -> io::Result<(Arc<ScheduledIo>, usize)> {
+    unsafe fn uring_allocate_scheduled_io(data: NonNull<()>) -> Arc<ScheduledIo> {
         let handle = unsafe { as_uring(data) };
-        let fd = source.registration_raw_fd();
-        handle.add_source(fd, interest)
+        handle.allocate_scheduled_io()
+    }
+
+    unsafe fn uring_register_local(
+        data: NonNull<()>,
+        shared: &Arc<ScheduledIo>,
+        fd: RawFd,
+        interest: Interest,
+    ) -> io::Result<usize> {
+        let handle = unsafe { as_uring(data) };
+        handle.register_local(shared, fd, interest)
     }
 
     unsafe fn uring_deregister(
@@ -315,12 +357,13 @@ cfg_io_sharded_mio! {
     /// data pointer back to `*const ShardedMioHandle` and forwards to
     /// the inherent method, mirroring [`URING_VTABLE`].
     pub(crate) static SHARDED_MIO_VTABLE: IoDriverVTable = IoDriverVTable {
-        add_source:    sharded_mio_add_source,
-        deregister:    sharded_mio_deregister,
-        unpark_worker: sharded_mio_unpark_worker,
-        num_workers:   sharded_mio_num_workers,
-        clone_data:    sharded_mio_clone_data,
-        drop_data:     sharded_mio_drop_data,
+        allocate_scheduled_io: sharded_mio_allocate_scheduled_io,
+        register_local:        sharded_mio_register_local,
+        deregister:            sharded_mio_deregister,
+        unpark_worker:         sharded_mio_unpark_worker,
+        num_workers:           sharded_mio_num_workers,
+        clone_data:            sharded_mio_clone_data,
+        drop_data:             sharded_mio_drop_data,
     };
 
     #[inline]
@@ -334,18 +377,19 @@ cfg_io_sharded_mio! {
         unsafe { &*(data.as_ptr() as *const ShardedMioHandle) }
     }
 
-    unsafe fn sharded_mio_add_source(
-        data: NonNull<()>,
-        source: &mut dyn RegistrationSource,
-        interest: Interest,
-    ) -> io::Result<(Arc<ScheduledIo>, usize)> {
+    unsafe fn sharded_mio_allocate_scheduled_io(data: NonNull<()>) -> Arc<ScheduledIo> {
         let handle = unsafe { as_sharded_mio_handle(data) };
-        // Forwarding `&mut dyn RegistrationSource` into the generic
-        // `S: RegistrationSource + ?Sized` parameter resolves
-        // `S = dyn RegistrationSource`; `mio::Registry::register`
-        // accepts `?Sized` sources, so the inner mio call works
-        // through the trait object's vtable.
-        handle.add_source(source, interest)
+        handle.allocate_scheduled_io()
+    }
+
+    unsafe fn sharded_mio_register_local(
+        data: NonNull<()>,
+        shared: &Arc<ScheduledIo>,
+        fd: RawFd,
+        interest: Interest,
+    ) -> io::Result<usize> {
+        let handle = unsafe { as_sharded_mio_handle(data) };
+        handle.register_local(shared, fd, interest)
     }
 
     unsafe fn sharded_mio_deregister(
@@ -354,9 +398,14 @@ cfg_io_sharded_mio! {
         source: &mut dyn RegistrationSource,
     ) -> io::Result<()> {
         let handle = unsafe { as_sharded_mio_handle(data) };
-        // Worker index is read off the `ScheduledIo` inside
-        // `deregister_source`; no caller-tracked index needed.
-        handle.deregister_source(io, source)
+        // Sharded-mio's deregister is queued onto the owning worker
+        // (registry mutation stays on a single thread per shard).
+        // Read the fd from the source so the worker can call
+        // `Registry::deregister(SourceFd(&fd), ...)` later — the
+        // original source value may be dropped by then.
+        let fd = source.registration_raw_fd();
+        handle.queue_deregister(io, fd);
+        Ok(())
     }
 
     unsafe fn sharded_mio_unpark_worker(data: NonNull<()>, worker_idx: usize) -> bool {

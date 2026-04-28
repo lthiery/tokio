@@ -69,6 +69,36 @@ impl RegistrationSet {
         Ok(ret)
     }
 
+    /// Track an externally-allocated `Arc<ScheduledIo>` in this set.
+    ///
+    /// Used by the vtable-routed backends (sharded-mio + uring), which
+    /// allocate the `ScheduledIo` lazily on first poll (rather than at
+    /// construction time, like the legacy mio driver) and then need to
+    /// register it with the per-shard / shared set so shutdown and
+    /// pending-release accounting remains uniform.
+    #[cfg(all(
+        tokio_unstable,
+        any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    pub(super) fn allocate_existing(
+        &self,
+        synced: &mut Synced,
+        scheduled_io: &Arc<ScheduledIo>,
+    ) -> io::Result<()> {
+        if synced.is_shutdown {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                crate::util::error::RUNTIME_SHUTTING_DOWN_ERROR,
+            ));
+        }
+
+        synced.registrations.push_front(scheduled_io.clone());
+
+        Ok(())
+    }
+
     // Returns `true` if the caller should unblock the I/O driver to purge
     // registrations pending release.
     pub(super) fn deregister(&self, synced: &mut Synced, registration: &Arc<ScheduledIo>) -> bool {
