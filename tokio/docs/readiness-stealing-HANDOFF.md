@@ -237,6 +237,92 @@ counters live in tree (293324f2…HEAD). Reuse for hypothesis-C
 investigation by widening the guard to also cover
 `JoinHandle::poll` or by adding a separate flag.
 
+### Per-trial delta dump (session 2 follow-up)
+
+`lazy_debug` now has a per-trial delta dumper triggered by
+`TOKIO_LAZY_DEBUG_TRIAL=N`. Every Nth `apply_deregister_calls`
+increment, the dumper takes a snapshot, computes deltas vs the
+previous boundary, and prints to stderr. With `N=16` (the bench's
+`NUM_PROBES`), each dump is exactly one bench iter.
+
+`TOKIO_LAZY_DEBUG_TRIAL=16 io_busy_owner --bench --quick
+'sharded_mio/busy_owner_3burners'` (excluding trial 1 which
+includes startup):
+
+| trial | dispatch_woken | steal_woken | local_sched | park_skip | begin_park_parked | dispatch_calls | steal_pass_visits | steal_eagain |
+|-------|---------------:|------------:|------------:|----------:|------------------:|---------------:|------------------:|-------------:|
+| 2     | 12             | 4           | 4           | 1         | 11                | 11             | 15                | 12           |
+| 3     | 5              | 11          | 11          | 1         | 10                | 10             | 15                | 13           |
+| 4     | 4              | 12          | 12          | 1         | 12                | 12             | 22                | 20           |
+| 5     | 9              | 7           | 7           | 1         | 12                | 12             | 22                | 20           |
+| 6     | 6              | 10          | 10          | 1         | 12                | 12             | 19                | 17           |
+| 7     | 8              | 8           | 8           | 1         | 11                | 11             | 17                | 15           |
+
+Three **decisive** observations:
+
+1. **`steal_pass_visits` ≈ 15-22 of `steal_pass_calls × 3 ≈ 45`
+   per trial — only ~30-50 % of CAS attempts succeed.** The CAS in
+   `try_steal_pass` is `EMPTY → STEALING`; it fails on `PARKED`,
+   `STEALING`, *or `NOTIFIED`*. With `unpark_was_empty ≈ 5/trial`
+   converting peer state to `NOTIFIED`, a burner-running peer that
+   received an unpark (e.g. a `notify_parked_remote` from a probe
+   spawn) sticks at `NOTIFIED` indefinitely — the burner never
+   reaches `begin_park` to consume it. **The stealer cannot harvest
+   from `NOTIFIED` peers, even though epoll-stealing is perfectly
+   safe in that state** (peer is not in `epoll_wait`).
+
+2. **`steal_eagain` ≈ `steal_pass_visits` − a few**: among the
+   ~15-22 successful CAS visits per trial, only 2-3 actually find
+   events on the peer's epoll. The rest of the events are stuck
+   on `NOTIFIED`-stuck peers we can't even probe.
+
+3. **`park_skip_after_steal = 1/trial`** — exactly one steal pass
+   per trial harvests > 0 events. Subsequent parks within the
+   trial keep failing the CAS on the same `NOTIFIED` peers and
+   come back empty.
+
+So the trial-1+ regression isn't about local-vs-remote scheduling
+or about half-harvested events — it's a **liveness bug in the
+park-state CAS**: stealing is gated on `EMPTY`, but a busy peer's
+`park_state` accumulates `NOTIFIED` from cross-thread unparks and
+never drains because the burner doesn't yield to its parker. The
+fix is to relax the CAS to accept both `EMPTY` *and* `NOTIFIED`,
+preserving the `NOTIFIED` flag on release.
+
+### Recommended fix (session 3 — not yet applied)
+
+In `sharded_mio_driver.rs::try_steal_pass`, replace the single
+`compare_exchange(EMPTY, STEALING)` with a load-and-CAS loop that
+accepts `EMPTY | NOTIFIED`, remembers the original, and on
+release CAS-restores `STEALING → original` (still using CAS, not
+store, to preserve any *new* `NOTIFIED` that raced in during our
+syscall):
+
+```rust
+let original = loop {
+    let prev = slot.park_state.load(Ordering::Acquire);
+    if prev == PARKED || prev == STEALING { continue 'peers; }
+    if slot.park_state
+        .compare_exchange(prev, STEALING, AcqRel, Acquire)
+        .is_ok() { break prev; }
+};
+// ... epoll_wait + dispatch ...
+let _ = slot.park_state.compare_exchange(
+    STEALING, original, Release, Relaxed,
+);
+```
+
+Validate first by adding three sub-counters
+(`steal_cas_fail_parked`, `steal_cas_fail_notified`,
+`steal_cas_fail_stealing`) to confirm `notified` dominates the
+failure mode. If yes, apply the fix and re-measure — expect trial
+1+ to drop to single-digit-ms (matching trial 0).
+
+Hypotheses A/B/C from the previous section may now be moot if
+the CAS relaxation alone moves the bench to <1 ms steady state.
+If a residual ~40 ms tail remains after the CAS fix, return to
+those.
+
 ## File map
 
 ```

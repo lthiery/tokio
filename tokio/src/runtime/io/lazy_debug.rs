@@ -15,8 +15,8 @@
 use std::cell::Cell;
 use std::env;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Mutex, Once};
 use std::thread;
 use std::time::Duration;
 
@@ -283,4 +283,98 @@ fn dump_to_stderr() {
     for (name, val) in snap {
         let _ = writeln!(out, "  {name:32} = {val}");
     }
+}
+
+// ---- per-trial delta dumper ----
+//
+// Activated by `TOKIO_LAZY_DEBUG_TRIAL=N`: every `N`th increment of
+// `apply_deregister_calls` triggers a delta snapshot. Designed for
+// the `io_busy_owner` bench, which deregisters one fd at the end of
+// every probe task; with `N=16` (the bench's `NUM_PROBES`), each
+// dump is exactly one trial-worth of activity.
+//
+// Independent of the periodic `TOKIO_LAZY_DEBUG=1` dumper. Safe to
+// enable both at once; output is interleaved on stderr.
+
+/// `-1` = env var not yet read; `0` = disabled; `>0` = trial size.
+static TRIAL_SIZE: AtomicI64 = AtomicI64::new(-1);
+
+/// Highest `count / trial_size` already dumped. Guards against
+/// double-dumping the same boundary when multiple threads are
+/// racing through `apply_deregister`.
+static TRIAL_NUM: AtomicU64 = AtomicU64::new(0);
+
+/// Counter values from the previous boundary, parallel to
+/// `LazyDebugCounters::snapshot()`'s iteration order. Empty before
+/// the first dump.
+static PREV_SNAPSHOT: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+fn trial_size() -> u64 {
+    let cur = TRIAL_SIZE.load(Ordering::Relaxed);
+    if cur >= 0 {
+        return cur as u64;
+    }
+    let parsed = env::var("TOKIO_LAZY_DEBUG_TRIAL")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    TRIAL_SIZE.store(parsed as i64, Ordering::Relaxed);
+    parsed
+}
+
+/// Hook called from `apply_deregister`. Cheap when the env var is
+/// unset (one relaxed load + an `i64::cmp` after first call).
+pub(crate) fn maybe_dump_trial() {
+    let size = trial_size();
+    if size == 0 {
+        return;
+    }
+    let count = COUNTERS.apply_deregister_calls.load(Ordering::Relaxed);
+    if count == 0 || count % size != 0 {
+        return;
+    }
+    let trial_num = count / size;
+
+    // Take the snapshot first so cross-thread race observers see a
+    // consistent view; serialise dumping on PREV_SNAPSHOT's lock.
+    let snap = COUNTERS.snapshot();
+    let mut prev = match PREV_SNAPSHOT.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
+    // Idempotency: only the first thread to reach this boundary
+    // emits the delta; later racers see TRIAL_NUM already advanced.
+    let last = TRIAL_NUM.load(Ordering::Relaxed);
+    if last >= trial_num {
+        return;
+    }
+    TRIAL_NUM.store(trial_num, Ordering::Relaxed);
+
+    let stderr = std::io::stderr();
+    let mut out = stderr.lock();
+    let _ = writeln!(
+        out,
+        "---- lazy-debug trial #{} (apply_deregister_calls = {}) ----",
+        trial_num, count,
+    );
+
+    if prev.is_empty() {
+        // First boundary: dump absolute values for any non-zero
+        // counter so the reader can see the cumulative startup cost.
+        for (name, val) in &snap {
+            if *val != 0 {
+                let _ = writeln!(out, "  {name:32} = {val}");
+            }
+        }
+    } else {
+        for (i, (name, val)) in snap.iter().enumerate() {
+            let prev_val = prev.get(i).copied().unwrap_or(0);
+            let delta = val.wrapping_sub(prev_val);
+            if delta != 0 {
+                let _ = writeln!(out, "  {name:32} +{delta}");
+            }
+        }
+    }
+    *prev = snap.into_iter().map(|(_, v)| v).collect();
 }

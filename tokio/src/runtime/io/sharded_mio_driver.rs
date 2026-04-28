@@ -806,8 +806,13 @@ impl ShardedMioHandle {
     }
 
     fn apply_deregister(&self, worker_idx: usize, shared: Arc<ScheduledIo>, fd: RawFd) {
-        use super::lazy_debug::{bump, COUNTERS};
+        use super::lazy_debug::{bump, maybe_dump_trial, COUNTERS};
         bump(&COUNTERS.apply_deregister_calls);
+        // Per-trial delta hook (no-op unless `TOKIO_LAZY_DEBUG_TRIAL`
+        // is set). Placed here because `io_busy_owner` deregisters
+        // exactly once per probe task at end-of-trial — modulo the
+        // configured `N` this gives one delta dump per bench iter.
+        maybe_dump_trial();
         let slot = &self.workers[worker_idx];
         let slab_key = shared.sharded_mio_slab_key.load(Ordering::Relaxed);
         let gen = shared.sharded_mio_gen.load(Ordering::Relaxed);
