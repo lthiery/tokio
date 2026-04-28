@@ -464,6 +464,12 @@ impl UnixDatagram {
     /// The runtime is usually set implicitly when this function is called
     /// from a future driven by a Tokio runtime, otherwise runtime can be set
     /// explicitly with [`Runtime::enter`](crate::runtime::Runtime::enter) function.
+    ///
+    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
+    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// to the first I/O operation on the returned handle, so this
+    /// constructor itself does not panic and may be called from any
+    /// thread; the panic moves to the first readiness/IO call.
     /// # Examples
     /// ```
     /// # use std::error::Error;
