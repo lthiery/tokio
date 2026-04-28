@@ -1,7 +1,6 @@
 use crate::io::interest::Interest;
 use crate::runtime::io::registration::RegistrationSource;
 use crate::runtime::io::Registration;
-use crate::runtime::scheduler;
 
 #[allow(unused_imports)]
 use mio::event::Source;
@@ -112,23 +111,11 @@ impl<E: RegistrationSource> PollEvented<E> {
     /// function.
     #[track_caller]
     #[cfg_attr(feature = "signal", allow(unused))]
-    pub(crate) fn new_with_interest(io: E, interest: Interest) -> io::Result<Self>
+    pub(crate) fn new_with_interest(mut io: E, interest: Interest) -> io::Result<Self>
     where
         E: RegistrationSource,
     {
-        Self::new_with_interest_and_handle(io, interest, scheduler::Handle::current())
-    }
-
-    #[track_caller]
-    pub(crate) fn new_with_interest_and_handle(
-        mut io: E,
-        interest: Interest,
-        handle: scheduler::Handle,
-    ) -> io::Result<Self>
-    where
-        E: RegistrationSource,
-    {
-        let registration = Registration::new_with_interest_and_handle(&mut io, interest, handle)?;
+        let registration = Registration::new_with_interest(&mut io, interest)?;
         Ok(Self {
             io: Some(io),
             registration,
@@ -160,8 +147,7 @@ impl<E: RegistrationSource> PollEvented<E> {
     {
         let io = self.io.as_mut().unwrap(); // As io shouldn't ever be None, just unwrap here.
         let _ = self.registration.deregister(io);
-        self.registration =
-            Registration::new_with_interest_and_handle(io, interest, scheduler::Handle::current())?;
+        self.registration = Registration::new_with_interest(io, interest)?;
 
         Ok(())
     }

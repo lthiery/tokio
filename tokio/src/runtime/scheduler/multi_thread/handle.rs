@@ -61,9 +61,9 @@ pub(crate) struct Handle {
     /// `IoFlavor::Traditional`.
     ///
     /// Kept on the scheduler handle (rather than on `driver::Handle`)
-    /// so that `Registration::new_with_interest_and_handle` can reach
-    /// it without plumbing a new field into the pre-scheduler I/O
-    /// stack.
+    /// so that `Registration::ensure_registered` can reach it on first
+    /// poll via `Handle::current()` without plumbing a new field into
+    /// the pre-scheduler I/O stack.
     ///
     /// See `tokio/docs/io-driver-vtable.md` for the design.
     ///

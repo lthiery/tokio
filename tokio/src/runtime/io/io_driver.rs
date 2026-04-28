@@ -62,16 +62,17 @@ unsafe impl Sync for IoDriver {}
 /// concrete backend. One `&'static` instance per backend.
 pub(crate) struct IoDriverVTable {
     /// Allocate a fresh `Arc<ScheduledIo>` without binding it to any
-    /// worker yet. Used by [`Registration::new_with_interest_and_handle`][reg]
-    /// at construction time when the backend defers actual driver
-    /// work to the first poll.
+    /// worker yet. Called from
+    /// [`Registration::ensure_registered`][reg] on the first poll of a
+    /// lazy-shape registration, just before [`register_local`][rl].
     ///
     /// Both backends implement this by `Arc::new(ScheduledIo::default())`.
     /// Kept in the vtable so future backends with non-trivial Arc
     /// initialisation (e.g. interior init that depends on driver
     /// state) have a hook.
     ///
-    /// [reg]: super::registration::Registration::new_with_interest_and_handle
+    /// [reg]: super::registration::Registration
+    /// [rl]: Self::register_local
     pub allocate_scheduled_io: unsafe fn(NonNull<()>) -> Arc<ScheduledIo>,
 
     /// Register a previously-allocated `Arc<ScheduledIo>` with `fd` /

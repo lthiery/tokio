@@ -1,6 +1,5 @@
 use crate::io::{Interest, Ready};
 use crate::runtime::io::{ReadyEvent, Registration};
-use crate::runtime::scheduler;
 
 use mio::unix::SourceFd;
 use std::error::Error;
@@ -221,6 +220,12 @@ impl<T: AsRawFd> AsyncFd<T> {
     ///
     /// This function panics if there is no current reactor set, or if the `rt`
     /// feature flag is not enabled.
+    ///
+    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
+    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// to the first I/O operation on the returned `AsyncFd`, so this
+    /// constructor itself does not panic and may be called from any
+    /// thread; the panic moves to the first readiness call.
     #[inline]
     #[track_caller]
     pub fn new(inner: T) -> io::Result<Self>
@@ -238,22 +243,24 @@ impl<T: AsRawFd> AsyncFd<T> {
     ///
     /// This function panics if there is no current reactor set, or if the `rt`
     /// feature flag is not enabled.
+    ///
+    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
+    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// to the first I/O operation on the returned `AsyncFd`, so this
+    /// constructor itself does not panic and may be called from any
+    /// thread; the panic moves to the first readiness call.
     #[inline]
     #[track_caller]
     pub fn with_interest(inner: T, interest: Interest) -> io::Result<Self>
     where
         T: AsRawFd,
     {
-        Self::new_with_handle_and_interest(inner, scheduler::Handle::current(), interest)
+        Self::new_with_interest_inner(inner, interest)
     }
 
     #[track_caller]
-    pub(crate) fn new_with_handle_and_interest(
-        inner: T,
-        handle: scheduler::Handle,
-        interest: Interest,
-    ) -> io::Result<Self> {
-        Self::try_new_with_handle_and_interest(inner, handle, interest).map_err(Into::into)
+    pub(crate) fn new_with_interest_inner(inner: T, interest: Interest) -> io::Result<Self> {
+        Self::try_new_with_interest_inner(inner, interest).map_err(Into::into)
     }
 
     /// Creates an [`AsyncFd`] backed by (and taking ownership of) an object
@@ -272,6 +279,12 @@ impl<T: AsRawFd> AsyncFd<T> {
     ///
     /// This function panics if there is no current reactor set, or if the `rt`
     /// feature flag is not enabled.
+    ///
+    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
+    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// to the first I/O operation on the returned `AsyncFd`, so this
+    /// constructor itself does not panic and may be called from any
+    /// thread; the panic moves to the first readiness call.
     #[inline]
     #[track_caller]
     pub fn try_new(inner: T) -> Result<Self, AsyncFdTryNewError<T>>
@@ -292,24 +305,28 @@ impl<T: AsRawFd> AsyncFd<T> {
     ///
     /// This function panics if there is no current reactor set, or if the `rt`
     /// feature flag is not enabled.
+    ///
+    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
+    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// to the first I/O operation on the returned `AsyncFd`, so this
+    /// constructor itself does not panic and may be called from any
+    /// thread; the panic moves to the first readiness call.
     #[inline]
     #[track_caller]
     pub fn try_with_interest(inner: T, interest: Interest) -> Result<Self, AsyncFdTryNewError<T>>
     where
         T: AsRawFd,
     {
-        Self::try_new_with_handle_and_interest(inner, scheduler::Handle::current(), interest)
+        Self::try_new_with_interest_inner(inner, interest)
     }
 
     #[track_caller]
-    pub(crate) fn try_new_with_handle_and_interest(
+    pub(crate) fn try_new_with_interest_inner(
         inner: T,
-        handle: scheduler::Handle,
         interest: Interest,
     ) -> Result<Self, AsyncFdTryNewError<T>> {
         let fd = inner.as_raw_fd();
-
-        match Registration::new_with_interest_and_handle(&mut SourceFd(&fd), interest, handle) {
+        match Registration::new_with_interest(&mut SourceFd(&fd), interest) {
             Ok(registration) => Ok(AsyncFd {
                 registration,
                 inner: Some(inner),
