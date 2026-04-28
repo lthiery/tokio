@@ -242,8 +242,9 @@ Done in three sub-commits:
   it for `mio::Registry::deregister`); the uring shim ignores
   source and reads `worker_idx` off the `ScheduledIo`.
 - **2c — collapse the cfg cascade** (`fa27c1a1`).
-  Both branches in `Registration::new_with_interest_and_handle` and
-  `Registration::deregister` reduced to a single
+  Both branches in `Registration::new_with_interest` (then named
+  `new_with_interest_and_handle`) and `Registration::deregister`
+  reduced to a single
   `if let Some(driver) = handle.io_driver() { driver.add_source/deregister(...) }`.
   Standalone `sharded_mio_handle` field on `multi_thread::Handle`
   removed; `io_driver` field now feeds both backends. Per-backend
@@ -619,3 +620,128 @@ so future-us remembers the framing.
 - `uring_send` / `uring_recv` / `uring_recv_multi` exposure. These stay
   inherent on `UringHandle`, reachable only when the caller already has
   a uring-specific handle in hand; the vtable does not see them.
+
+## Truly-lazy `Registration` (post step-2)
+
+After step 2 landed, `Registration::new_with_interest_and_handle` was
+"halfway lazy" on vtable backends — it stashed `(fd, interest)` and
+deferred the slab insert / `epoll_ctl_add` to first poll, but it still
+called `Handle::current()` and `handle.allocate_scheduled_io()` at
+construction time. That kept the construction-from-anywhere benefit out
+of reach: `TcpStream::from_std` and peers continued to panic when called
+outside a runtime, even on vtable builds.
+
+The follow-up (this section) finished the job:
+
+- The constructor was renamed to `Registration::new_with_interest` and
+  the `&Handle` argument removed entirely.
+- On the vtable cfg branch the constructor does **no** runtime lookup
+  at all: it stores `(fd, interest)` plus three OnceLocks
+  (`shared`, `handle`, `first_poll_error`).
+- `ensure_registered` (the renamed `register_if_needed`) now calls
+  `Handle::current()` itself on first poll, dispatches on
+  `handle.io_driver()`, allocates an `Arc<ScheduledIo>`, and either
+  calls `register_local` (vtable backends) or falls back to
+  `handle.driver().io().add_source` (Traditional runtime running
+  inside a vtable-feature build). It publishes the `scheduler::Handle`
+  into the OnceLock **before** the `Arc<ScheduledIo>`, so any reader
+  that observes `shared.get().is_some()` is guaranteed to also see
+  `handle.get().is_some()`.
+- `Drop::deregister` reads `handle` and `shared` out of the OnceLocks
+  and dispatches on `handle.io_driver()` the same way
+  `ensure_registered` did. Drop running outside a runtime context
+  (`Runtime::shutdown`, `block_on` returning, late thread-local
+  teardown) is fine — there's no fresh `Handle::current()` call. If
+  `shared` was never populated (no first poll happened), Drop is a
+  no-op.
+
+User-visible consequence on vtable builds:
+`TcpStream::from_std` (and every other `from_std` / `bind` / `connect`
+wrapper that calls `PollEvented::new` underneath) can be called from
+any thread, with or without a runtime in scope. The construction-time
+"panics if not in a runtime" check moves to the first
+`.readable()` / `.read()` / `.write()` etc. call. `from_std`
+docstrings call this out explicitly. **This is a semver-adjacent
+behavior change scoped to `tokio_unstable` + the experimental
+features**; legacy mio builds keep their construction-time panic.
+
+Why the **`scheduler::Handle`** is cached in the OnceLock (and not
+the narrower `IoDriver`): a vtable-feature build can still be paired
+with `IoFlavor::Traditional`, in which case `handle.io_driver()`
+returns `None` and `ensure_registered` has to fall back to
+`handle.driver().io().add_source`. Caching the broad scheduler
+handle covers both branches with one OnceLock and lets `Drop`
+re-do the same dispatch without ever touching TLS. Drop can run
+outside a runtime context where `Handle::current()` would panic, so
+the cached scheduler handle lets us deregister cleanly regardless.
+The cost is one extra OnceLock per registration plus a
+`scheduler::Handle::clone` (Arc strong-count bump) on first poll.
+
+Why `allocate_scheduled_io` stays a vtable shim (rather than moving
+to a uniform `Arc::new(ScheduledIo::default())` at the call site): the
+uring backend's `Arc::new_cyclic` slot wiring would need an
+`init_with_slot_key` post-allocate hook to factor out cleanly, which
+is its own refactor with its own risk. Keeping the vtable shim is
+zero blast radius on uring; the per-call cost is one extra indirect
+call on first poll, which is negligible against the syscalls it
+precedes.
+
+## Same-worker register fast path (Phase 2)
+
+Once registration is fully lazy, the first-poll site naturally
+identifies the worker that's about to consume readiness for the new
+fd. `sharded_mio_driver::register_local` exploits this: when
+`current_worker_index()` returns `Some(idx)` and `idx` is in range,
+it routes to `register_on_worker(idx, …)` and mutates that worker's
+own `RegistrationSet` + `SharedRegistry` synchronously. No
+cross-thread queue, no `mio::Waker` syscall, no waiting for the
+target worker's next park to drain a `DriverOp::Register`.
+
+The fall-through path (off-runtime first poll, e.g. `from_std`
+called on a thread spawned outside the multi-thread scheduler) keeps
+using `queue_register` → `pending_ops` → `unpark`. `deregister`
+unconditionally queues, so the FIFO Register-before-Deregister
+property the cross-thread Drop race relies on is preserved.
+
+### Throughput artifact: `tcp_connect_churn`
+
+Bench machine: workstation, criterion `--quick` with 30-conn batches.
+
+| variant | `tcp_connect_churn` median | `tcp_echo_throughput` median |
+|---|---|---|
+| sharded-mio, fast path **disabled** (always queue) | 1.46 ms | 14.87 ms |
+| sharded-mio, fast path **enabled** (Phase 2)        | 8.92 ms | 14.81 ms |
+| traditional (eager add_source on producer thread)   | 9.03 ms | (unmeasured here) |
+
+The sync fast path **regresses `tcp_connect_churn` ~6×** vs the
+queue-everywhere shape, while leaving `tcp_echo_throughput`
+indistinguishable. This is the artifact called out in the prior
+session's handoff: connect_churn spawns 30 client tasks per iter
+from a single `block_on` root, so work-stealing tends to land the
+whole batch on one worker, the sync register stamps all 30 fds onto
+that worker's registry, and dispatch + Drop bottleneck on that
+shard. With queueing, round-robin spreads the 30 fds across all
+workers, so dispatch parallelizes.
+
+We **keep the sync fast path** because:
+
+1. `tcp_echo_throughput` (a more realistic distributed-load shape:
+   listener accepts on different workers and the connection's first
+   poll happens on the worker that accepted it) shows no regression.
+2. The fast path eliminates a wake syscall per registration, which
+   matters on workloads where fds are short-lived (the same
+   workloads where connect_churn looks bad, but real producer
+   patterns put accepts on different workers, so sync = local =
+   no concentration).
+3. Connect_churn's bench shape (single producer, 30-way fan out)
+   is itself unrepresentative — production servers don't `connect`
+   30 sockets from one task in a tight loop without distributing
+   them across cores first.
+
+If a future change makes connect_churn-like workloads important —
+e.g. a TLS client benchmarked with single-task connection pools —
+we could spread Phase-2 placement by hashing fd → worker, or by
+re-introducing the queue path under env-var/config control. The
+artifact discussion lives here so future readers know why the
+"fast" path can look slow.
+
