@@ -57,6 +57,24 @@ counters! {
     register_local_calls,
     queue_register_calls,
 
+    // ---- same-worker sync register fast path ----
+    /// `register_on_worker` entered (sync path on the calling worker).
+    register_on_worker_calls,
+    /// `register_on_worker` saw the registration set already shutting
+    /// down; the registration was rejected.
+    register_on_worker_shutdown,
+    /// `register_on_worker` found no `SharedRegistry` published on the
+    /// calling worker yet — startup race; should not happen
+    /// post-barrier.
+    register_on_worker_no_registry,
+    /// `register_on_worker` succeeded: kernel-side epoll registration
+    /// installed and `(slab_key, gen)` stamped on `ScheduledIo`.
+    register_on_worker_ok,
+    /// `register_on_worker` saw `mio::Registry::register` fail (e.g.
+    /// EBADF). Rolled back the per-shard set entry and surfaced the
+    /// error.
+    register_on_worker_errors,
+
     // ---- park-side drain ----
     drain_calls,
     drain_register_drained,

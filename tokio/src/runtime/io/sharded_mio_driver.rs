@@ -4,13 +4,13 @@
 //! ## Lazy first-poll registration
 //!
 //! Originally this backend mirrored the legacy mio driver: every
-//! `Registration::new_with_interest_and_handle` call eagerly allocated
+//! `Registration::new_with_interest` call eagerly allocated
 //! a [`ScheduledIo`] from a global [`RegistrationSet`] and called
 //! `mio::Registry::register` on a round-robin-picked worker. That work
 //! ran on the producer thread (often a single accept worker) and
 //! serialised through one global mutex.
 //!
-//! The current shape is lazy: `Registration::new_with_interest_and_handle`
+//! The current shape is lazy: `Registration::new_with_interest`
 //! does no driver work — it stashes `(fd, interest)` only. The first
 //! `poll_ready` / `try_io` / `readiness` call on the registration runs
 //! on whichever worker happens to be polling and triggers
@@ -291,29 +291,49 @@ impl ShardedMioHandle {
 
     /// Lazy register `(shared, fd, interest)` with the sharded-mio
     /// reactor. Called from
-    /// [`Registration::register_if_needed`][reg-rin] on the first poll
+    /// [`Registration::ensure_registered`][reg-er] on the first poll
     /// of a registration.
     ///
-    /// Round-robin picks a shard, pushes a [`DriverOp::Register`] op,
-    /// and unparks the shard. The shard processes the op at its next
-    /// park; the registration becomes effective then. The polling
-    /// future records its waker on the `ScheduledIo` and is woken by
-    /// epoll once the kernel signals readiness.
+    /// Two-tier dispatch:
     ///
-    /// All registrations go through this cross-thread queue path,
-    /// including those originating on a sharded-mio worker. A
-    /// synchronous worker-local fast path was tried and found to
-    /// (a) deadlock `tcp_connect_churn` when the calling worker holds
-    /// all freshly-registered fds and its siblings are fully parked,
-    /// and (b) regress connect-churn throughput due to FD
-    /// concentration on the accepting worker. See
-    /// HANDOFF-lazy-register-session2.md for the full bisection.
+    /// 1. **Same-worker sync path.** When the caller is itself a
+    ///    sharded-mio worker (detected via
+    ///    [`current_worker_index`][cwi]), the registration is applied
+    ///    inline on the calling worker's own [`SharedRegistry`] —
+    ///    no cross-thread queue, no unpark syscall, no pre-park
+    ///    drain delay. This is the common path: `from_std` /
+    ///    `TcpListener::accept` on a worker triggers first poll on
+    ///    that same worker.
+    ///
+    /// 2. **Foreign-thread queued path.** When `current_worker_index`
+    ///    returns `None` (off-runtime first poll, e.g. from a thread
+    ///    spawned outside the multi-thread scheduler), or the
+    ///    returned index is past the worker count (defensive),
+    ///    round-robin picks a shard, pushes a
+    ///    [`DriverOp::Register`] op, and unparks it.
+    ///    The op is drained on the target worker's next park.
+    ///
+    /// `deregister` always queues — same-thread vs foreign-thread is
+    /// a less interesting axis there because the deregister path is
+    /// already happy to wait one park cycle. Centralising registry
+    /// mutation on the owning worker keeps the FIFO Register-then-
+    /// Deregister property the cross-thread Drop race relies on.
+    ///
+    /// **Throughput note.** The synchronous fast path concentrates
+    /// fds on whichever worker happens to call `from_std`. In
+    /// `tcp_connect_churn` (single accept-loop worker, many
+    /// short-lived connections) this regresses throughput because
+    /// the accepting worker becomes a single dispatch hot spot.
+    /// Distributed-load workloads — where each worker accepts/spawns
+    /// its own connections — benefit. See `docs/io-driver-vtable.md`
+    /// for the bench results and the artifact discussion.
     ///
     /// Returns the worker index this registration is now bound to —
     /// the same index that ends up stored in
     /// `shared.sharded_mio_worker`.
     ///
-    /// [reg-rin]: super::registration::Registration::register_if_needed
+    /// [reg-er]: super::registration::Registration::ensure_registered
+    /// [cwi]: crate::runtime::scheduler::multi_thread::sharded_mio_park::current_worker_index
     pub(crate) fn register_local(
         &self,
         shared: &Arc<ScheduledIo>,
@@ -322,7 +342,110 @@ impl ShardedMioHandle {
     ) -> io::Result<usize> {
         use super::lazy_debug::{bump, COUNTERS};
         bump(&COUNTERS.register_local_calls);
+
+        // Sync fast path: when the calling thread is itself a
+        // sharded-mio worker, apply the registration inline on its
+        // own `SharedRegistry`. The lazy-from-anywhere panic boundary
+        // (no runtime in TLS) was already cleared by
+        // `Registration::ensure_registered` calling
+        // `Handle::current()`, so reaching this point with a worker
+        // index always means we're on a live sharded-mio worker
+        // belonging to the same runtime as `self`.
+        if let Some(worker_idx) =
+            crate::runtime::scheduler::multi_thread::sharded_mio_park::current_worker_index()
+        {
+            if worker_idx < self.workers.len() {
+                return self.register_on_worker(worker_idx, shared, fd, interest);
+            }
+        }
+
         self.queue_register(shared, fd, interest)
+    }
+
+    /// Same-worker sync register. Mutates the owning worker's
+    /// `RegistrationSet` and `SharedRegistry` directly. Caller must
+    /// have established that `worker_idx` is the index of the
+    /// currently-executing worker.
+    fn register_on_worker(
+        &self,
+        worker_idx: usize,
+        shared: &Arc<ScheduledIo>,
+        fd: RawFd,
+        interest: Interest,
+    ) -> io::Result<usize> {
+        use super::lazy_debug::{bump, COUNTERS};
+        bump(&COUNTERS.register_on_worker_calls);
+
+        // Publish the worker assignment first so a racing
+        // `queue_deregister` (e.g. from a foreign Drop that just
+        // received a clone of `shared`) routes to this same worker
+        // and the FIFO ordering on `pending_ops` resolves
+        // Register-before-Deregister.
+        shared
+            .sharded_mio_worker
+            .store(worker_idx as u32, Ordering::Relaxed);
+
+        let slot = &self.workers[worker_idx];
+
+        // Track in the per-shard set first.
+        if slot
+            .registrations
+            .allocate_existing(&mut slot.synced.lock(), shared)
+            .is_err()
+        {
+            bump(&COUNTERS.register_on_worker_shutdown);
+            // Driver shutting down — surface a shutdown event so the
+            // caller's first-poll waiter doesn't hang.
+            shared.shutdown();
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "io driver shutting down",
+            ));
+        }
+
+        let registry = match slot.shared_registry.get() {
+            Some(r) => r,
+            None => {
+                bump(&COUNTERS.register_on_worker_no_registry);
+                // Worker hasn't published its registry yet (shouldn't
+                // happen post-startup; the start barrier guarantees
+                // every worker publishes before any task runs). Be
+                // safe: roll back the set insert and report.
+                // SAFETY: `shared` was just inserted by
+                // `allocate_existing`.
+                unsafe {
+                    slot.registrations
+                        .remove(&mut slot.synced.lock(), shared);
+                }
+                shared.shutdown();
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "sharded-mio worker registry not yet published",
+                ));
+            }
+        };
+
+        let mut source = mio::unix::SourceFd(&fd);
+        match registry.register(&mut source, fd, interest, shared) {
+            Ok(ok) => {
+                bump(&COUNTERS.register_on_worker_ok);
+                shared
+                    .sharded_mio_slab_key
+                    .store(ok.slab_key, Ordering::Relaxed);
+                self.metrics.incr_fd_count();
+                Ok(worker_idx)
+            }
+            Err(e) => {
+                bump(&COUNTERS.register_on_worker_errors);
+                // SAFETY: just inserted by `allocate_existing` above.
+                unsafe {
+                    slot.registrations
+                        .remove(&mut slot.synced.lock(), shared);
+                }
+                shared.shutdown();
+                Err(e)
+            }
+        }
     }
 
     /// Cross-thread first-poll path: enqueue a Register op onto a
