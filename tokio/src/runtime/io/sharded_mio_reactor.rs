@@ -388,12 +388,15 @@ impl SharedRegistry {
     /// lifetime of `self` (the inner `mio::Registry` keeps the fd open
     /// via dup; closed when this `SharedRegistry` drops).
     ///
-    /// Reserved for the upcoming meta-epoll integration: each worker's
-    /// child epoll fd is registered onto a runtime-wide meta-epoll so
-    /// idle workers can park on the meta and wake on any sibling's
-    /// readiness. Currently unused — kept as the integration hook.
+    /// Used by [`ShardedMioHandle::register_worker`] to add this
+    /// child epoll onto the runtime-wide meta epoll (see
+    /// [`sharded_mio_driver`]). The upcoming steal-mode park path
+    /// will also pass it back to a peer worker's
+    /// [`Self::try_steal_drain`] so the peer can `epoll_wait` non-
+    /// blocking on it under a `try_lock` of `OpsState`.
+    ///
+    /// [`sharded_mio_driver`]: super::sharded_mio_driver
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)]
     pub(crate) fn epoll_fd(&self) -> RawFd {
         self.registry.as_raw_fd()
     }

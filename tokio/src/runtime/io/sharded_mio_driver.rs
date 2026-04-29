@@ -118,6 +118,15 @@ impl std::fmt::Debug for WorkerState {
 /// synchronously on the calling thread, targeting the owner worker's
 /// child epoll directly via the cloneable `mio::Registry`.
 ///
+/// On Linux the handle additionally owns a *meta epoll fd*: every
+/// worker's child epoll is registered onto it as level-triggered
+/// `EPOLLIN`. A worker that is idle but not its target's owner can
+/// park on the meta-epoll instead of its own child epoll and pick
+/// up "some sibling has events" wake notifications, then drain the
+/// firing child via [`SharedRegistry`]'s try-lock peer path. The
+/// child epolls themselves remain the single-owner registration
+/// surface — only the *parking* layer is hierarchical.
+///
 /// [uh]: super::uring_driver::UringHandle
 pub(crate) struct ShardedMioHandle {
     workers: Box<[WorkerState]>,
@@ -133,6 +142,17 @@ pub(crate) struct ShardedMioHandle {
     ///
     /// [uhb]: super::uring_driver::UringHandle
     start_barrier: std::sync::Barrier,
+
+    /// Runtime-wide *meta epoll fd*. Each worker's child epoll is
+    /// added here once it publishes its `SharedRegistry`, with the
+    /// child's `worker_idx` carried in `epoll_event.data.u64`. Used
+    /// by the upcoming steal-mode park path to wait for "some
+    /// sibling has events" and resolve back to the firing worker.
+    ///
+    /// Owned by this handle: created in [`Self::new`], closed in
+    /// [`Drop`]. Not exposed publicly outside the sharded-mio module.
+    #[cfg(target_os = "linux")]
+    meta_epfd: RawFd,
 }
 
 impl std::fmt::Debug for ShardedMioHandle {
@@ -143,6 +163,24 @@ impl std::fmt::Debug for ShardedMioHandle {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Drop for ShardedMioHandle {
+    fn drop(&mut self) {
+        // Close the meta epoll fd. Children remain registered until
+        // each worker's `SharedRegistry` (and the underlying child
+        // epoll fd) is dropped a moment later as part of runtime
+        // teardown — the kernel removes the meta-side records
+        // automatically when the meta fd closes, so we don't need to
+        // walk the workers and `EPOLL_CTL_DEL` first.
+        if self.meta_epfd >= 0 {
+            // SAFETY: `meta_epfd` was created by `epoll_create1` in
+            // `Self::new` and has not been closed elsewhere — Drop
+            // runs at most once.
+            unsafe { libc::close(self.meta_epfd) };
+        }
+    }
+}
+
 impl ShardedMioHandle {
     pub(crate) fn new(num_workers: usize) -> Self {
         let mut workers = Vec::with_capacity(num_workers);
@@ -150,12 +188,38 @@ impl ShardedMioHandle {
             workers.push(WorkerState::new());
         }
         let barrier_count = num_workers.max(1);
+
+        // Create the runtime-wide meta epoll fd up front so it is
+        // available for `register_worker` to add child epolls onto.
+        // `EPOLL_CLOEXEC` keeps the fd from leaking across `exec`.
+        #[cfg(target_os = "linux")]
+        let meta_epfd = {
+            let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if fd < 0 {
+                let err = io::Error::last_os_error();
+                panic!("sharded-mio: epoll_create1 for meta epoll failed: {err}");
+            }
+            fd
+        };
+
         Self {
             workers: workers.into_boxed_slice(),
             next_worker: AtomicUsize::new(0),
             metrics: IoDriverMetrics::default(),
             start_barrier: std::sync::Barrier::new(barrier_count),
+            #[cfg(target_os = "linux")]
+            meta_epfd,
         }
+    }
+
+    /// Raw meta-epoll fd. Stable for the lifetime of `self` and closed
+    /// in [`Drop`]. Currently only the parker module needs this — for
+    /// the upcoming steal-mode `epoll_wait` on the meta fd. Not
+    /// exposed publicly outside the sharded-mio backend.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn meta_epfd(&self) -> RawFd {
+        self.meta_epfd
     }
 
     /// Number of workers this handle serves.
@@ -187,6 +251,15 @@ impl ShardedMioHandle {
     /// exactly once per worker during scheduler startup, on that
     /// worker's thread. After this returns, other threads can target
     /// the worker via `add_source` / `unpark`.
+    ///
+    /// On Linux this also registers the worker's child epoll fd onto
+    /// the runtime-wide meta epoll as level-triggered `EPOLLIN`, with
+    /// `worker_idx` stamped into `epoll_event.data.u64`. The level-
+    /// triggered shape is deliberate: we want the meta `epoll_wait`
+    /// to keep reporting a child as ready until that child has been
+    /// drained, so a peer parker that wakes on the meta but loses the
+    /// try-lock race can be re-woken on the next attempt without any
+    /// intervening event.
     pub(crate) fn register_worker(
         &self,
         worker_idx: usize,
@@ -194,6 +267,44 @@ impl ShardedMioHandle {
         external_waker: ExternalWaker,
     ) {
         let slot = &self.workers[worker_idx];
+
+        // Register the child epoll onto the meta epoll *before*
+        // publishing `shared_registry` so that any thread that
+        // subsequently observes the published registry can also rely
+        // on the child being visible to the meta. Failure here is a
+        // hard error — the runtime cannot honor steal-mode park
+        // without the registration in place.
+        #[cfg(target_os = "linux")]
+        {
+            let child_epfd = shared_registry.epoll_fd();
+            let mut ev = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: worker_idx as u64,
+            };
+            // SAFETY: `self.meta_epfd` is owned by this handle and
+            // stays open until `Drop`; `child_epfd` is owned by the
+            // soon-to-be-published `SharedRegistry`, which itself
+            // outlives the handle (the worker's `Reactor` is dropped
+            // last on shutdown via `ShardedMioParker::shutdown`).
+            // `&mut ev` is a fresh stack value the kernel reads but
+            // does not retain.
+            let ret = unsafe {
+                libc::epoll_ctl(
+                    self.meta_epfd,
+                    libc::EPOLL_CTL_ADD,
+                    child_epfd,
+                    &mut ev,
+                )
+            };
+            if ret != 0 {
+                let err = io::Error::last_os_error();
+                panic!(
+                    "sharded-mio: epoll_ctl(meta, ADD, child={child_epfd}, \
+                     worker={worker_idx}) failed: {err}",
+                );
+            }
+        }
+
         if slot.shared_registry.set(shared_registry).is_err() {
             debug_assert!(false, "worker {worker_idx} published shared_registry twice");
         }
