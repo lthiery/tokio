@@ -79,7 +79,7 @@ const TOKEN_KEY_MASK: u32 = (1 << TOKEN_KEY_BITS) - 1;
 /// (orders of magnitude below `0xFFFFFFF`) so this remains safe in
 /// practice — same argument as before the worker_idx field was added.
 #[inline]
-fn pack_token(worker_idx: u8, key: u32, gen: u32) -> Token {
+pub(crate) fn pack_token(worker_idx: u8, key: u32, gen: u32) -> Token {
     debug_assert!(
         (worker_idx as u32) <= TOKEN_WORKER_MASK,
         "worker_idx {worker_idx} exceeds TOKEN_WORKER_MASK ({TOKEN_WORKER_MASK})",
@@ -256,10 +256,14 @@ pub(crate) struct SharedRegistry {
 
 /// Outcome of a [`SharedRegistry::register`] call. Carries the
 /// freshly-assigned `(slab_key, gen)` pair so the caller can stash both
-/// on the [`ScheduledIo`] for later mismatch checks.
+/// on the [`ScheduledIo`] for later mismatch checks, plus the packed
+/// `mio::Token` so the EPOLLEXCLUSIVE-fanout helpers can stamp the
+/// same `(worker_idx, key, gen)` tuple onto every peer worker's epoll
+/// fd without having to re-derive it.
 pub(crate) struct RegisterOk {
     pub(crate) slab_key: u32,
     pub(crate) gen: u32,
+    pub(crate) token: Token,
 }
 
 /// Outcome of a [`SharedRegistry::deregister`] call.
@@ -364,7 +368,11 @@ impl SharedRegistry {
             .sharded_mio_gen
             .store(gen, Ordering::Relaxed);
         bump(&COUNTERS.sr_register_ok);
-        Ok(RegisterOk { slab_key: key_u32, gen })
+        Ok(RegisterOk {
+            slab_key: key_u32,
+            gen,
+            token,
+        })
     }
 
     /// Deregister `source` (whose fd is `fd`) from this reactor's
