@@ -176,55 +176,6 @@ counters! {
     /// hand-off / blocking-pool transition).
     schedule_remote_no_core,
 
-    // ---- EPOLLEXCLUSIVE fanout (step 2 of fanout rollout) ----
-    /// `fanout_register_peers` entered (one per successful owner-side
-    /// mio register that's about to fan out to peer epoll fds).
-    fanout_register_calls,
-    /// All peer `EPOLL_CTL_ADD` calls succeeded.
-    fanout_register_ok,
-    /// At least one peer `EPOLL_CTL_ADD` failed; rollback ran on the
-    /// already-added peers and the caller will undo the owner-side
-    /// register.
-    fanout_register_errors,
-    /// `fanout_deregister_peers` entered (called from the deregister
-    /// path after the owner's mio deregister returns Applied).
-    fanout_deregister_calls,
-    /// One peer's `EPOLL_CTL_DEL` succeeded.
-    fanout_deregister_ok,
-    /// One peer's `EPOLL_CTL_DEL` returned `EBADF` — the peer's epoll
-    /// fd was closed (runtime shutdown). Ignored.
-    fanout_deregister_ebadf,
-    /// One peer's `EPOLL_CTL_DEL` returned `ENOENT` — the entry was
-    /// already auto-removed by the kernel (fd was closed before we
-    /// got here). Ignored.
-    fanout_deregister_enoent,
-    /// One peer's `EPOLL_CTL_DEL` returned a different error. Ignored
-    /// (deregister is best-effort) but counted for visibility.
-    fanout_deregister_errors,
-
-    /// Owner-side mio register succeeded but the peer fanout failed;
-    /// owner-side mio deregister + slab rollback ran. Tracked
-    /// separately from `register_on_worker_errors` so the failure mode
-    /// is debuggable.
-    register_on_worker_fanout_err,
-
-    // ---- step 3: uniform dispatch routing observability ----
-    /// `Reactor::poll_and_dispatch` reached the routing block before
-    /// the parker installed the driver handle. Should not happen in
-    /// steady state — `ShardedMioParker::new` calls `set_handle`
-    /// before any task can run.
-    dispatch_no_handle,
-    /// Token's `worker_idx` field exceeded the configured worker
-    /// count. Should not happen — `pack_token` debug-asserts the
-    /// upper bound at registration time. If hit, indicates a
-    /// corrupted token (kernel-internal event with a sentinel
-    /// pattern, slab/gen reuse race surfacing as worker_idx mismatch,
-    /// etc.).
-    dispatch_unknown_worker,
-    /// Token resolved to a valid worker index but that worker hasn't
-    /// published its `SharedRegistry` yet. Only possible pre-start-
-    /// barrier; once the runtime is up, every worker has published.
-    dispatch_no_peer_registry,
 }
 
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();

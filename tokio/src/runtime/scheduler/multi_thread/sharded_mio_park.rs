@@ -80,7 +80,7 @@ impl ShardedMioParker {
         // `UringHandle::workers[idx]` before any `add_source` call can
         // arrive, eliminating the startup race that TCP-bind-before-worker
         // setup would otherwise hit.
-        let mut reactor = Reactor::new().expect(
+        let reactor = Reactor::new().expect(
             "failed to construct per-worker mio::Poll Reactor",
         );
         let shared_registry = reactor
@@ -88,13 +88,6 @@ impl ShardedMioParker {
             .expect("failed to clone mio::Registry for sharded-mio worker");
         let external_waker = reactor.external_waker();
         handle.register_worker(idx, shared_registry, external_waker);
-        // Hand the reactor a clone of the driver handle so its
-        // `poll_and_dispatch` can route events by token `worker_idx`
-        // (step 3 of the EPOLLEXCLUSIVE-fanout rollout). Done
-        // immediately after `register_worker` so the handle's
-        // `workers[idx]` slot is already populated for any later
-        // self-routed events.
-        reactor.set_handle(Arc::clone(&handle));
 
         Self {
             idx,

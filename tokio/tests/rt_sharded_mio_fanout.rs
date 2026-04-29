@@ -50,7 +50,15 @@ fn build_rt(workers: usize) -> runtime::Runtime {
 ///
 /// Without fanout, all fds registered on burner-pinned workers
 /// would stall until the burner exited.
+///
+/// **Currently ignored.** The EPOLLEXCLUSIVE-fanout path was reverted
+/// in favor of a meta-epoll + demand-driven steal model that is being
+/// rolled out in subsequent commits. This test is expected to fail
+/// against the bare single-owner registration model (no peer can wake
+/// while the owner burns) and will be re-enabled once the meta-epoll
+/// park mode lands.
 #[test]
+#[ignore = "awaiting meta-epoll readiness-stealing rollout"]
 fn readable_wakes_while_owner_burns() {
     const BURNER_MS: u64 = 500;
     const WAKE_BUDGET_MS: u64 = 100;

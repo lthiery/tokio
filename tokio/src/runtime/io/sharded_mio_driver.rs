@@ -22,26 +22,21 @@
 //! 3. Calls `mio::Registry::register` on the polling worker's own
 //!    `SharedRegistry` — entirely thread-local, lock-free against
 //!    sibling workers.
-//! 4. Fans the registration out to every peer worker's epoll fd via
-//!    raw `epoll_ctl(EPOLL_CTL_ADD, EPOLLEXCLUSIVE | EPOLLET)` so any
-//!    idle worker's `epoll_wait` can pick the event up.
 //!
-//! Under the EPOLLEXCLUSIVE-fanout model, every register/deregister
-//! call is **synchronous on the calling thread**, regardless of which
-//! thread is making the call. `mio::Registry` clones are
-//! `Send + Sync`, so the calling thread can issue `epoll_ctl` against
-//! any worker's epoll fd directly. The "owning worker" concept
-//! survives only on the slab side — the worker that allocates the
-//! `ScheduledIo` slot is also the one that frees it on deregister —
-//! while every dispatch is uniform: `Reactor::poll_and_dispatch`
-//! routes each event by the token's `worker_idx` field to the slab on
-//! that worker's `SharedRegistry`. There is no cross-thread `pending_ops`
-//! queue, no park-time drain, and no readiness stealing.
+//! Under the single-owner registration model, each fd is registered
+//! on exactly one worker's epoll fd; events surface only to that
+//! worker. `mio::Registry` clones are `Send + Sync`, so register and
+//! deregister calls run synchronously on the calling thread (no
+//! cross-thread queue), but they target the owner's child epoll
+//! whoever the caller is. Cross-worker readiness propagation —
+//! readiness stealing under contention, idle-worker wake on owner
+//! burn — is layered on top in subsequent commits via a runtime-wide
+//! meta-epoll and a try-lock peer drain. Until those land, an event
+//! whose owner is mid-burn is not visible to a peer.
 //!
 //! When `register_local` is called from off-runtime (no worker idx in
 //! TLS), it picks a fallback worker for slab ownership via
-//! [`fallback_worker`], then runs the same synchronous fanout-register
-//! path as the on-worker fast path.
+//! [`fallback_worker`].
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -87,11 +82,10 @@ pub(crate) struct WorkerState {
     /// state never contends a global mutex.
     pub(super) registrations: RegistrationSet,
 
-    /// Synced state for [`Self::registrations`]. Mutated only from
-    /// the owning worker's slab insert/remove paths; the underlying
-    /// fanout register/deregister calls reach peer workers' epolls
-    /// directly via cloned `mio::Registry` handles, so this lock is
-    /// only ever taken under the owner's control.
+    /// Synced state for [`Self::registrations`]. Mutated under the
+    /// owning worker's slab insert/remove paths. Cross-thread register
+    /// / deregister calls take it briefly via [`Mutex::lock`] before
+    /// touching the slab.
     pub(super) synced: Mutex<registration_set::Synced>,
 }
 
@@ -120,9 +114,9 @@ impl std::fmt::Debug for WorkerState {
 /// and per-worker [`RegistrationSet`]s. There is no global registration
 /// set — each shard owns its own, eliminating a single-mutex
 /// serialization point under TCP connect churn. There is also no
-/// cross-thread `pending_ops` queue: every register/deregister call
-/// runs synchronously on the calling thread under the
-/// EPOLLEXCLUSIVE-fanout model.
+/// cross-thread `pending_ops` queue: register/deregister calls run
+/// synchronously on the calling thread, targeting the owner worker's
+/// child epoll directly via the cloneable `mio::Registry`.
 ///
 /// [uh]: super::uring_driver::UringHandle
 pub(crate) struct ShardedMioHandle {
@@ -170,11 +164,14 @@ impl ShardedMioHandle {
         self.workers.len()
     }
 
-    /// Per-worker state slice. Exposed for `Reactor::poll_and_dispatch`
-    /// (step 3 of the EPOLLEXCLUSIVE-fanout rollout) to look up the
-    /// owning worker's `SharedRegistry` from the unpacked token's
-    /// `worker_idx` field. Not part of the public `IoDriverHandle`
-    /// surface — strictly internal to the sharded-mio backend.
+    /// Per-worker state slice. Reserved for the upcoming meta-epoll
+    /// integration: a parker idle on the meta-epoll will need to
+    /// resolve a wake notification (which carries the firing child
+    /// epoll's worker idx) back to that worker's `SharedRegistry` to
+    /// run the steal-drain pass. Not part of the public
+    /// `IoDriverHandle` surface — strictly internal to the
+    /// sharded-mio backend.
+    #[allow(dead_code)]
     pub(crate) fn workers(&self) -> &[WorkerState] {
         &self.workers
     }
@@ -284,24 +281,22 @@ impl ShardedMioHandle {
     /// [`Registration::ensure_registered`][reg-er] on the first poll
     /// of a registration.
     ///
-    /// Synchronous on any thread. Under the EPOLLEXCLUSIVE-fanout
-    /// model every register call must hit every worker's epoll fd, so
-    /// there is no value in queuing the off-worker case onto a target
-    /// worker — `mio::Registry` clones are `Send + Sync`, so the
-    /// calling thread can drive both the owner-side mio register and
-    /// the peer-side raw `epoll_ctl` calls directly. The only
-    /// per-shard decision is which worker owns the slab entry:
+    /// Synchronous on any thread. `mio::Registry` clones are
+    /// `Send + Sync`, so the calling thread can drive the owner-side
+    /// mio register directly without bouncing through the owner's
+    /// park loop. The single per-shard decision is which worker owns
+    /// the slab entry:
     ///
     /// * **On a worker:** the calling worker is the owner, picked via
     ///   [`current_worker_index`][cwi]. This is the common path —
     ///   `from_std` / `TcpListener::accept` on a worker triggers first
-    ///   poll on that same worker.
+    ///   poll on that same worker, which keeps cache-warm dispatch
+    ///   on the same core.
     /// * **Off-runtime:** [`fallback_worker`] picks an owner via
-    ///   round-robin. Same fanout work as the on-worker path; only
-    ///   the slab-owner identity differs.
+    ///   round-robin.
     ///
-    /// **Throughput note.** The synchronous fast path concentrates
-    /// fds on whichever worker happens to call `from_std`. In
+    /// **Throughput note.** The fast path concentrates fds on
+    /// whichever worker happens to call `from_std`. In
     /// `tcp_connect_churn` (single accept-loop worker, many
     /// short-lived connections) this regresses throughput because
     /// the accepting worker becomes a single dispatch hot spot.
@@ -340,179 +335,8 @@ impl ShardedMioHandle {
             }
         }
 
-        // Off-runtime path: pick a fallback owner round-robin. The
-        // fanout fan-out portion runs synchronously on the calling
-        // thread (no cross-thread queue) just like the on-worker case.
+        // Off-runtime path: pick a fallback owner round-robin.
         self.register_on_worker(self.fallback_worker(), shared, fd, interest)
-    }
-
-    /// Fan out a freshly-registered fd to every peer worker's epoll
-    /// fd via raw `libc::epoll_ctl(EPOLL_CTL_ADD)` with
-    /// `EPOLLEXCLUSIVE | EPOLLET | <interest_bits>`. The owner's
-    /// epoll already received the registration through mio's
-    /// `Registry::register`; this method only touches peers.
-    ///
-    /// Step 2 of the EPOLLEXCLUSIVE-fanout rollout: the helper is
-    /// wired in but `Reactor::poll_and_dispatch` does not yet route
-    /// peer-delivered events back to the owner's slab via the token's
-    /// `worker_idx` field, so peer dispatch falls through as a slab
-    /// miss for now. Step 3 closes that loop.
-    ///
-    /// `EPOLLEXCLUSIVE` (Linux 4.5+) instructs the kernel to wake at
-    /// most one of the threads currently blocked in `epoll_wait` on
-    /// epolls containing this fd's interest record with the flag set,
-    /// across the whole fanout set. Combined with `EPOLLET`, that
-    /// gives one wake per state-change with no thundering-herd.
-    ///
-    /// On any peer's `EPOLL_CTL_ADD` failure, we roll back the peers
-    /// we already added (best-effort `EPOLL_CTL_DEL`) and surface the
-    /// error to the caller, which is responsible for undoing the
-    /// owner-side mio register and slab insert.
-    #[cfg(target_os = "linux")]
-    fn fanout_register_peers(
-        &self,
-        owner_idx: usize,
-        fd: RawFd,
-        interest: Interest,
-        token: mio::Token,
-    ) -> io::Result<()> {
-        use super::lazy_debug::{bump, COUNTERS};
-        bump(&COUNTERS.fanout_register_calls);
-
-        // `EPOLLEXCLUSIVE` is the kernel's exact-once wake selector
-        // across the fanout set. Per epoll_ctl(2), it is compatible
-        // *only* with `EPOLLIN | EPOLLOUT | EPOLLWAKEUP | EPOLLET`;
-        // adding `EPOLLRDHUP` or `EPOLLPRI` (which mio normally
-        // requests on the owner-side register) would yield `EINVAL`.
-        // The owner's own mio register still carries those bits, so
-        // half-close / priority signals still reach user code via the
-        // owner; peer-delivered events surface only the IN/OUT bits.
-        let mio_int = interest.to_mio();
-        let mut events: u32 = libc::EPOLLET as u32 | libc::EPOLLEXCLUSIVE as u32;
-        if mio_int.is_readable() {
-            events |= libc::EPOLLIN as u32;
-        }
-        if mio_int.is_writable() {
-            events |= libc::EPOLLOUT as u32;
-        }
-
-        // Track which peer indices we successfully added so a partial
-        // failure can be cleanly rolled back. `MAX_WORKERS` is bounded
-        // by `lazy_debug::MAX_WORKERS = 16`, so a `u32` bitmask covers
-        // every peer index without allocating.
-        let mut added_mask: u32 = 0;
-
-        for (i, slot) in self.workers.iter().enumerate() {
-            if i == owner_idx {
-                continue;
-            }
-            let peer_registry = match slot.shared_registry.get() {
-                Some(r) => r,
-                // Peer hasn't published its registry yet (early
-                // startup, before its own `register_worker` call).
-                // Skip — once it publishes, only fds registered after
-                // that point will fan out to it. Pre-publish fds are
-                // an acceptable best-effort gap because the start
-                // barrier already guarantees publication completes
-                // before any task runs.
-                None => continue,
-            };
-            let peer_epfd = peer_registry.epoll_fd();
-            let mut ev = libc::epoll_event {
-                events,
-                u64: token.0 as u64,
-            };
-            // SAFETY: `peer_epfd` is owned by the peer's
-            // `SharedRegistry` (via `mio::Registry::try_clone`) and
-            // remains live until runtime shutdown, which is gated by
-            // `Drop` on `ShardedMioHandle`. `fd` is the just-
-            // registered source's raw fd. `&mut ev` is a fresh stack
-            // value the kernel reads but does not retain.
-            let ret = unsafe {
-                libc::epoll_ctl(peer_epfd, libc::EPOLL_CTL_ADD, fd, &mut ev)
-            };
-            if ret == 0 {
-                added_mask |= 1u32 << i;
-                continue;
-            }
-            let err = io::Error::last_os_error();
-            bump(&COUNTERS.fanout_register_errors);
-
-            // Roll back the peer adds we already committed. Each
-            // `EPOLL_CTL_DEL` is best-effort: if the peer's epoll fd
-            // closed mid-fanout we just continue. The owner-side
-            // rollback (mio deregister + slab drop) is the caller's
-            // responsibility.
-            for (j, slot_j) in self.workers.iter().enumerate() {
-                if added_mask & (1u32 << j) == 0 {
-                    continue;
-                }
-                if let Some(reg_j) = slot_j.shared_registry.get() {
-                    // SAFETY: same lifetime argument as the ADD above.
-                    unsafe {
-                        let _ = libc::epoll_ctl(
-                            reg_j.epoll_fd(),
-                            libc::EPOLL_CTL_DEL,
-                            fd,
-                            std::ptr::null_mut(),
-                        );
-                    }
-                }
-            }
-            return Err(err);
-        }
-
-        bump(&COUNTERS.fanout_register_ok);
-        Ok(())
-    }
-
-    /// Remove `fd` from every peer worker's epoll fd. Mirrors
-    /// `fanout_register_peers` for the deregister path. Best-effort:
-    /// `EBADF` (peer epoll closed during shutdown) and `ENOENT`
-    /// (kernel auto-removed the entry when `fd` was closed) are
-    /// counted and ignored.
-    ///
-    /// Caller must have already detected — via the owner's
-    /// `DeregisterOutcome::Applied` return — that the kernel-side
-    /// epoll record on the owner still belongs to this registration
-    /// (i.e. the fd was not recycled). Skipping the peer fanout when
-    /// the owner skipped is what protects a fresh registration on a
-    /// recycled fd from being clobbered through one of the peer
-    /// epolls.
-    #[cfg(target_os = "linux")]
-    fn fanout_deregister_peers(&self, owner_idx: usize, fd: RawFd) {
-        use super::lazy_debug::{bump, COUNTERS};
-        bump(&COUNTERS.fanout_deregister_calls);
-        for (i, slot) in self.workers.iter().enumerate() {
-            if i == owner_idx {
-                continue;
-            }
-            let peer_registry = match slot.shared_registry.get() {
-                Some(r) => r,
-                None => continue,
-            };
-            // SAFETY: peer epoll fd lifetime extends to runtime
-            // shutdown; null `event` pointer is permitted on
-            // `EPOLL_CTL_DEL` since Linux 2.6.9 (we're far above that
-            // floor — sharded-mio is gated to Linux generally).
-            let ret = unsafe {
-                libc::epoll_ctl(
-                    peer_registry.epoll_fd(),
-                    libc::EPOLL_CTL_DEL,
-                    fd,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ret == 0 {
-                bump(&COUNTERS.fanout_deregister_ok);
-                continue;
-            }
-            match io::Error::last_os_error().raw_os_error() {
-                Some(libc::EBADF) => bump(&COUNTERS.fanout_deregister_ebadf),
-                Some(libc::ENOENT) => bump(&COUNTERS.fanout_deregister_enoent),
-                _ => bump(&COUNTERS.fanout_deregister_errors),
-            }
-        }
     }
 
     /// Same-worker sync register. Mutates the owning worker's
@@ -594,30 +418,6 @@ impl ShardedMioHandle {
             }
         };
 
-        // Owner-side mio register succeeded. Fan the registration out
-        // to peer workers' epoll fds via raw `epoll_ctl(EPOLL_CTL_ADD,
-        // EPOLLEXCLUSIVE | EPOLLET | <interest>)`. On any peer
-        // failure, `fanout_register_peers` rolls back the peer adds
-        // it already committed; we additionally undo the owner-side
-        // mio register and the per-shard set insert here.
-        #[cfg(target_os = "linux")]
-        {
-            if let Err(e) =
-                self.fanout_register_peers(worker_idx, fd, interest, ok.token)
-            {
-                bump(&COUNTERS.register_on_worker_fanout_err);
-                let mut undo_source = mio::unix::SourceFd(&fd);
-                let _ = registry.deregister(&mut undo_source, fd, ok.slab_key, ok.gen);
-                // SAFETY: just inserted by `allocate_existing` above.
-                unsafe {
-                    slot.registrations
-                        .remove(&mut slot.synced.lock(), shared);
-                }
-                shared.shutdown();
-                return Err(e);
-            }
-        }
-
         bump(&COUNTERS.register_on_worker_ok);
         super::lazy_debug::bump_per_worker(
             &super::lazy_debug::PER_WORKER.register_per_worker,
@@ -637,14 +437,12 @@ impl ShardedMioHandle {
     /// Synchronously deregister `shared` from the sharded-mio reactor.
     ///
     /// Despite the historical "queue_" name, this call applies the
-    /// deregistration directly on the calling thread under the
-    /// EPOLLEXCLUSIVE-fanout model: `mio::Registry` clones are
-    /// `Send + Sync`, so there is no need to bounce through the owning
-    /// worker's park loop. The owner identity (loaded from
-    /// `shared.sharded_mio_worker`) is used only to identify which
-    /// shard's slab the entry lives in. The owner's mio deregister
-    /// runs first; on a successful (`Applied`) outcome the fanout
-    /// `EPOLL_CTL_DEL` is mirrored to every peer worker's epoll fd.
+    /// deregistration directly on the calling thread:
+    /// `mio::Registry` clones are `Send + Sync`, so there is no need
+    /// to bounce through the owning worker's park loop. The owner
+    /// identity (loaded from `shared.sharded_mio_worker`) identifies
+    /// which shard's slab the entry lives in and which worker's child
+    /// epoll holds the kernel-side registration.
     ///
     /// `fd` must be the same fd that was passed to
     /// [`Self::register_local`]; the caller (typically
@@ -677,15 +475,6 @@ impl ShardedMioHandle {
                 match registry.deregister(&mut source, fd, slab_key, gen) {
                     DeregisterOutcome::Applied => {
                         self.metrics.dec_fd_count();
-                        // The owner-side epoll record was ours to
-                        // remove; mirror that on every peer worker's
-                        // epoll fd via the fanout-deregister helper.
-                        // Done only on `Applied` so that an fd-reuse
-                        // race (peer epoll entry now belongs to the
-                        // recycled fd's fresh registration) doesn't
-                        // clobber the new owner.
-                        #[cfg(target_os = "linux")]
-                        self.fanout_deregister_peers(worker_idx, fd);
                     }
                     DeregisterOutcome::SkippedFdReused
                     | DeregisterOutcome::SkippedSlotReassigned => {

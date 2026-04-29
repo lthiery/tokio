@@ -31,14 +31,13 @@ use crate::io::{Interest, Ready};
 use crate::loom::sync::Arc;
 use crate::runtime::io::driver::Tick;
 use crate::runtime::io::registration::RegistrationSource;
-use crate::runtime::io::sharded_mio_driver::ShardedMioHandle;
 use crate::runtime::io::ScheduledIo;
 
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::Ordering;
-use std::sync::RwLock as StdRwLock;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 /// Reserved token for the per-worker `mio::Waker`. Events arriving with
@@ -67,11 +66,12 @@ const TOKEN_KEY_MASK: u32 = (1 << TOKEN_KEY_BITS) - 1;
 ///        32 bits             28 bits           4 bits
 /// ```
 ///
-/// `wrkr` is the registering worker's index, used after the
-/// EPOLLEXCLUSIVE-fanout step to route a peer-delivered event back to
-/// the slab that owns its `ScheduledIo`. Until that step lands `wrkr`
-/// is informational — every dispatch already runs on the registering
-/// worker.
+/// `wrkr` is the registering worker's index. In the current
+/// single-owner registration model every event is delivered to the
+/// owner's epoll fd, so `wrkr` is informational — but it is preserved
+/// in the layout because the upcoming meta-epoll readiness-stealing
+/// path will use it to route an event observed via a *peer's* drain
+/// pass back to the right slab.
 ///
 /// `WAKER_TOKEN` (`usize::MAX`) decodes to (`wrkr=0xF`, `key=0xFFFFFFF`,
 /// `gen=0xFFFFFFFF`); a real registration would need worker idx 15
@@ -113,14 +113,13 @@ const EVENTS_CAPACITY: usize = 1024;
 /// State shared between [`Reactor`] (dispatch) and [`SharedRegistry`]
 /// (cross-thread register/deregister).
 ///
-/// All three fields live behind one [`std::sync::RwLock`]: dispatch is
-/// read-mostly (slab `get` + gens index, with the actual readiness
-/// store/wake on the [`ScheduledIo`] handled by atomic ops outside the
-/// lock), while register/deregister/drop_slab_entry mutate the slab
-/// structure and so take the write lock. Under EPOLLEXCLUSIVE-fanout
-/// any peer worker may dispatch events for any owner, so multiple
-/// readers (one per dispatching worker) need to make progress in
-/// parallel — `RwLock` is the right shape over a `Mutex` here.
+/// All three fields live behind one [`std::sync::Mutex`]. Under the
+/// single-owner registration model only one party touches a given
+/// worker's `OpsState` at a time in the steady state — the owner
+/// thread during dispatch — so the lock is uncontended on the hot
+/// path. Cross-thread `register` / `deregister` from peers and the
+/// future demand-driven peer-steal path will use `try_lock` to skip
+/// rather than block when the owner is mid-dispatch.
 pub(crate) struct OpsState {
     /// Live `Arc<ScheduledIo>` per slab key. Vacant slots indicate a
     /// previously-registered entry has been deregistered.
@@ -150,40 +149,25 @@ pub(crate) struct OpsState {
 /// Per-worker `mio::Poll` reactor.
 ///
 /// Owns the [`Poll`] instance and an `Events` scratch buffer. The slab
-/// of live registrations lives behind an [`Arc<StdRwLock<_>>`]: under
-/// EPOLLEXCLUSIVE-fanout, every dispatching worker may need to look up
-/// keys in any owner's slab, so the read path must scale with
-/// dispatcher count. Register/deregister take the write lock and serialise
-/// against each other and against in-flight dispatches; both are
-/// per-fd-lifecycle (rare) so writer churn does not gate the hot path.
+/// of live registrations lives behind an [`Arc<StdMutex<_>>`]; the
+/// owner worker takes the lock during dispatch and the peer paths
+/// (cross-thread register/deregister, future steal-drain) take it via
+/// `lock` / `try_lock`. Single-owner registration means each event is
+/// delivered to exactly one worker's epoll fd, so the dispatch path
+/// does not need read-side parallelism across slabs.
 pub(crate) struct Reactor {
     poll: Poll,
     events: Events,
 
     /// Per-worker registration state — slab + per-slot gens + live-fd
     /// map. See [`OpsState`].
-    ops: Arc<StdRwLock<OpsState>>,
+    ops: Arc<StdMutex<OpsState>>,
 
     /// Cross-thread waker, cloneable via [`Self::external_waker`] and
     /// via [`SharedRegistry`]. Mio collapses both the "external thread"
     /// and "peer worker" wake paths into one [`Waker`] — unlike the
     /// uring reactor which splits them into eventfd vs. `MSG_RING`.
     waker: Arc<Waker>,
-
-    /// Driver handle, installed by [`ShardedMioParker::new`] after the
-    /// owning worker's `SharedRegistry` is published. Used by the
-    /// unified dispatch path in [`Self::poll_and_dispatch`] to route
-    /// each event to the slab indicated by the token's `worker_idx`
-    /// field. Pre-fanout (step 1/2) `poll_and_dispatch` looked up
-    /// tokens in `self.ops` only; step 3 routes via this handle so
-    /// peer-delivered EPOLLEXCLUSIVE events resolve to the right slab.
-    ///
-    /// `Option` only because the field is set post-construction (the
-    /// handle holds the reactor's `SharedRegistry` clone, so we must
-    /// finish constructing the reactor before the handle has any way
-    /// to refer back). After [`Self::set_handle`] runs, the slot is
-    /// permanently `Some` for the lifetime of this reactor.
-    handle: Option<Arc<ShardedMioHandle>>,
 }
 
 /// Cross-thread wake handle. Analogous to
@@ -226,7 +210,7 @@ pub(crate) struct SharedRegistry {
     /// holding the `ScheduledIo`.
     worker_idx: u8,
     registry: Registry,
-    ops: Arc<StdRwLock<OpsState>>,
+    ops: Arc<StdMutex<OpsState>>,
     waker: Arc<Waker>,
 }
 
@@ -301,7 +285,7 @@ impl SharedRegistry {
             bump(&COUNTERS.sr_register_writable_interest);
         }
         let (key_u32, gen) = {
-            let mut state = self.ops.write().expect("sharded-mio ops poisoned");
+            let mut state = self.ops.lock().expect("sharded-mio ops poisoned");
             let key = state.slab.insert(Arc::clone(scheduled_io));
             let key_u32 = u32::try_from(key).expect("slab key exceeds u32");
             // Lazily grow gens to cover this slot. Persistent across
@@ -328,7 +312,7 @@ impl SharedRegistry {
         let token = pack_token(self.worker_idx, key_u32, gen);
         if let Err(e) = self.registry.register(source, token, interest.to_mio()) {
             bump(&COUNTERS.sr_register_err);
-            let mut state = self.ops.write().expect("sharded-mio ops poisoned");
+            let mut state = self.ops.lock().expect("sharded-mio ops poisoned");
             let _ = state.slab.try_remove(key_u32 as usize);
             // Roll back live_fds only if it still matches us (a racing
             // register from another thread shouldn't be undone).
@@ -371,7 +355,7 @@ impl SharedRegistry {
         if slab_key == u32::MAX {
             return DeregisterOutcome::Applied;
         }
-        let mut state = self.ops.write().expect("sharded-mio ops poisoned");
+        let mut state = self.ops.lock().expect("sharded-mio ops poisoned");
 
         // Per-fd ownership check: if the kernel-side epoll record for
         // this fd belongs to someone else now (different slab key),
@@ -404,73 +388,14 @@ impl SharedRegistry {
     /// lifetime of `self` (the inner `mio::Registry` keeps the fd open
     /// via dup; closed when this `SharedRegistry` drops).
     ///
-    /// Used by the EPOLLEXCLUSIVE-fanout register/deregister helpers
-    /// in `sharded_mio_driver.rs`: registration adds the fd to every
-    /// peer's epoll fd via raw `libc::epoll_ctl(EPOLL_CTL_ADD,
-    /// EPOLLEXCLUSIVE | EPOLLET | <interest>)`, and deregistration
-    /// mirrors the `EPOLL_CTL_DEL` to each peer. mio's
-    /// `Registry::register` doesn't expose `EPOLLEXCLUSIVE`, so the
-    /// fanout path bypasses mio for the peer-side `epoll_ctl` calls
-    /// while keeping the owner-side register on mio.
+    /// Reserved for the upcoming meta-epoll integration: each worker's
+    /// child epoll fd is registered onto a runtime-wide meta-epoll so
+    /// idle workers can park on the meta and wake on any sibling's
+    /// readiness. Currently unused — kept as the integration hook.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub(crate) fn epoll_fd(&self) -> RawFd {
         self.registry.as_raw_fd()
-    }
-
-    /// Walk `events` once, dispatching each event whose token's
-    /// `worker_idx` matches `owner_idx` against this registry's slab.
-    /// Returns the number of events that resolved to a live
-    /// `ScheduledIo` and fired its waker.
-    ///
-    /// Used by the unified dispatch path in
-    /// [`Reactor::poll_and_dispatch`]: each receiving worker calls
-    /// `dispatch_batch` once per owner present in its `epoll_wait`
-    /// batch, taking that owner's read lock once and processing the
-    /// matching subset under it. This collapses what was previously a
-    /// per-event lock acquire into one per-owner-per-batch acquire —
-    /// the natural lock granularity once peer-delivered events became
-    /// the norm under EPOLLEXCLUSIVE fanout.
-    ///
-    /// Reader-side critical section: `slab.get` + gen check are reads;
-    /// `set_readiness` and `wake` mutate the [`ScheduledIo`] but are
-    /// independently atomic and not protected by `ops`. So multiple
-    /// dispatchers (peer workers) can hold their respective owners'
-    /// read locks in parallel without serialising; only register and
-    /// deregister (write lock) serialise against in-flight dispatches.
-    pub(crate) fn dispatch_batch(&self, events: &Events, owner_idx: u8) -> usize {
-        use super::lazy_debug::{bump, COUNTERS};
-        let state = self.ops.read().expect("sharded-mio ops poisoned");
-        let mut woken = 0usize;
-        for event in events.iter() {
-            let token = event.token();
-            if token == WAKER_TOKEN {
-                continue;
-            }
-            let (w, key, gen) = unpack_token(token);
-            if w != owner_idx {
-                continue;
-            }
-            let Some(io) = state.slab.get(key as usize) else {
-                bump(&COUNTERS.dispatch_slab_miss);
-                continue;
-            };
-            if io.sharded_mio_gen.load(Ordering::Relaxed) != gen {
-                bump(&COUNTERS.dispatch_gen_mismatch);
-                continue;
-            }
-            let ready = Ready::from_mio(event);
-            bump(&COUNTERS.dispatch_woken);
-            if ready.is_readable() {
-                bump(&COUNTERS.dispatch_woken_readable);
-            }
-            if ready.is_writable() {
-                bump(&COUNTERS.dispatch_woken_writable);
-            }
-            io.set_readiness(Tick::Set, |curr| curr | ready);
-            io.wake(ready);
-            woken += 1;
-        }
-        woken
     }
 
     /// Drop the slab entry identified by `(slab_key, gen)` without
@@ -484,7 +409,7 @@ impl SharedRegistry {
         if slab_key == u32::MAX {
             return;
         }
-        let mut state = self.ops.write().expect("sharded-mio ops poisoned");
+        let mut state = self.ops.lock().expect("sharded-mio ops poisoned");
         let cur_gen = state.gens.get(slab_key as usize).copied().unwrap_or(0);
         if cur_gen == gen {
             let _ = state.slab.try_remove(slab_key as usize);
@@ -504,26 +429,13 @@ impl Reactor {
         Ok(Self {
             poll,
             events: Events::with_capacity(EVENTS_CAPACITY),
-            ops: Arc::new(StdRwLock::new(OpsState {
+            ops: Arc::new(StdMutex::new(OpsState {
                 slab: Slab::new(),
                 gens: Vec::new(),
                 live_fds: HashMap::new(),
             })),
             waker,
-            handle: None,
         })
-    }
-
-    /// Install the driver handle so [`Self::poll_and_dispatch`] can
-    /// route events to peer workers' slabs via the token's
-    /// `worker_idx` field. Called once per worker, immediately after
-    /// the parker hands its `SharedRegistry` to
-    /// [`ShardedMioHandle::register_worker`].
-    ///
-    /// Idempotent against re-installation, but the parker only ever
-    /// calls this once.
-    pub(crate) fn set_handle(&mut self, handle: Arc<ShardedMioHandle>) {
-        self.handle = Some(handle);
     }
 
     /// Clone out a cross-thread [`SharedRegistry`]. `mio::Registry` is
@@ -604,91 +516,54 @@ impl Reactor {
             return Ok(());
         }
 
-        // Filter-walk by owner under EPOLLEXCLUSIVE-fanout: the kernel
-        // may have delivered events for any subset of owners into this
-        // single `epoll_wait` batch (LIFO across the exclusive set, so
-        // typically the receiving worker is *not* the owner). One pass
-        // pre-counts events per owner using a stack-only `[u16;
-        // MAX_WORKERS]`; then for each non-empty bucket we invoke
-        // `dispatch_batch` once, which acquires that owner's read lock
-        // once and processes its matching subset.
-        //
-        // This is two compounding wins over the per-event acquire:
-        //   * lock churn drops from O(events) to O(owners-with-events),
-        //     bounded by `num_workers`;
-        //   * the lock is now `RwLock` rather than `Mutex`, so peer
-        //     dispatchers running against different owners' slabs
-        //     (always the case under fanout) and against the same
-        //     owner's slab (LIFO clumping) all run in parallel as
-        //     readers.
-        let Some(handle) = self.handle.as_ref() else {
-            // Reactor was constructed but `set_handle` hasn't yet been
-            // called by the parker. Should be unreachable in steady
-            // state — `ShardedMioParker::new` runs `set_handle`
-            // immediately after `register_worker`, before any task can
-            // invoke the reactor's park path.
-            bump(&COUNTERS.dispatch_no_handle);
-            return Ok(());
-        };
-        let workers = handle.workers();
-        let num_workers = workers.len();
-
-        let mut per_worker_counts =
-            [0u16; super::lazy_debug::MAX_WORKERS];
+        // Single-owner dispatch: every event was delivered against
+        // *this* worker's epoll fd because each fd is registered on
+        // exactly one worker. Look up each token's slab key in our own
+        // `OpsState`, holding the lock once across the whole batch.
+        // The token's `worker_idx` is informational here and is only
+        // sanity-checked against our own index in debug builds.
+        let mut woken_total = 0usize;
         let mut waker_token_count = 0u64;
-        let mut unknown_worker_count = 0u64;
+        let state = self.ops.lock().expect("sharded-mio ops poisoned");
         for event in events.iter() {
             let token = event.token();
             if token == WAKER_TOKEN {
                 waker_token_count += 1;
                 continue;
             }
-            let (worker_idx, _key, _gen) = unpack_token(token);
-            let widx = worker_idx as usize;
-            if widx >= num_workers {
-                unknown_worker_count += 1;
+            let (_w, key, gen) = unpack_token(token);
+            let Some(io) = state.slab.get(key as usize) else {
+                bump(&COUNTERS.dispatch_slab_miss);
+                continue;
+            };
+            if io.sharded_mio_gen.load(Ordering::Relaxed) != gen {
+                bump(&COUNTERS.dispatch_gen_mismatch);
                 continue;
             }
-            // Saturating in case an unrealistic 65k+ events for one
-            // owner show up in a single batch — `EVENTS_CAPACITY` is
-            // 1024 today so this is purely defensive.
-            per_worker_counts[widx] = per_worker_counts[widx].saturating_add(1);
+            let ready = Ready::from_mio(event);
+            bump(&COUNTERS.dispatch_woken);
+            if ready.is_readable() {
+                bump(&COUNTERS.dispatch_woken_readable);
+            }
+            if ready.is_writable() {
+                bump(&COUNTERS.dispatch_woken_writable);
+            }
+            io.set_readiness(Tick::Set, |curr| curr | ready);
+            io.wake(ready);
+            woken_total += 1;
         }
+        drop(state);
         if waker_token_count > 0 {
             COUNTERS
                 .dispatch_waker_token
                 .fetch_add(waker_token_count, Ordering::Relaxed);
         }
-        if unknown_worker_count > 0 {
-            COUNTERS
-                .dispatch_unknown_worker
-                .fetch_add(unknown_worker_count, Ordering::Relaxed);
-        }
-
-        for worker_idx in 0..num_workers {
-            if per_worker_counts[worker_idx] == 0 {
-                continue;
-            }
-            let slot = &workers[worker_idx];
-            let Some(reg) = slot.shared_registry.get() else {
-                // Peer worker hasn't published its `SharedRegistry`
-                // yet — possible only during startup, before the start
-                // barrier opens. Shouldn't be reached in steady state.
-                bump(&COUNTERS.dispatch_no_peer_registry);
-                continue;
-            };
-            let woken = reg.dispatch_batch(events, worker_idx as u8);
-            if woken > 0 {
-                if let Some(idx) = self_idx {
-                    // Attribute dispatched events to the *receiving*
-                    // worker (us), not the slab's owning worker — this
-                    // is the work-allocation question: which worker's
-                    // CPU did the dispatch run on?
-                    super::lazy_debug::PER_WORKER
-                        .dispatch_woken
-                        .get(idx)
-                        .map(|c| c.fetch_add(woken as u64, Ordering::Relaxed));
-                }
+        if woken_total > 0 {
+            if let Some(idx) = self_idx {
+                super::lazy_debug::PER_WORKER
+                    .dispatch_woken
+                    .get(idx)
+                    .map(|c| c.fetch_add(woken_total as u64, Ordering::Relaxed));
             }
         }
         Ok(())
