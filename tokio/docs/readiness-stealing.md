@@ -1,5 +1,16 @@
 # Readiness stealing for sharded-mio
 
+> **Superseded by [`readiness-stealing-fanout.md`](./readiness-stealing-fanout.md)**
+> (April 2026). The phased plan below shipped P1 on
+> `worktree-io-driver-vtable`, but P1 does not meet its own bench
+> gate (`busy_owner_3burners` was supposed to drop from 45.6 ms to
+> < 1 ms; it sits at ~44 ms). Root cause documented in
+> [`readiness-stealing-HANDOFF.md`](./readiness-stealing-HANDOFF.md)
+> sessions 6–7: the steal pass runs only at park entry, so events
+> arriving on a peer's epoll fd after a worker is parked never reach
+> it. The fanout design replaces user-space stealing with kernel-
+> side `EPOLLEXCLUSIVE` load balancing. P2/P3/P4 below are obsolete.
+
 ## Motivation
 
 The sharded-mio backend gives each multi-thread worker its own

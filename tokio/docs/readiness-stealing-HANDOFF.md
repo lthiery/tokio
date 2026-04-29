@@ -776,3 +776,47 @@ not fixing, the gap.
 The per-worker lazy_debug counters (Session 7) stay in tree.
 They have no runtime cost when `TOKIO_LAZY_DEBUG` is unset and
 will be needed again when P2 begins. Marking P1 done.
+
+---
+
+## Session 8 — reassessment, EPOLLEXCLUSIVE spike, supersession
+
+**Reassessment.** Re-reading the umbrella docs (`io-driver-vtable.md`,
+`readiness-stealing.md`, `plan-history/uring-reactor-design.md`)
+made it clear that the original sharded-mio motivation — *less
+contention than one global driver, correct under all loads* — is
+real and reachable, but the P1 readiness-stealing design as
+shipped does not deliver it. The doc's own bench gate
+(`busy_owner_3burners` < 1 ms) was never met. P1 was, in effect,
+correctness-only: the steal pass adds a syscall on idle paths but
+does nothing for the bench it was designed to fix, because the
+steal-pass call site (pre-park, once) cannot observe events that
+arrive on peer epolls *after* a worker has parked.
+
+**Spike.** A standalone Rust program (`/tmp/epoll_exclusive_spike.rs`)
+verifies the kernel mechanic that the alternative design relies
+on. Three findings on Linux 6.17:
+
+1. One fd registered on N epolls with `EPOLLEXCLUSIVE | EPOLLET`
+   delivers each edge to exactly one waiter. 100 events fired,
+   100 wakes total, 0 double-fires.
+2. A spin-busy worker holding such an epoll receives zero events
+   when peers are in `epoll_wait`. The kernel only wakes
+   currently-blocked waiters.
+3. Busy-owner shape (3 of 4 workers spin-burning, kicker fires):
+   58 µs kick→wake, vs. 47 900 µs in today's sharded-mio.
+
+**Direction.** The architectural fix is `EPOLLEXCLUSIVE` fanout:
+register every fd on every worker's epoll fd, with the kernel
+choosing the wake target. This dissolves the "owner traps events
+when busy" failure mode and removes the need for user-space
+stealing entirely. New design doc:
+[`readiness-stealing-fanout.md`](./readiness-stealing-fanout.md).
+
+**Status of P1 work on this branch.** The instrumentation commits
+(`b5f9d074` per-worker counters, `2ae25e1c` Session 7 doc,
+`2eb3f75f` P1 closeout) stay. The fanout work proceeds in the
+sequencing laid out in the new doc: token re-pack → fanout
+register/deregister → uniform dispatch → delete steal infra.
+P2/P3/P4 from the original phased rollout are obsolete (steal
+infrastructure goes away in step 4 of fanout).
