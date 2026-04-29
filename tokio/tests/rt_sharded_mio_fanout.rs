@@ -48,17 +48,14 @@ fn build_rt(workers: usize) -> runtime::Runtime {
 /// return within 100 ms — well under the 500 ms burner deadline,
 /// proving the wake reached an idle worker via the fanout epoll.
 ///
-/// Without fanout, all fds registered on burner-pinned workers
-/// would stall until the burner exited.
-///
-/// **Currently ignored.** The EPOLLEXCLUSIVE-fanout path was reverted
-/// in favor of a meta-epoll + demand-driven steal model that is being
-/// rolled out in subsequent commits. This test is expected to fail
-/// against the bare single-owner registration model (no peer can wake
-/// while the owner burns) and will be re-enabled once the meta-epoll
-/// park mode lands.
+/// Without the meta-epoll readiness-stealing path, all fds registered
+/// on burner-pinned workers would stall until the burner exited. With
+/// it, the idle worker(s) parked on the runtime-wide meta epoll observe
+/// the owner's child as fireable (level-triggered) and `try_steal_drain`
+/// dispatches the queued event on the owner's behalf — gated on the
+/// owner being in `EMPTY` park state (i.e. running user code, not
+/// parked) so the peer can never swallow the owner's WAKER eventfd.
 #[test]
-#[ignore = "awaiting meta-epoll readiness-stealing rollout"]
 fn readable_wakes_while_owner_burns() {
     const BURNER_MS: u64 = 500;
     const WAKE_BUDGET_MS: u64 = 100;
