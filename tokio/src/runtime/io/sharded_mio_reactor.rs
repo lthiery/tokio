@@ -31,6 +31,7 @@ use crate::io::{Interest, Ready};
 use crate::loom::sync::Arc;
 use crate::runtime::io::driver::Tick;
 use crate::runtime::io::registration::RegistrationSource;
+use crate::runtime::io::sharded_mio_driver::ShardedMioHandle;
 use crate::runtime::io::ScheduledIo;
 
 use std::collections::HashMap;
@@ -208,6 +209,21 @@ pub(crate) struct Reactor {
     /// and "peer worker" wake paths into one [`Waker`] — unlike the
     /// uring reactor which splits them into eventfd vs. `MSG_RING`.
     waker: Arc<Waker>,
+
+    /// Driver handle, installed by [`ShardedMioParker::new`] after the
+    /// owning worker's `SharedRegistry` is published. Used by the
+    /// unified dispatch path in [`Self::poll_and_dispatch`] to route
+    /// each event to the slab indicated by the token's `worker_idx`
+    /// field. Pre-fanout (step 1/2) `poll_and_dispatch` looked up
+    /// tokens in `self.ops` only; step 3 routes via this handle so
+    /// peer-delivered EPOLLEXCLUSIVE events resolve to the right slab.
+    ///
+    /// `Option` only because the field is set post-construction (the
+    /// handle holds the reactor's `SharedRegistry` clone, so we must
+    /// finish constructing the reactor before the handle has any way
+    /// to refer back). After [`Self::set_handle`] runs, the slot is
+    /// permanently `Some` for the lifetime of this reactor.
+    handle: Option<Arc<ShardedMioHandle>>,
 }
 
 /// Cross-thread wake handle. Analogous to
@@ -489,6 +505,48 @@ impl SharedRegistry {
         woken
     }
 
+    /// Resolve a single event against this registry's slab and fire
+    /// its waker if the entry is still live. Used by the unified
+    /// dispatch path in [`Reactor::poll_and_dispatch`] (step 3 of the
+    /// EPOLLEXCLUSIVE-fanout rollout): every event arriving on any
+    /// worker's epoll is routed by its token's `worker_idx` to the
+    /// owning worker's `SharedRegistry`, which then runs this method
+    /// against its own slab.
+    ///
+    /// Returns `true` if the event resolved to a live `ScheduledIo`
+    /// and a waker was fired. Returns `false` for slab-miss /
+    /// gen-mismatch (counted via the dispatch counters).
+    ///
+    /// Per-event critical section: lock `ops`, slab-get, gen-check,
+    /// `set_readiness`, `wake`. The lock acquire is per-event under
+    /// the new fanout dispatch model — events for the same worker
+    /// arriving in one peer's `epoll_wait` batch each lock that peer's
+    /// `ops` mutex separately. Contention is bounded by event rate
+    /// times stealer-count; the `Drop`-side waker fan-in path was
+    /// always per-event so no new bottleneck appears here.
+    pub(crate) fn dispatch_event(&self, key: u32, gen: u32, ready: Ready) -> bool {
+        use super::lazy_debug::{bump, COUNTERS};
+        let state = self.ops.lock().expect("sharded-mio ops poisoned");
+        let Some(io) = state.slab.get(key as usize) else {
+            bump(&COUNTERS.dispatch_slab_miss);
+            return false;
+        };
+        if io.sharded_mio_gen.load(Ordering::Relaxed) != gen {
+            bump(&COUNTERS.dispatch_gen_mismatch);
+            return false;
+        }
+        bump(&COUNTERS.dispatch_woken);
+        if ready.is_readable() {
+            bump(&COUNTERS.dispatch_woken_readable);
+        }
+        if ready.is_writable() {
+            bump(&COUNTERS.dispatch_woken_writable);
+        }
+        io.set_readiness(Tick::Set, |curr| curr | ready);
+        io.wake(ready);
+        true
+    }
+
     /// Drop the slab entry identified by `(slab_key, gen)` without
     /// touching mio. Used during `ScheduledIo` teardown when the
     /// underlying source has already been closed — mio implicitly
@@ -526,7 +584,20 @@ impl Reactor {
                 live_fds: HashMap::new(),
             })),
             waker,
+            handle: None,
         })
+    }
+
+    /// Install the driver handle so [`Self::poll_and_dispatch`] can
+    /// route events to peer workers' slabs via the token's
+    /// `worker_idx` field. Called once per worker, immediately after
+    /// the parker hands its `SharedRegistry` to
+    /// [`ShardedMioHandle::register_worker`].
+    ///
+    /// Idempotent against re-installation, but the parker only ever
+    /// calls this once.
+    pub(crate) fn set_handle(&mut self, handle: Arc<ShardedMioHandle>) {
+        self.handle = Some(handle);
     }
 
     /// Clone out a cross-thread [`SharedRegistry`]. `mio::Registry` is
@@ -606,15 +677,14 @@ impl Reactor {
             bump(&COUNTERS.dispatch_zero_events);
         }
 
-        // Hold the ops lock for the whole dispatch pass: lock-once vs.
-        // lock-per-event is the right tradeoff given contention is
-        // bounded by registration/deregistration rate rather than
-        // event rate. Waking scheduled tasks can invoke arbitrary
-        // waker callbacks, but those callbacks cannot themselves
-        // re-enter the reactor's lock on this thread (they go
-        // through the scheduler, not back into `register`).
-        let state = self.ops.lock().expect("sharded-mio ops poisoned");
-
+        // Step 3 of EPOLLEXCLUSIVE-fanout: route every event by its
+        // token's `worker_idx` field to the slab on that worker's
+        // `SharedRegistry`. Under fanout the kernel may deliver an
+        // event to *any* worker's `epoll_wait` (LIFO across the
+        // exclusive set), so the dispatching reactor is no longer the
+        // implicit owner of the slab the event references. Per-event
+        // lock acquire is unavoidable here — different events in one
+        // poll batch may target different peers' slabs.
         for event in events.iter() {
             let token = event.token();
             if token == WAKER_TOKEN {
@@ -623,42 +693,53 @@ impl Reactor {
                 // around the park call; nothing to dispatch here.
                 continue;
             }
-            // Step 1 of EPOLLEXCLUSIVE-fanout: token now carries the
-            // owning worker's index. Pre-fanout, every event arrives on
-            // its registering worker's epoll, so the unpacked
-            // `worker_idx` is always `self`'s own. Step 3 makes this
-            // the routing key for peer-delivered events.
-            let (_wrkr_idx, key, gen) = unpack_token(token);
-            let Some(io) = state.slab.get(key as usize) else {
-                bump(&COUNTERS.dispatch_slab_miss);
-                // Slab slot already vacated (e.g. a deregister raced
-                // ahead of a poll tick that had already captured the
-                // event). Safe to drop; the caller dropped interest.
+            let (worker_idx, key, gen) = unpack_token(token);
+            let ready = Ready::from_mio(event);
+
+            let Some(handle) = self.handle.as_ref() else {
+                // Reactor was constructed but `set_handle` hasn't yet
+                // been called by the parker. The startup ordering in
+                // `ShardedMioParker::new` runs `set_handle`
+                // immediately after `register_worker`, before any
+                // task can invoke the reactor's park path, so this
+                // branch should be unreachable in steady state.
+                bump(&COUNTERS.dispatch_no_handle);
                 continue;
             };
-            // Per-slot gen check: an event for a slot that has since
-            // been reassigned would otherwise wake the wrong waiter
-            // with a stale readiness mask. Skip.
-            if io.sharded_mio_gen.load(Ordering::Relaxed) != gen {
-                bump(&COUNTERS.dispatch_gen_mismatch);
+            let workers = handle.workers();
+            let Some(slot) = workers.get(worker_idx as usize) else {
+                // worker_idx came from `unpack_token` (max value
+                // `TOKEN_WORKER_MASK = 0xF`) but the runtime was
+                // built with fewer than 16 workers. A registration
+                // could have only stamped a token whose worker_idx
+                // was `< workers.len()`, so reaching this branch
+                // means a corrupted token (e.g. a kernel-internal
+                // event surfaced with `WAKER_TOKEN`'s sentinel
+                // pattern that we missed). Surface for debugging.
+                bump(&COUNTERS.dispatch_unknown_worker);
                 continue;
+            };
+            let Some(reg) = slot.shared_registry.get() else {
+                // Peer worker hasn't published its `SharedRegistry`
+                // yet — possible only during startup, before the
+                // start barrier opens. Shouldn't be reached in
+                // steady state.
+                bump(&COUNTERS.dispatch_no_peer_registry);
+                continue;
+            };
+
+            if reg.dispatch_event(key, gen, ready) {
+                if let Some(idx) = self_idx {
+                    // Attribute the dispatch to the *receiving*
+                    // worker (us), not the slab's owning worker.
+                    // This is the work-allocation question: which
+                    // worker's CPU did the dispatch run on?
+                    super::lazy_debug::bump_per_worker(
+                        &super::lazy_debug::PER_WORKER.dispatch_woken,
+                        idx,
+                    );
+                }
             }
-            let ready = Ready::from_mio(event);
-            bump(&COUNTERS.dispatch_woken);
-            if let Some(idx) = self_idx {
-                super::lazy_debug::bump_per_worker(
-                    &super::lazy_debug::PER_WORKER.dispatch_woken,
-                    idx,
-                );
-            }
-            if ready.is_readable() {
-                bump(&COUNTERS.dispatch_woken_readable);
-            }
-            if ready.is_writable() {
-                bump(&COUNTERS.dispatch_woken_writable);
-            }
-            io.set_readiness(Tick::Set, |curr| curr | ready);
-            io.wake(ready);
         }
         Ok(())
     }

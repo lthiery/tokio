@@ -198,6 +198,15 @@ impl ShardedMioHandle {
         self.workers.len()
     }
 
+    /// Per-worker state slice. Exposed for `Reactor::poll_and_dispatch`
+    /// (step 3 of the EPOLLEXCLUSIVE-fanout rollout) to look up the
+    /// owning worker's `SharedRegistry` from the unpacked token's
+    /// `worker_idx` field. Not part of the public `IoDriverHandle`
+    /// surface — strictly internal to the sharded-mio backend.
+    pub(crate) fn workers(&self) -> &[WorkerState] {
+        &self.workers
+    }
+
     /// Block until every sibling worker has also reached this call.
     /// Called exactly once per worker at startup after the reactor is
     /// built and its `SharedRegistry` published.

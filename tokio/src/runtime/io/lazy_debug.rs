@@ -267,6 +267,24 @@ counters! {
     /// Same shape as `register_on_worker_fanout_err` but for the
     /// off-worker queued path.
     apply_register_fanout_err,
+
+    // ---- step 3: uniform dispatch routing observability ----
+    /// `Reactor::poll_and_dispatch` reached the routing block before
+    /// the parker installed the driver handle. Should not happen in
+    /// steady state — `ShardedMioParker::new` calls `set_handle`
+    /// before any task can run.
+    dispatch_no_handle,
+    /// Token's `worker_idx` field exceeded the configured worker
+    /// count. Should not happen — `pack_token` debug-asserts the
+    /// upper bound at registration time. If hit, indicates a
+    /// corrupted token (kernel-internal event with a sentinel
+    /// pattern, slab/gen reuse race surfacing as worker_idx mismatch,
+    /// etc.).
+    dispatch_unknown_worker,
+    /// Token resolved to a valid worker index but that worker hasn't
+    /// published its `SharedRegistry` yet. Only possible pre-start-
+    /// barrier; once the runtime is up, every worker has published.
+    dispatch_no_peer_registry,
 }
 
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();
