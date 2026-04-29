@@ -200,6 +200,22 @@ counters! {
     /// Sum of events fired across all steal calls. Useful for
     /// end-of-trial dumps to compare with `dispatch_woken`.
     steal_drain_woken_total,
+
+    /// `ShardedMioParker::park_on_meta` entered. One call per
+    /// steal-mode park; mode is selected per-park based on whether
+    /// the worker's own slab is empty.
+    meta_park_calls,
+    /// Steal-mode park returned 0 events because the
+    /// `epoll_wait(timeout)` deadline expired without any sibling
+    /// child firing.
+    meta_park_timeout,
+    /// `epoll_wait` on the meta fd returned an error. EINTR is the
+    /// most common reason and is harmless; others are logged for
+    /// visibility.
+    meta_park_err,
+    /// Steal-mode park observed at least one firing child and
+    /// invoked `try_steal_drain` (or self-drain) for it.
+    meta_park_woken,
 }
 
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();

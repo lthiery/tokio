@@ -10,12 +10,14 @@
 use crate::loom::sync::Arc;
 use crate::runtime::driver;
 use crate::runtime::io::sharded_mio_driver::{
-    clear_local_reactor, install_local_reactor_raw, ShardedMioHandle,
+    clear_local_reactor, install_local_reactor_raw, ShardedMioHandle, EMPTY as PARK_EMPTY,
 };
 use crate::runtime::io::sharded_mio_reactor::Reactor;
 use crate::runtime::scheduler::multi_thread::park::HadDriver;
 
 use std::cell::{Cell, RefCell};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 thread_local! {
@@ -139,34 +141,177 @@ impl ShardedMioParker {
         // observed as `PARKED`.
         self.ensure_reactor_installed();
 
-        // Under EPOLLEXCLUSIVE-fanout the only pre-park action is the
-        // notified fast-path CAS. Cross-thread register/deregister
-        // calls land synchronously on every worker's epoll fd from
-        // the calling thread, and the kernel itself routes events to
-        // whichever worker is currently in `epoll_wait` — so there is
-        // no `pending_ops` queue to drain and no readiness-steal pass
-        // to run before blocking.
+        // Notified fast-path: no syscall needed.
         if self.handle.begin_park(self.idx) {
-            // Notified fast-path: no syscall needed.
             return;
         }
 
+        // Mode selection: park on our own child epoll if we have
+        // any live registrations of our own (cache-warm dispatch on
+        // owner thread); otherwise park on the runtime-wide meta
+        // epoll so we can pick up siblings' work via steal-drain.
+        //
+        // The decision is made *per park call* rather than once at
+        // startup so that workers transition naturally between modes
+        // as their `OpsState` populates and drains. The lock acquire
+        // in [`Reactor::slab_is_empty`] is uncontended on the hot
+        // path under single-owner registration.
+        let park_on_meta = {
+            let cell: &RefCell<Reactor> = self
+                .reactor
+                .as_deref()
+                .expect("reactor installed");
+            cell.borrow().slab_is_empty()
+        };
+
+        if park_on_meta {
+            self.park_on_meta(duration);
+        } else {
+            self.park_on_own_child(duration);
+        }
+
+        self.handle.end_park(self.idx);
+    }
+
+    /// Owner-mode park. Block in `mio::Poll::poll` on this worker's
+    /// own child epoll fd and dispatch any returned events through
+    /// the owner-side path that holds the slab lock under
+    /// [`Reactor::poll_and_dispatch`]. This is the cache-warm path:
+    /// the worker that registered the fd is the one that picks up
+    /// the kernel notification and runs the wake.
+    fn park_on_own_child(&mut self, duration: Option<Duration>) {
         let cell: &RefCell<Reactor> = self
             .reactor
             .as_deref()
             .expect("reactor installed");
         let mut reactor = cell.borrow_mut();
-
         let result = match duration {
             None => reactor.park(),
             Some(dur) => reactor.park_timeout(dur),
         };
+        // Park errors are spurious; another wake will arrive.
+        let _ = result;
+    }
 
-        let _ = result; // park errors are spurious; another wake will arrive
+    /// Steal-mode park. Block in `epoll_wait` on the runtime-wide
+    /// meta epoll fd. On wake, the kernel returns one or more
+    /// `worker_idx` values (level-triggered registration of each
+    /// child epoll); for each, run [`SharedRegistry::try_steal_drain`]
+    /// against that worker's registry to dispatch any queued events
+    /// on its behalf. If the firing child is our own (e.g. our
+    /// external waker fired), we drain it through the standard
+    /// owner-side path with `timeout=0` so the slab lookup runs on
+    /// our cache-warm copy of `OpsState`.
+    ///
+    /// Lost steal races are harmless: the meta is level-triggered,
+    /// so any child still holding undrained events will keep firing
+    /// until the owner or a future peer call drains it.
+    #[cfg(target_os = "linux")]
+    fn park_on_meta(&mut self, duration: Option<Duration>) {
+        use crate::runtime::io::lazy_debug::{bump, COUNTERS};
 
-        drop(reactor);
+        const META_BUDGET: usize = 16;
+        let timeout_ms: i32 = match duration {
+            None => -1,
+            Some(d) => {
+                // `epoll_wait` takes milliseconds as i32. Saturate to
+                // i32::MAX-1 (~24 days) so the upper bound never
+                // overflows; durations beyond that are a scheduler-
+                // shutdown artifact, not a real wait.
+                let ms = d.as_millis();
+                if ms >= i32::MAX as u128 { i32::MAX - 1 } else { ms as i32 }
+            }
+        };
 
-        self.handle.end_park(self.idx);
+        // SAFETY: `epoll_event` is plain old data; `epoll_wait`
+        // overwrites the slots it returns and we only read the
+        // first `n` of them.
+        let mut events: [libc::epoll_event; META_BUDGET] =
+            unsafe { std::mem::zeroed() };
+
+        bump(&COUNTERS.meta_park_calls);
+
+        let meta_fd = self.handle.meta_epfd();
+        let n = unsafe {
+            libc::epoll_wait(
+                meta_fd,
+                events.as_mut_ptr(),
+                META_BUDGET as i32,
+                timeout_ms,
+            )
+        };
+        if n < 0 {
+            // EINTR is expected; other errors are logged and we let
+            // the scheduler re-park if it still has nothing to do.
+            bump(&COUNTERS.meta_park_err);
+            return;
+        }
+        if n == 0 {
+            bump(&COUNTERS.meta_park_timeout);
+            return;
+        }
+        bump(&COUNTERS.meta_park_woken);
+
+        let workers = self.handle.workers();
+        for ev in events.iter().take(n as usize) {
+            let widx = ev.u64 as usize;
+            if widx >= workers.len() {
+                continue;
+            }
+            if widx == self.idx {
+                // Our own child fired (most commonly the external
+                // waker). Drain it through the owner-side path —
+                // we *are* the owner, so this takes the lock without
+                // contending with anyone.
+                let cell: &RefCell<Reactor> = self
+                    .reactor
+                    .as_deref()
+                    .expect("reactor installed");
+                let mut reactor = cell.borrow_mut();
+                let _ = reactor.park_timeout(Duration::ZERO);
+                drop(reactor);
+                continue;
+            }
+            // Gate steal-drain on the owner being in `EMPTY` state
+            // (running user code, not parked or transitioning).
+            //
+            // The peer-drain path raw-`epoll_wait`s on the owner's
+            // child epoll fd. mio's `Waker` is registered on that same
+            // epoll fd as an EPOLLET-tracked eventfd, so a concurrent
+            // peer drain can consume the WAKER event posted by the
+            // most recent `unpark(widx)` without ever reading the
+            // eventfd. The owner's own `Poll::poll` then blocks
+            // indefinitely: the eventfd counter stays at 1, no edge
+            // transition fires, and subsequent `Waker::wake()` writes
+            // never produce another EPOLLET event.
+            //
+            // Owner in `EMPTY` ⇒ not parked, no pending unpark, so the
+            // WAKER eventfd cannot have a queued event for the peer
+            // to swallow. Owner in `PARKED` or `NOTIFIED` ⇒ owner
+            // (or its imminent return from `Poll::poll`) is the
+            // designated drainer; peer skipping costs at most one
+            // wasted meta wake. The meta is level-triggered, so a
+            // missed steal re-fires until the owner consumes the
+            // events itself.
+            let owner_state =
+                workers[widx].park_state.load(Ordering::Acquire);
+            if owner_state != PARK_EMPTY {
+                continue;
+            }
+            if let Some(reg) = workers[widx].shared_registry.get() {
+                reg.try_steal_drain();
+            }
+        }
+    }
+
+    /// Non-Linux fallback: meta-epoll is Linux-only. Sharded-mio is
+    /// gated to Linux by `scheduled_io.rs`, so this branch should
+    /// be unreachable in steady state, but we provide an
+    /// implementation that simply parks on the owner's child as a
+    /// safety net rather than relying on a panic.
+    #[cfg(not(target_os = "linux"))]
+    fn park_on_meta(&mut self, duration: Option<Duration>) {
+        self.park_on_own_child(duration);
     }
 
     /// Build the reactor on the current thread and wait on the startup
