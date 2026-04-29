@@ -22,17 +22,26 @@
 //! 3. Calls `mio::Registry::register` on the polling worker's own
 //!    `SharedRegistry` — entirely thread-local, lock-free against
 //!    sibling workers.
+//! 4. Fans the registration out to every peer worker's epoll fd via
+//!    raw `epoll_ctl(EPOLL_CTL_ADD, EPOLLEXCLUSIVE | EPOLLET)` so any
+//!    idle worker's `epoll_wait` can pick the event up.
 //!
-//! When the first poll happens off-runtime (rare), the producer
-//! enqueues a [`DriverOp::Register`] op onto a round-robin-picked
-//! worker's [`WorkerState::pending_ops`] queue and unparks the worker;
-//! the worker drains the queue at park time.
+//! Under the EPOLLEXCLUSIVE-fanout model, every register/deregister
+//! call is **synchronous on the calling thread**, regardless of which
+//! thread is making the call. `mio::Registry` clones are
+//! `Send + Sync`, so the calling thread can issue `epoll_ctl` against
+//! any worker's epoll fd directly. The "owning worker" concept
+//! survives only on the slab side — the worker that allocates the
+//! `ScheduledIo` slot is also the one that frees it on deregister —
+//! while every dispatch is uniform: `Reactor::poll_and_dispatch`
+//! routes each event by the token's `worker_idx` field to the slab on
+//! that worker's `SharedRegistry`. There is no cross-thread `pending_ops`
+//! queue, no park-time drain, and no readiness stealing.
 //!
-//! `deregister` always queues a [`DriverOp::Deregister`] op on the
-//! owning worker so registry mutation stays on a single thread per
-//! shard. The queue is FIFO, so the Drop-after-foreign-thread-Register
-//! race is automatically resolved — Register is processed before the
-//! matching Deregister.
+//! When `register_local` is called from off-runtime (no worker idx in
+//! TLS), it picks a fallback worker for slab ownership via
+//! [`fallback_worker`], then runs the same synchronous fanout-register
+//! path as the on-worker fast path.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -51,38 +60,9 @@ use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 
 /// Park-state atomic values. Shape mirrors the uring handle's
 /// transitions so scheduler integration stays familiar.
-///
-/// `STEALING` is added to support readiness stealing: a peer worker
-/// holds this state while it is mid-`epoll_wait` on our epoll fd. We
-/// must not call our own `epoll_wait` while a stealer is active, or we
-/// race the stealer for the kernel's exactly-once event delivery and
-/// risk being starved. `begin_park` waits out a `STEALING` state via a
-/// short spin before transitioning to `PARKED`.
 pub(crate) const EMPTY: usize = 0;
 pub(crate) const PARKED: usize = 1;
 pub(crate) const NOTIFIED: usize = 2;
-pub(crate) const STEALING: usize = 3;
-
-/// Cross-thread driver op queued onto a worker's
-/// [`WorkerState::pending_ops`].
-///
-/// Both variants carry an owning `Arc<ScheduledIo>` so the slab/registry
-/// state can be mutated on the owning worker thread. `Deregister`
-/// snapshots the fd at queue time because the original
-/// [`mio::event::Source`] may be dropped before the worker drains the
-/// op (mio's `Registry::deregister` only needs the fd, not the
-/// originally-registered source value, on Linux/epoll).
-pub(crate) enum DriverOp {
-    Register {
-        shared: Arc<ScheduledIo>,
-        fd: RawFd,
-        interest: Interest,
-    },
-    Deregister {
-        shared: Arc<ScheduledIo>,
-        fd: RawFd,
-    },
-}
 
 /// Per-worker coordination slot. One per worker, indexed by worker id.
 pub(crate) struct WorkerState {
@@ -107,20 +87,12 @@ pub(crate) struct WorkerState {
     /// state never contends a global mutex.
     pub(super) registrations: RegistrationSet,
 
-    /// Synced state for [`Self::registrations`]. The cross-thread
-    /// `pending_ops` queue is drained on the worker at park time so
-    /// this lock is only ever taken from the owning worker thread.
+    /// Synced state for [`Self::registrations`]. Mutated only from
+    /// the owning worker's slab insert/remove paths; the underlying
+    /// fanout register/deregister calls reach peer workers' epolls
+    /// directly via cloned `mio::Registry` handles, so this lock is
+    /// only ever taken under the owner's control.
     pub(super) synced: Mutex<registration_set::Synced>,
-
-    /// Cross-thread MPSC queue of [`DriverOp`]s targeted at this
-    /// worker. Drained at park time by the owning worker.
-    ///
-    /// `Mutex<Vec<DriverOp>>` rather than a lock-free queue because
-    /// contention is bounded by registration rate (one push per fd
-    /// register/deregister), not event rate. A simple mutex keeps the
-    /// FIFO ordering Register-before-Deregister relies on for the
-    /// foreign-thread-drop race.
-    pub(super) pending_ops: Mutex<Vec<DriverOp>>,
 }
 
 impl WorkerState {
@@ -132,7 +104,6 @@ impl WorkerState {
             external_waker: OnceLock::new(),
             registrations,
             synced: Mutex::new(synced),
-            pending_ops: Mutex::new(Vec::new()),
         }
     }
 }
@@ -145,12 +116,13 @@ impl std::fmt::Debug for WorkerState {
 
 /// Shared I/O handle for the sharded-mio backend.
 ///
-/// Symmetry with [`UringHandle`][uh]: per-worker slots for unparking,
-/// per-worker [`RegistrationSet`]s, plus a per-worker `pending_ops`
-/// queue used only for the foreign-thread-first-poll and deregister
-/// paths. There is no global registration set — each shard owns its
-/// own, eliminating a single-mutex serialization point under TCP
-/// connect churn.
+/// Symmetry with [`UringHandle`][uh]: per-worker slots for unparking
+/// and per-worker [`RegistrationSet`]s. There is no global registration
+/// set — each shard owns its own, eliminating a single-mutex
+/// serialization point under TCP connect churn. There is also no
+/// cross-thread `pending_ops` queue: every register/deregister call
+/// runs synchronously on the calling thread under the
+/// EPOLLEXCLUSIVE-fanout model.
 ///
 /// [uh]: super::uring_driver::UringHandle
 pub(crate) struct ShardedMioHandle {
@@ -262,245 +234,30 @@ impl ShardedMioHandle {
         true
     }
 
-    /// Try to harvest readiness from peer workers' epoll fds.
-    ///
-    /// Called from a worker's pre-park path when its own scheduler run
-    /// queue is empty. For each peer (round-robin starting from the
-    /// next index after `self_idx`) we issue a non-blocking
-    /// `libc::epoll_wait(peer.epoll_fd, buf, 0)` and dispatch any
-    /// returned events through the peer's [`SharedRegistry`].
-    ///
-    /// Why bypass mio's `Poll`: `Poll::poll` is `&mut self` and lives
-    /// on the owning worker thread. The `Registry` clone, by contrast,
-    /// is `Send + Sync` and gives us the same epoll fd. Calling raw
-    /// `epoll_wait` on it is sound — Linux guarantees exactly-once
-    /// delivery to `epoll_wait` callers, so a stealer racing the
-    /// peer's own `Poll::poll` cannot cause a double-fire.
-    ///
-    /// Returns the total number of events dispatched. The caller
-    /// generally doesn't need this — the wake side-effect is the
-    /// product — but it's surfaced for tests/metrics.
-    ///
-    /// `buf` is a caller-owned scratch buffer; sized once on the stack
-    /// (typically `[epoll_event; 32]`) to keep the steal pass
-    /// allocation-free.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn try_steal_pass(
-        &self,
-        self_idx: usize,
-        buf: &mut [libc::epoll_event],
-    ) -> usize {
-        use super::lazy_debug::{bump, bump_per_worker, COUNTERS, PER_WORKER};
-        bump(&COUNTERS.steal_pass_calls);
-        bump_per_worker(&PER_WORKER.try_steal_pass_calls, self_idx);
-
-        let n = self.workers.len();
-        if n <= 1 || buf.is_empty() {
-            return 0;
-        }
-        let mut total = 0usize;
-        // Round-robin over peers starting after self_idx so two
-        // adjacent stealers don't pile on the same victim every pass.
-        'peers: for offset in 1..n {
-            let victim_idx = (self_idx + offset) % n;
-            let slot = &self.workers[victim_idx];
-            let Some(registry) = slot.shared_registry.get() else {
-                // Peer hasn't published its registry yet (early
-                // startup). The start barrier prevents this in the
-                // steady state, but be defensive.
-                continue;
-            };
-
-            // Acquire the steal lock by CAS-ing peer.park_state into
-            // STEALING. We accept *both* EMPTY and NOTIFIED as valid
-            // entry states:
-            //
-            // * EMPTY: peer is running tasks (the common busy-burner
-            //   case).
-            // * NOTIFIED: peer was either previously running and got
-            //   an `unpark` (no eventfd write — peer.park_state went
-            //   EMPTY→NOTIFIED, harmless to steal from) OR was
-            //   previously parked and got an `unpark` (eventfd byte
-            //   written; peer's `poll.poll()` is about to return).
-            //
-            // We skip PARKED (peer is the right consumer for its own
-            // events; the kernel delivers exactly-once and harvesting
-            // here would starve `poll.poll()`) and STEALING (another
-            // stealer beat us to this slot).
-            //
-            // The original-state we entered from is preserved on
-            // release: if we entered from NOTIFIED, the slot returns
-            // to NOTIFIED so the peer's next `begin_park` still
-            // fastpaths. If we entered from EMPTY we restore EMPTY.
-            //
-            // Safety vs WAKER_TOKEN events on the peer's eventfd:
-            // when entering from NOTIFIED there *may* be a queued
-            // eventfd byte that our `epoll_wait` would consume,
-            // racing the peer's own `poll.poll()` (kernel exactly-
-            // once delivery). To stay safe we re-fire the peer's
-            // external waker after the steal, putting a fresh byte
-            // back on the eventfd — peer's poll either already
-            // returned (and our re-fire becomes a harmless spurious
-            // wake on its next park) or is still blocked (and our
-            // re-fire is what unblocks it). EMPTY-original peers
-            // have no eventfd byte queued by construction so no
-            // re-fire is needed.
-            let original = loop {
-                let prev = slot.park_state.load(Ordering::Acquire);
-                match prev {
-                    PARKED => {
-                        bump(&COUNTERS.steal_cas_fail_parked);
-                        continue 'peers;
-                    }
-                    STEALING => {
-                        bump(&COUNTERS.steal_cas_fail_stealing);
-                        continue 'peers;
-                    }
-                    EMPTY | NOTIFIED => {
-                        if slot
-                            .park_state
-                            .compare_exchange(
-                                prev,
-                                STEALING,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            if prev == NOTIFIED {
-                                bump(&COUNTERS.steal_entered_notified);
-                            }
-                            break prev;
-                        }
-                        // CAS lost the race; reload and retry.
-                        continue;
-                    }
-                    _ => continue 'peers,
-                }
-            };
-            bump(&COUNTERS.steal_pass_visits);
-
-            let epfd = registry.epoll_fd();
-            // SAFETY: epfd is the live cloned epoll fd held by
-            // `registry`; `buf` is a valid mutable buffer with `len`
-            // entries. Timeout 0 = non-blocking.
-            let rc = unsafe {
-                libc::epoll_wait(
-                    epfd,
-                    buf.as_mut_ptr(),
-                    buf.len() as libc::c_int,
-                    0,
-                )
-            };
-
-            // If we entered from NOTIFIED, re-fire peer's external
-            // waker before releasing. See the WAKER_TOKEN safety
-            // note on the entry CAS above. Cheap (one eventfd
-            // write); only paid on NOTIFIED-original visits.
-            if original == NOTIFIED {
-                if let Some(waker) = slot.external_waker.get() {
-                    let _ = waker.wake();
-                }
-            }
-
-            // Release the steal lock before dispatch so a wake
-            // delivered into the peer's queue can take effect via
-            // `unpark` if the peer parks immediately after — we're
-            // out of its hair after this point. Dispatch happens
-            // outside the lock; the slab is independently protected
-            // by `ops.lock()` inside `steal_dispatch`.
-            //
-            // CAS rather than store: while we held STEALING, an
-            // `unpark` may have fired and `swap(NOTIFIED)`-ed past
-            // us. In that case the slot is now NOTIFIED and the peer
-            // worker should see it via its next `begin_park`. A naïve
-            // `store(original)` here would silently clobber any such
-            // racing notification.
-            let _ = slot.park_state.compare_exchange(
-                STEALING,
-                original,
-                Ordering::Release,
-                Ordering::Relaxed,
-            );
-
-            if rc < 0 {
-                let err = std::io::Error::last_os_error().raw_os_error();
-                if err == Some(libc::EINTR) {
-                    bump(&COUNTERS.steal_eintr);
-                } else {
-                    // EBADF can occur during shutdown; we just stop
-                    // visiting this victim. Anything else (rare:
-                    // EFAULT, EINVAL) is caller-bug territory and we
-                    // also just skip — the next park pass retries.
-                    bump(&COUNTERS.steal_errors);
-                }
-                continue;
-            }
-            if rc == 0 {
-                bump(&COUNTERS.steal_eagain);
-                continue;
-            }
-            let count = rc as usize;
-            COUNTERS
-                .steal_events_harvested
-                .fetch_add(count as u64, Ordering::Relaxed);
-            let woken = registry.steal_dispatch(&buf[..count]);
-            // Attribute steal-side wakes to the *stealer* (this
-            // worker), not the victim — matters for hypothesis 1
-            // (probe registration concentrated on burner-pinned
-            // workers means the stealer must do all the harvesting).
-            super::lazy_debug::add_per_worker(
-                &PER_WORKER.steal_events_woken,
-                self_idx,
-                woken as u64,
-            );
-            total += woken;
-        }
-        total
-    }
-
     /// Called by the worker on entry to park. Returns `true` if a wake
     /// was already pending, in which case park should skip the syscall
     /// and return immediately.
-    ///
-    /// If a peer worker is currently in the [`STEALING`] state on this
-    /// slot (mid `epoll_wait` on our epoll fd), we briefly spin waiting
-    /// for it to release. The stealer holds the lock only for the
-    /// duration of one non-blocking `epoll_wait` (~hundreds of ns), so
-    /// the spin is bounded.
     pub(crate) fn begin_park(&self, worker_idx: usize) -> bool {
         use super::lazy_debug::{bump, bump_per_worker, COUNTERS, PER_WORKER};
         bump(&COUNTERS.begin_park_calls);
         bump_per_worker(&PER_WORKER.begin_park_calls, worker_idx);
         let slot = &self.workers[worker_idx];
-        loop {
-            match slot.park_state.compare_exchange(
-                EMPTY,
-                PARKED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    bump(&COUNTERS.begin_park_parked);
-                    return false;
-                }
-                Err(NOTIFIED) => {
-                    bump(&COUNTERS.begin_park_fastpath);
-                    slot.park_state.store(EMPTY, Ordering::Release);
-                    return true;
-                }
-                Err(STEALING) => {
-                    // Peer is mid `epoll_wait(timeout=0)` on our
-                    // epoll fd. Bounded duration; spin until they
-                    // release back to EMPTY (or to NOTIFIED if a
-                    // wake races in) and retry the CAS.
-                    bump(&COUNTERS.begin_park_steal_spin);
-                    while slot.park_state.load(Ordering::Acquire) == STEALING {
-                        std::hint::spin_loop();
-                    }
-                }
-                Err(state) => panic!("inconsistent park_state on begin_park: {state}"),
+        match slot.park_state.compare_exchange(
+            EMPTY,
+            PARKED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                bump(&COUNTERS.begin_park_parked);
+                false
             }
+            Err(NOTIFIED) => {
+                bump(&COUNTERS.begin_park_fastpath);
+                slot.park_state.store(EMPTY, Ordering::Release);
+                true
+            }
+            Err(state) => panic!("inconsistent park_state on begin_park: {state}"),
         }
     }
 
@@ -527,30 +284,21 @@ impl ShardedMioHandle {
     /// [`Registration::ensure_registered`][reg-er] on the first poll
     /// of a registration.
     ///
-    /// Two-tier dispatch:
+    /// Synchronous on any thread. Under the EPOLLEXCLUSIVE-fanout
+    /// model every register call must hit every worker's epoll fd, so
+    /// there is no value in queuing the off-worker case onto a target
+    /// worker — `mio::Registry` clones are `Send + Sync`, so the
+    /// calling thread can drive both the owner-side mio register and
+    /// the peer-side raw `epoll_ctl` calls directly. The only
+    /// per-shard decision is which worker owns the slab entry:
     ///
-    /// 1. **Same-worker sync path.** When the caller is itself a
-    ///    sharded-mio worker (detected via
-    ///    [`current_worker_index`][cwi]), the registration is applied
-    ///    inline on the calling worker's own [`SharedRegistry`] —
-    ///    no cross-thread queue, no unpark syscall, no pre-park
-    ///    drain delay. This is the common path: `from_std` /
-    ///    `TcpListener::accept` on a worker triggers first poll on
-    ///    that same worker.
-    ///
-    /// 2. **Foreign-thread queued path.** When `current_worker_index`
-    ///    returns `None` (off-runtime first poll, e.g. from a thread
-    ///    spawned outside the multi-thread scheduler), or the
-    ///    returned index is past the worker count (defensive),
-    ///    round-robin picks a shard, pushes a
-    ///    [`DriverOp::Register`] op, and unparks it.
-    ///    The op is drained on the target worker's next park.
-    ///
-    /// `deregister` always queues — same-thread vs foreign-thread is
-    /// a less interesting axis there because the deregister path is
-    /// already happy to wait one park cycle. Centralising registry
-    /// mutation on the owning worker keeps the FIFO Register-then-
-    /// Deregister property the cross-thread Drop race relies on.
+    /// * **On a worker:** the calling worker is the owner, picked via
+    ///   [`current_worker_index`][cwi]. This is the common path —
+    ///   `from_std` / `TcpListener::accept` on a worker triggers first
+    ///   poll on that same worker.
+    /// * **Off-runtime:** [`fallback_worker`] picks an owner via
+    ///   round-robin. Same fanout work as the on-worker path; only
+    ///   the slab-owner identity differs.
     ///
     /// **Throughput note.** The synchronous fast path concentrates
     /// fds on whichever worker happens to call `from_std`. In
@@ -592,7 +340,10 @@ impl ShardedMioHandle {
             }
         }
 
-        self.queue_register(shared, fd, interest)
+        // Off-runtime path: pick a fallback owner round-robin. The
+        // fanout fan-out portion runs synchronously on the calling
+        // thread (no cross-thread queue) just like the on-worker case.
+        self.register_on_worker(self.fallback_worker(), shared, fd, interest)
     }
 
     /// Fan out a freshly-registered fd to every peer worker's epoll
@@ -780,9 +531,10 @@ impl ShardedMioHandle {
 
         // Publish the worker assignment first so a racing
         // `queue_deregister` (e.g. from a foreign Drop that just
-        // received a clone of `shared`) routes to this same worker
-        // and the FIFO ordering on `pending_ops` resolves
-        // Register-before-Deregister.
+        // received a clone of `shared`) routes to this same worker's
+        // slab. Both calls run synchronously on their respective
+        // threads; the slot's mutex serialises the Register-vs-
+        // Deregister order on the slab side.
         shared
             .sharded_mio_worker
             .store(worker_idx as u32, Ordering::Relaxed);
@@ -878,62 +630,35 @@ impl ShardedMioHandle {
         Ok(worker_idx)
     }
 
-    /// Cross-thread first-poll path: enqueue a Register op onto a
-    /// round-robin-picked shard and unpark it.
-    fn queue_register(
-        &self,
-        shared: &Arc<ScheduledIo>,
-        fd: RawFd,
-        interest: Interest,
-    ) -> io::Result<usize> {
-        use super::lazy_debug::{bump, COUNTERS};
-        bump(&COUNTERS.queue_register_calls);
-        let worker_idx = self.fallback_worker();
-
-        // Publish the worker assignment immediately so a racing
-        // `deregister` enqueued behind this Register op routes to the
-        // same shard.
-        shared
-            .sharded_mio_worker
-            .store(worker_idx as u32, Ordering::Relaxed);
-
-        let slot = &self.workers[worker_idx];
-        let was_empty = {
-            let mut q = slot.pending_ops.lock();
-            let was_empty = q.is_empty();
-            q.push(DriverOp::Register {
-                shared: Arc::clone(shared),
-                fd,
-                interest,
-            });
-            was_empty
-        };
-
-        // Only unpark when transitioning the queue from empty → non-
-        // empty: subsequent ops batch with no extra wake.
-        if was_empty {
-            self.unpark(worker_idx);
-        }
-
-        Ok(worker_idx)
-    }
-
     fn fallback_worker(&self) -> usize {
         self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len()
     }
 
-    /// Queue a deregister op for `shared` on the worker that originally
-    /// registered it. All deregisters go through this queue —
-    /// including from the owning worker — so registry mutation stays
-    /// single-threaded per shard.
+    /// Synchronously deregister `shared` from the sharded-mio reactor.
+    ///
+    /// Despite the historical "queue_" name, this call applies the
+    /// deregistration directly on the calling thread under the
+    /// EPOLLEXCLUSIVE-fanout model: `mio::Registry` clones are
+    /// `Send + Sync`, so there is no need to bounce through the owning
+    /// worker's park loop. The owner identity (loaded from
+    /// `shared.sharded_mio_worker`) is used only to identify which
+    /// shard's slab the entry lives in. The owner's mio deregister
+    /// runs first; on a successful (`Applied`) outcome the fanout
+    /// `EPOLL_CTL_DEL` is mirrored to every peer worker's epoll fd.
     ///
     /// `fd` must be the same fd that was passed to
     /// [`Self::register_local`]; the caller (typically
     /// `Registration::deregister`) has it via
     /// `RegistrationSource::registration_raw_fd()`.
     pub(crate) fn queue_deregister(&self, shared: &Arc<ScheduledIo>, fd: RawFd) {
-        use super::lazy_debug::{bump, COUNTERS};
+        use super::lazy_debug::{bump, maybe_dump_trial, COUNTERS};
         bump(&COUNTERS.queue_deregister_calls);
+        // Per-trial delta hook (no-op unless `TOKIO_LAZY_DEBUG_TRIAL`
+        // is set). Placed here because `io_busy_owner` deregisters
+        // exactly once per probe task at end-of-trial — modulo the
+        // configured `N` this gives one delta dump per bench iter.
+        bump(&COUNTERS.apply_deregister_calls);
+        maybe_dump_trial();
         let worker_idx = shared.sharded_mio_worker.load(Ordering::Relaxed) as usize;
         if worker_idx >= self.workers.len() {
             bump(&COUNTERS.queue_deregister_no_worker);
@@ -942,168 +667,6 @@ impl ShardedMioHandle {
             // to deregister.
             return;
         }
-        let slot = &self.workers[worker_idx];
-        let was_empty = {
-            let mut q = slot.pending_ops.lock();
-            let was_empty = q.is_empty();
-            q.push(DriverOp::Deregister {
-                shared: Arc::clone(shared),
-                fd,
-            });
-            was_empty
-        };
-        if was_empty {
-            self.unpark(worker_idx);
-        }
-    }
-
-    /// Drain all pending [`DriverOp`]s targeted at `worker_idx`.
-    ///
-    /// Called by the owning worker on entry to park (before
-    /// `reactor.park()`), so all queued Register/Deregister ops become
-    /// visible to the kernel epoll set in the same syscall window
-    /// that's about to block on it.
-    pub(crate) fn drain_pending_ops(&self, worker_idx: usize) {
-        use super::lazy_debug::{bump, COUNTERS};
-        bump(&COUNTERS.drain_calls);
-        if worker_idx >= self.workers.len() {
-            return;
-        }
-        let slot = &self.workers[worker_idx];
-
-        // Take ownership of the queue contents in one shot to
-        // minimize lock-hold time. New ops pushed after this swap go
-        // onto the next park's drain.
-        let ops = {
-            let mut q = slot.pending_ops.lock();
-            std::mem::take(&mut *q)
-        };
-
-        for op in ops {
-            match op {
-                DriverOp::Register {
-                    shared,
-                    fd,
-                    interest,
-                } => {
-                    bump(&COUNTERS.drain_register_drained);
-                    self.apply_register(worker_idx, shared, fd, interest);
-                }
-                DriverOp::Deregister { shared, fd } => {
-                    bump(&COUNTERS.drain_deregister_drained);
-                    self.apply_deregister(worker_idx, shared, fd);
-                }
-            }
-        }
-
-        // Drain any deferred releases that landed during the drain
-        // pass (or in-flight from prior parks). Keeps the per-shard
-        // `pending_release` vec from growing unboundedly when the
-        // NOTIFY_AFTER threshold isn't hit.
-        if slot.registrations.needs_release() {
-            slot.registrations.release(&mut slot.synced.lock());
-        }
-    }
-
-    fn apply_register(
-        &self,
-        worker_idx: usize,
-        shared: Arc<ScheduledIo>,
-        fd: RawFd,
-        interest: Interest,
-    ) {
-        use super::lazy_debug::{bump, COUNTERS};
-        bump(&COUNTERS.apply_register_calls);
-        let slot = &self.workers[worker_idx];
-
-        // Track in the per-shard set first.
-        if slot
-            .registrations
-            .allocate_existing(&mut slot.synced.lock(), &shared)
-            .is_err()
-        {
-            bump(&COUNTERS.apply_register_shutdown);
-            // Driver shutting down — surface a final shutdown event
-            // to any waiter so they don't hang.
-            shared.shutdown();
-            return;
-        }
-
-        let registry = match slot.shared_registry.get() {
-            Some(r) => r,
-            None => {
-                bump(&COUNTERS.apply_register_no_registry);
-                // Worker hasn't published its registry yet (shouldn't
-                // happen post-startup; just be safe). Roll back.
-                // SAFETY: `shared` was just inserted by
-                // `allocate_existing` above.
-                unsafe {
-                    slot.registrations
-                        .remove(&mut slot.synced.lock(), &shared);
-                }
-                shared.shutdown();
-                return;
-            }
-        };
-
-        let mut source = mio::unix::SourceFd(&fd);
-        let ok = match registry.register(&mut source, fd, interest, &shared) {
-            Ok(ok) => ok,
-            Err(_e) => {
-                bump(&COUNTERS.apply_register_errors);
-                // SAFETY: just inserted by `allocate_existing` above.
-                unsafe {
-                    slot.registrations
-                        .remove(&mut slot.synced.lock(), &shared);
-                }
-                shared.shutdown();
-                return;
-            }
-        };
-
-        // Owner-side mio register succeeded. Fan out to peer epoll
-        // fds; on partial failure the helper rolls back the peers it
-        // already added, and we additionally undo the owner-side
-        // register and per-shard set insert.
-        #[cfg(target_os = "linux")]
-        {
-            if let Err(_e) =
-                self.fanout_register_peers(worker_idx, fd, interest, ok.token)
-            {
-                bump(&COUNTERS.apply_register_fanout_err);
-                let mut undo_source = mio::unix::SourceFd(&fd);
-                let _ = registry.deregister(&mut undo_source, fd, ok.slab_key, ok.gen);
-                // SAFETY: just inserted by `allocate_existing` above.
-                unsafe {
-                    slot.registrations
-                        .remove(&mut slot.synced.lock(), &shared);
-                }
-                shared.shutdown();
-                return;
-            }
-        }
-
-        bump(&COUNTERS.apply_register_ok);
-        super::lazy_debug::bump_per_worker(
-            &super::lazy_debug::PER_WORKER.register_per_worker,
-            worker_idx,
-        );
-        // `sharded_mio_gen` was stamped on `shared` by
-        // `SharedRegistry::register`.
-        shared
-            .sharded_mio_slab_key
-            .store(ok.slab_key, Ordering::Relaxed);
-        self.metrics.incr_fd_count();
-    }
-
-    fn apply_deregister(&self, worker_idx: usize, shared: Arc<ScheduledIo>, fd: RawFd) {
-        use super::lazy_debug::{bump, maybe_dump_trial, COUNTERS};
-        bump(&COUNTERS.apply_deregister_calls);
-        // Per-trial delta hook (no-op unless `TOKIO_LAZY_DEBUG_TRIAL`
-        // is set). Placed here because `io_busy_owner` deregisters
-        // exactly once per probe task at end-of-trial — modulo the
-        // configured `N` this gives one delta dump per bench iter.
-        maybe_dump_trial();
         let slot = &self.workers[worker_idx];
         let slab_key = shared.sharded_mio_slab_key.load(Ordering::Relaxed);
         let gen = shared.sharded_mio_gen.load(Ordering::Relaxed);
@@ -1139,12 +702,17 @@ impl ShardedMioHandle {
             bump(&COUNTERS.apply_deregister_no_key);
         }
 
-        // Mark the registration for release; the worker will run
-        // through `pending_release` either at the NOTIFY_AFTER
-        // threshold or at the end of `drain_pending_ops`.
+        // Mark the registration for release. The per-shard
+        // pending_release vec is drained on the owning worker's next
+        // park via the `RegistrationSet::release` path inside
+        // `RegistrationSet::deregister` itself once the threshold is
+        // hit. Best-effort flush here too if needed.
         let _ = slot
             .registrations
-            .deregister(&mut slot.synced.lock(), &shared);
+            .deregister(&mut slot.synced.lock(), shared);
+        if slot.registrations.needs_release() {
+            slot.registrations.release(&mut slot.synced.lock());
+        }
     }
 }
 

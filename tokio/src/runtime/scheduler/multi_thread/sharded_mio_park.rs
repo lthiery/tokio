@@ -146,49 +146,13 @@ impl ShardedMioParker {
         // observed as `PARKED`.
         self.ensure_reactor_installed();
 
-        // Drain cross-thread driver ops (foreign-thread Registers,
-        // Deregisters from any thread) before parking so that the
-        // pending kernel-side state is up to date before we block in
-        // `epoll_wait`. Done unconditionally — even on the notified
-        // fast path — so a Register that arrived just before the
-        // notification still becomes effective immediately.
-        self.handle.drain_pending_ops(self.idx);
-
-        // Readiness stealing. Reaching the park path means our
-        // scheduler run queue is empty. Before we commit to a blocking
-        // wait, harvest readiness from peer workers' epoll fds — peers
-        // that may be CPU-bound and not calling `epoll_wait` themselves
-        // (the `io_busy_owner.rs` scenario). Any harvested event whose
-        // target task lives on this worker triggers a wake which sets
-        // our `park_state` to `NOTIFIED`; the `begin_park` CAS just
-        // below catches that as the fast-path return. See
-        // `tokio/docs/readiness-stealing.md` for the full design.
-        #[cfg(target_os = "linux")]
-        let stole_events = {
-            // Stack-allocated event buffer; sized to comfortably absorb
-            // a per-park burst from a busy peer without a malloc. Mio
-            // rolls excess events over to the next call, so this is a
-            // batching hint, not a correctness knob.
-            const STEAL_BATCH: usize = 32;
-            let mut buf: [libc::epoll_event; STEAL_BATCH] =
-                [libc::epoll_event { events: 0, u64: 0 }; STEAL_BATCH];
-            self.handle.try_steal_pass(self.idx, &mut buf) > 0
-        };
-        #[cfg(not(target_os = "linux"))]
-        let stole_events = false;
-
-        // If the steal harvested any events, we *cannot* park: the
-        // wakers we just fired enqueue tasks on their *home* worker's
-        // local queue, which may be a CPU-bound burner that won't
-        // process them. Skip the syscall and bounce back to the
-        // scheduler search loop, which will work-steal those tasks
-        // off the burner's queue.
-        if stole_events {
-            crate::runtime::io::lazy_debug::bump(
-                &crate::runtime::io::lazy_debug::COUNTERS.park_skip_after_steal,
-            );
-            return;
-        }
+        // Under EPOLLEXCLUSIVE-fanout the only pre-park action is the
+        // notified fast-path CAS. Cross-thread register/deregister
+        // calls land synchronously on every worker's epoll fd from
+        // the calling thread, and the kernel itself routes events to
+        // whichever worker is currently in `epoll_wait` — so there is
+        // no `pending_ops` queue to drain and no readiness-steal pass
+        // to run before blocking.
         if self.handle.begin_park(self.idx) {
             // Notified fast-path: no syscall needed.
             return;

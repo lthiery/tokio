@@ -169,10 +169,10 @@ pub(crate) struct ScheduledIo {
     /// same key. `0` means "not registered". Combined with
     /// [`Self::sharded_mio_slab_key`] in the mio token so the dispatch
     /// loop can reject stale events queued against an older incarnation
-    /// of the slot, and so [`apply_deregister`] can reject queued ops
-    /// whose slot was reassigned to a fresh registration.
+    /// of the slot, and so [`queue_deregister`] can reject deregister
+    /// requests whose slot was reassigned to a fresh registration.
     ///
-    /// [`apply_deregister`]: crate::runtime::io::sharded_mio_driver::ShardedMioHandle::apply_deregister
+    /// [`queue_deregister`]: crate::runtime::io::sharded_mio_driver::ShardedMioHandle::queue_deregister
     #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
     pub(super) sharded_mio_gen: AtomicU32,
 

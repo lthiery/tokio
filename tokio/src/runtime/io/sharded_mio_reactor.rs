@@ -103,49 +103,6 @@ fn unpack_token(t: Token) -> (u8, u32, u32) {
     (worker_idx as u8, key, gen)
 }
 
-/// Mirror of `Ready::from_mio` operating on the raw `epoll_event.events`
-/// bitmask returned by a direct `libc::epoll_wait` call.
-///
-/// Used by the readiness-stealing path: peer-worker steals call
-/// `epoll_wait` directly (bypassing mio) and need to translate the raw
-/// epoll bits the same way mio's `event::Event::is_*` methods would.
-#[cfg(target_os = "linux")]
-fn ready_from_epoll_events(events: u32) -> crate::io::Ready {
-    use crate::io::Ready;
-    let mut ready = Ready::EMPTY;
-    let ev = events as i32;
-
-    // EPOLLIN | EPOLLPRI -> readable. (Mio also surfaces priority
-    // separately below; here we follow mio's `is_readable` which folds
-    // EPOLLPRI into READABLE.)
-    if ev & (libc::EPOLLIN | libc::EPOLLPRI) != 0 {
-        ready |= Ready::READABLE;
-    }
-    if ev & libc::EPOLLOUT != 0 {
-        ready |= Ready::WRITABLE;
-    }
-    // EPOLLRDHUP -> half-close on the read side.
-    if ev & libc::EPOLLRDHUP != 0 {
-        ready |= Ready::READ_CLOSED;
-    }
-    // EPOLLHUP -> full hang-up: both directions closed.
-    if ev & libc::EPOLLHUP != 0 {
-        ready |= Ready::READ_CLOSED | Ready::WRITE_CLOSED;
-    }
-    if ev & libc::EPOLLERR != 0 {
-        ready |= Ready::ERROR;
-        // Mio surfaces WRITE_CLOSED when EPOLLOUT registrations get
-        // EPOLLERR — preserve that semantics.
-        if ev & libc::EPOLLOUT != 0 {
-            ready |= Ready::WRITE_CLOSED;
-        }
-    }
-    if ev & libc::EPOLLPRI != 0 {
-        ready |= Ready::PRIORITY;
-    }
-    ready
-}
-
 /// Capacity of each worker's `mio::Events` buffer. Sized in the same
 /// spirit as the uring reactor's CQ: comfortably above the observed
 /// per-park working set for the bench matrix. Mio silently rolls
@@ -178,7 +135,7 @@ pub(crate) struct OpsState {
     /// to its slab key. Used to detect the
     /// stale-deregister-clobbers-fresh-registration race documented in
     /// HANDOFF-lazy-register-session2.md: if a queued `Deregister`
-    /// arrives at `apply_deregister` but the fd has since been closed
+    /// arrives at `queue_deregister` but the fd has since been closed
     /// and recycled by a *different* registration, the live key here
     /// won't match and the `epoll_ctl_del(fd)` is skipped (which would
     /// otherwise wipe the new owner's epoll record because epoll keys
@@ -444,65 +401,17 @@ impl SharedRegistry {
     /// lifetime of `self` (the inner `mio::Registry` keeps the fd open
     /// via dup; closed when this `SharedRegistry` drops).
     ///
-    /// Used by the readiness-stealing path: a peer worker calls
-    /// `libc::epoll_wait(epoll_fd(), ..., 0)` non-blocking to harvest
-    /// events queued for this worker, then dispatches them through
-    /// [`Self::steal_dispatch`].
+    /// Used by the EPOLLEXCLUSIVE-fanout register/deregister helpers
+    /// in `sharded_mio_driver.rs`: registration adds the fd to every
+    /// peer's epoll fd via raw `libc::epoll_ctl(EPOLL_CTL_ADD,
+    /// EPOLLEXCLUSIVE | EPOLLET | <interest>)`, and deregistration
+    /// mirrors the `EPOLL_CTL_DEL` to each peer. mio's
+    /// `Registry::register` doesn't expose `EPOLLEXCLUSIVE`, so the
+    /// fanout path bypasses mio for the peer-side `epoll_ctl` calls
+    /// while keeping the owner-side register on mio.
     #[cfg(target_os = "linux")]
     pub(crate) fn epoll_fd(&self) -> RawFd {
         self.registry.as_raw_fd()
-    }
-
-    /// Dispatch a batch of raw epoll events harvested from this
-    /// registry's epoll fd by a peer worker.
-    ///
-    /// `events` should be the populated prefix of the buffer the caller
-    /// passed to `libc::epoll_wait(self.epoll_fd(), ..., 0)`. Returns
-    /// the number of events that successfully resolved to a live
-    /// `ScheduledIo` and fired its waker. The remaining count covers
-    /// the WAKER_TOKEN, slab miss, or gen-mismatch cases.
-    ///
-    /// Concurrency: the kernel guarantees exactly-once delivery to
-    /// `epoll_wait` callers, so a stealer/owner-park race resolves at
-    /// the syscall layer with no double-fire. Slab access is serialised
-    /// with the owning worker via the existing `ops` mutex.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn steal_dispatch(&self, events: &[libc::epoll_event]) -> usize {
-        use super::lazy_debug::{bump, StealDispatchGuard, COUNTERS};
-        let state = self.ops.lock().expect("sharded-mio ops poisoned");
-        // Mark the calling thread as being inside steal_dispatch so the
-        // scheduler's `schedule_task` can attribute its local-vs-remote
-        // branch to this path. Dropped at end of function scope.
-        let _steal_guard = StealDispatchGuard::enter();
-        let mut woken = 0usize;
-        for ev in events {
-            let token = Token(ev.u64 as usize);
-            if token == WAKER_TOKEN {
-                bump(&COUNTERS.steal_waker_token);
-                continue;
-            }
-            // Step 1 of EPOLLEXCLUSIVE-fanout: token now carries the
-            // owning worker's index. `steal_dispatch` already operates
-            // on the peer registry's own slab, so we discard the
-            // unpacked `worker_idx` here — it would equal `self`'s
-            // own index by construction. Step 3 collapses this into
-            // the unified dispatch path.
-            let (_wrkr_idx, key, gen) = unpack_token(token);
-            let Some(io) = state.slab.get(key as usize) else {
-                bump(&COUNTERS.steal_slab_miss);
-                continue;
-            };
-            if io.sharded_mio_gen.load(Ordering::Relaxed) != gen {
-                bump(&COUNTERS.steal_gen_mismatch);
-                continue;
-            }
-            let ready = ready_from_epoll_events(ev.events);
-            io.set_readiness(Tick::Set, |curr| curr | ready);
-            io.wake(ready);
-            bump(&COUNTERS.steal_events_woken);
-            woken += 1;
-        }
-        woken
     }
 
     /// Resolve a single event against this registry's slab and fire

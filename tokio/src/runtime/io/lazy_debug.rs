@@ -12,7 +12,6 @@
 //! The dump thread prints the full counter set to stderr every 250 ms.
 //! It exits when the process exits — we don't try to join it.
 
-use std::cell::Cell;
 use std::env;
 use std::io::Write;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -56,7 +55,6 @@ counters! {
 
     // ---- sharded_mio_driver register dispatch ----
     register_local_calls,
-    queue_register_calls,
 
     // ---- same-worker sync register fast path ----
     /// `register_on_worker` entered (sync path on the calling worker).
@@ -76,17 +74,12 @@ counters! {
     /// error.
     register_on_worker_errors,
 
-    // ---- park-side drain ----
-    drain_calls,
-    drain_register_drained,
-    drain_deregister_drained,
-
-    apply_register_calls,
-    apply_register_shutdown,
-    apply_register_no_registry,
-    apply_register_errors,
-    apply_register_ok,
-
+    // ---- deregister bookkeeping ----
+    /// Total number of `queue_deregister` calls that reached the
+    /// synchronous deregister body (i.e. were not short-circuited by
+    /// the `worker_idx >= workers.len()` no-op check). Kept under the
+    /// historical `apply_deregister_calls` name because
+    /// `maybe_dump_trial` keys its delta-dump cadence off this counter.
     apply_deregister_calls,
     apply_deregister_no_key,
     /// Dispatch-time observation that a slab lookup hit but the entry's
@@ -166,56 +159,6 @@ counters! {
     /// included `WRITABLE`.
     sr_register_writable_interest,
 
-    // ---- readiness stealing ----
-    /// `try_steal_pass` entered (one per pre-park steal attempt).
-    steal_pass_calls,
-    /// Number of peer epoll fds visited across all steal passes.
-    steal_pass_visits,
-    /// Total events harvested across all steal passes.
-    steal_events_harvested,
-    /// Subset of harvested events where dispatch fired a waker.
-    steal_events_woken,
-    /// `epoll_wait(timeout=0)` returned 0 (no events ready on the peer).
-    steal_eagain,
-    /// `epoll_wait(timeout=0)` returned a negative errno other than EINTR.
-    steal_errors,
-    /// `epoll_wait(timeout=0)` returned EINTR (rare; treat as 0).
-    steal_eintr,
-    /// Steal observed an event whose slab entry was vacated.
-    steal_slab_miss,
-    /// Steal observed an event whose gen disagrees with the slab entry.
-    steal_gen_mismatch,
-    /// Steal observed the peer's WAKER_TOKEN (peer self-wake; ignored).
-    steal_waker_token,
-    /// `begin_park` observed a peer holding STEALING; spun until released.
-    begin_park_steal_spin,
-    /// Pre-park steal harvested >0 events; we skipped the actual park.
-    park_skip_after_steal,
-    /// During `steal_dispatch`, the woken task's `schedule_task` took
-    /// the local-queue branch (current worker held its core, scheduler
-    /// matched). This is the desired path: the task lands on the
-    /// stealing worker's local queue.
-    steal_dispatch_local_schedule,
-    /// During `steal_dispatch`, the woken task's `schedule_task` fell
-    /// through to the inject queue (`push_remote_task` +
-    /// `notify_parked_remote`). Indicates either the current thread
-    /// was not a worker, the scheduler did not match, or the worker
-    /// no longer held its core when the waker fired.
-    steal_dispatch_remote_schedule,
-    /// `try_steal_pass` skipped a peer because its `park_state` was
-    /// `PARKED`. Expected case — peer is the right consumer for its
-    /// own readiness; we leave it alone.
-    steal_cas_fail_parked,
-    /// `try_steal_pass` successfully entered a peer's slot from
-    /// `NOTIFIED` (CAS `NOTIFIED -> STEALING` succeeded). The
-    /// peer was either notified-while-running (no eventfd byte) or
-    /// notified-after-park (eventfd byte queued; we re-fire the
-    /// peer's external waker after the steal to compensate for any
-    /// `WAKER_TOKEN` event we may have consumed).
-    steal_entered_notified,
-    /// `try_steal_pass` skipped a peer because its `park_state` was
-    /// `STEALING` (another peer is already mid-steal on this slot).
-    steal_cas_fail_stealing,
     /// `Handle::schedule_task` took the local-queue branch (current
     /// thread is on a worker of this scheduler and holds its core).
     /// Counted regardless of steal-dispatch context.
@@ -264,9 +207,6 @@ counters! {
     /// separately from `register_on_worker_errors` so the failure mode
     /// is debuggable.
     register_on_worker_fanout_err,
-    /// Same shape as `register_on_worker_fanout_err` but for the
-    /// off-worker queued path.
-    apply_register_fanout_err,
 
     // ---- step 3: uniform dispatch routing observability ----
     /// `Reactor::poll_and_dispatch` reached the routing block before
@@ -298,20 +238,18 @@ pub(crate) const MAX_WORKERS: usize = 16;
 /// `ShardedMioParker` / `current_worker_index()`. Out-of-range indices
 /// are silently dropped at the bump sites.
 pub(crate) struct PerWorkerCounters {
-    /// Worker harvested ≥1 event from its *own* `mio::Poll::poll`
-    /// (the [`dispatch_woken`] counter, attributed by worker).
+    /// Worker dispatched ≥1 event during its own
+    /// `Reactor::poll_and_dispatch` pass (the [`dispatch_woken`]
+    /// counter, attributed by worker). Under EPOLLEXCLUSIVE-fanout
+    /// the dispatching worker is whichever one received the event in
+    /// `epoll_wait`, not necessarily the slab owner.
     ///
     /// [`dispatch_woken`]: LazyDebugCounters
     pub(crate) dispatch_woken: [AtomicU64; MAX_WORKERS],
-    /// Worker (the *stealer*) harvested events from peer epoll fds.
-    /// Bumped by the stealer's idx, not the victim's.
-    pub(crate) steal_events_woken: [AtomicU64; MAX_WORKERS],
     /// `begin_park` was called for this worker idx.
     pub(crate) begin_park_calls: [AtomicU64; MAX_WORKERS],
-    /// `try_steal_pass` was called by this worker idx.
-    pub(crate) try_steal_pass_calls: [AtomicU64; MAX_WORKERS],
-    /// fd registered (via either `register_on_worker` sync fast path
-    /// or `apply_register` queued path) onto this worker.
+    /// fd registered via `register_on_worker` onto this worker as the
+    /// slab owner.
     pub(crate) register_per_worker: [AtomicU64; MAX_WORKERS],
 }
 
@@ -319,9 +257,7 @@ impl PerWorkerCounters {
     const fn new() -> Self {
         Self {
             dispatch_woken: [const { AtomicU64::new(0) }; MAX_WORKERS],
-            steal_events_woken: [const { AtomicU64::new(0) }; MAX_WORKERS],
             begin_park_calls: [const { AtomicU64::new(0) }; MAX_WORKERS],
-            try_steal_pass_calls: [const { AtomicU64::new(0) }; MAX_WORKERS],
             register_per_worker: [const { AtomicU64::new(0) }; MAX_WORKERS],
         }
     }
@@ -335,15 +271,6 @@ pub(crate) static PER_WORKER: PerWorkerCounters = PerWorkerCounters::new();
 pub(crate) fn bump_per_worker(arr: &[AtomicU64; MAX_WORKERS], idx: usize) {
     if let Some(slot) = arr.get(idx) {
         slot.fetch_add(1, Ordering::Relaxed);
-    }
-    ensure_dumper();
-}
-
-/// Add `n` to a per-worker counter slot.
-#[inline]
-pub(crate) fn add_per_worker(arr: &[AtomicU64; MAX_WORKERS], idx: usize, n: u64) {
-    if let Some(slot) = arr.get(idx) {
-        slot.fetch_add(n, Ordering::Relaxed);
     }
     ensure_dumper();
 }
@@ -377,44 +304,6 @@ fn spawn_dumper() {
             thread::sleep(Duration::from_millis(250));
             dump_to_stderr();
         });
-}
-
-thread_local! {
-    /// Set while a worker thread is running [`steal_dispatch`]'s wake
-    /// loop. Read by the scheduler's `schedule_task` to attribute the
-    /// local-vs-remote branch to the steal path. Defaults to `false`;
-    /// the [`StealDispatchGuard`] flips it true on construction and
-    /// back to false on drop.
-    ///
-    /// [`steal_dispatch`]: crate::runtime::io::sharded_mio_reactor::SharedRegistry::steal_dispatch
-    static IN_STEAL_DISPATCH: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Returns `true` when the current thread is inside a
-/// `steal_dispatch` wake loop.
-#[inline]
-pub(crate) fn in_steal_dispatch() -> bool {
-    IN_STEAL_DISPATCH.with(Cell::get)
-}
-
-/// RAII guard that marks the current thread as being inside
-/// `steal_dispatch` for the lifetime of the guard. Use a single
-/// guard per `steal_dispatch` invocation, around the wake loop.
-pub(crate) struct StealDispatchGuard {
-    _priv: (),
-}
-
-impl StealDispatchGuard {
-    pub(crate) fn enter() -> Self {
-        IN_STEAL_DISPATCH.with(|c| c.set(true));
-        Self { _priv: () }
-    }
-}
-
-impl Drop for StealDispatchGuard {
-    fn drop(&mut self) {
-        IN_STEAL_DISPATCH.with(|c| c.set(false));
-    }
 }
 
 fn dump_to_stderr() {
@@ -458,9 +347,7 @@ static PREV_PER_WORKER: Mutex<Option<PerWorkerSnapshot>> = Mutex::new(None);
 #[derive(Default, Clone)]
 struct PerWorkerSnapshot {
     dispatch_woken: [u64; MAX_WORKERS],
-    steal_events_woken: [u64; MAX_WORKERS],
     begin_park_calls: [u64; MAX_WORKERS],
-    try_steal_pass_calls: [u64; MAX_WORKERS],
     register_per_worker: [u64; MAX_WORKERS],
 }
 
@@ -475,9 +362,7 @@ impl PerWorkerSnapshot {
         };
         Self {
             dispatch_woken: load_arr(&PER_WORKER.dispatch_woken),
-            steal_events_woken: load_arr(&PER_WORKER.steal_events_woken),
             begin_park_calls: load_arr(&PER_WORKER.begin_park_calls),
-            try_steal_pass_calls: load_arr(&PER_WORKER.try_steal_pass_calls),
             register_per_worker: load_arr(&PER_WORKER.register_per_worker),
         }
     }
@@ -580,12 +465,8 @@ pub(crate) fn maybe_dump_trial() {
     let prev_pw = prev_pw_guard.as_ref();
     render(&mut out, "dispatch_woken_pw",
         &cur_pw.dispatch_woken, prev_pw.map(|p| &p.dispatch_woken));
-    render(&mut out, "steal_events_woken_pw",
-        &cur_pw.steal_events_woken, prev_pw.map(|p| &p.steal_events_woken));
     render(&mut out, "begin_park_calls_pw",
         &cur_pw.begin_park_calls, prev_pw.map(|p| &p.begin_park_calls));
-    render(&mut out, "try_steal_pass_calls_pw",
-        &cur_pw.try_steal_pass_calls, prev_pw.map(|p| &p.try_steal_pass_calls));
     render(&mut out, "register_per_worker_pw",
         &cur_pw.register_per_worker, prev_pw.map(|p| &p.register_per_worker));
 

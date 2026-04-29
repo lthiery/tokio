@@ -1582,12 +1582,6 @@ impl Handle {
                                 &crate::runtime::io::lazy_debug::COUNTERS
                                     .schedule_local_total,
                             );
-                            if crate::runtime::io::lazy_debug::in_steal_dispatch() {
-                                crate::runtime::io::lazy_debug::bump(
-                                    &crate::runtime::io::lazy_debug::COUNTERS
-                                        .steal_dispatch_local_schedule,
-                                );
-                            }
                         }
                         self.schedule_local(core, task, is_yield);
                         return;
@@ -1633,12 +1627,6 @@ impl Handle {
             {
                 if let Some(c) = remote_reason {
                     crate::runtime::io::lazy_debug::bump(c);
-                }
-                if crate::runtime::io::lazy_debug::in_steal_dispatch() {
-                    crate::runtime::io::lazy_debug::bump(
-                        &crate::runtime::io::lazy_debug::COUNTERS
-                            .steal_dispatch_remote_schedule,
-                    );
                 }
             }
             self.push_remote_task(task);
