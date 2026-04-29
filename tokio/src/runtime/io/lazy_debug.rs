@@ -176,6 +176,30 @@ counters! {
     /// hand-off / blocking-pool transition).
     schedule_remote_no_core,
 
+    // ---- meta-epoll readiness stealing ----
+    /// `SharedRegistry::try_steal_drain` entered. One call ≈ one
+    /// peer attempt to drain a sibling worker's child epoll on
+    /// behalf of a stalled task or an idle parker.
+    steal_drain_calls,
+    /// Steal attempt skipped because `try_lock` on `OpsState`
+    /// failed — the owner is mid-dispatch and we yield to it
+    /// rather than block.
+    steal_drain_busy,
+    /// Steal attempt found the owner's child epoll empty
+    /// (kernel returned 0 events). Either another peer just
+    /// drained it or the level-trigger fired spuriously.
+    steal_drain_empty,
+    /// `epoll_wait` on the child epoll returned an error from
+    /// the steal path. Counted but not fatal — the owner-side
+    /// park loop is the canonical drain.
+    steal_drain_err,
+    /// Steal attempt drained at least one event and fired its
+    /// waker. `steal_drain_woken_total` accumulates the per-call
+    /// counts.
+    steal_drain_woken,
+    /// Sum of events fired across all steal calls. Useful for
+    /// end-of-trial dumps to compare with `dispatch_woken`.
+    steal_drain_woken_total,
 }
 
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();

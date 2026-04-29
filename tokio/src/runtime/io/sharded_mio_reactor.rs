@@ -110,6 +110,52 @@ fn unpack_token(t: Token) -> (u8, u32, u32) {
 /// hint, not a correctness knob.
 const EVENTS_CAPACITY: usize = 1024;
 
+/// Per-call budget for [`SharedRegistry::try_steal_drain`]. Sized so
+/// the on-stack `[libc::epoll_event; N]` buffer remains comfortably
+/// in the worker's stack budget (each `epoll_event` is 12 bytes on
+/// Linux x86_64 — 12 * 128 = 1.5 KiB) and so a single steal call
+/// cannot monopolise a peer worker by draining the owner's whole
+/// queue. The level-triggered meta epoll guarantees we'll be woken
+/// again on the same child if events remain undrained.
+#[cfg(target_os = "linux")]
+const STEAL_DRAIN_BUDGET: usize = 128;
+
+/// Convert a raw Linux `epoll_event.events` bitmask into a tokio
+/// [`Ready`]. Mirrors mio's owner-side
+/// `mio::sys::unix::selector::epoll::event::is_*` helpers verbatim
+/// so that the steal-drain path produces the same readiness shape
+/// that the owner's `Reactor::poll_and_dispatch` would produce for
+/// the same kernel event.
+#[cfg(target_os = "linux")]
+fn ready_from_epoll_bits(events: u32) -> Ready {
+    let e = events as libc::c_int;
+    let mut ready = Ready::EMPTY;
+    if (e & libc::EPOLLIN) != 0 || (e & libc::EPOLLPRI) != 0 {
+        ready |= Ready::READABLE;
+    }
+    if (e & libc::EPOLLOUT) != 0 {
+        ready |= Ready::WRITABLE;
+    }
+    if (e & libc::EPOLLERR) != 0 {
+        ready |= Ready::ERROR;
+    }
+    if (e & libc::EPOLLHUP) != 0
+        || ((e & libc::EPOLLIN) != 0 && (e & libc::EPOLLRDHUP) != 0)
+    {
+        ready |= Ready::READ_CLOSED;
+    }
+    if (e & libc::EPOLLHUP) != 0
+        || ((e & libc::EPOLLOUT) != 0 && (e & libc::EPOLLERR) != 0)
+        || e == libc::EPOLLERR
+    {
+        ready |= Ready::WRITE_CLOSED;
+    }
+    if (e & libc::EPOLLPRI) != 0 {
+        ready |= Ready::PRIORITY;
+    }
+    ready
+}
+
 /// State shared between [`Reactor`] (dispatch) and [`SharedRegistry`]
 /// (cross-thread register/deregister).
 ///
@@ -399,6 +445,122 @@ impl SharedRegistry {
     #[cfg(target_os = "linux")]
     pub(crate) fn epoll_fd(&self) -> RawFd {
         self.registry.as_raw_fd()
+    }
+
+    /// Drain at most [`STEAL_DRAIN_BUDGET`] ready events from this
+    /// worker's child epoll fd, dispatching each onto its slab
+    /// without blocking the owner. Called by a *peer* worker on
+    /// behalf of the owner — usually because a meta-epoll park
+    /// observed this child as fireable, or because a task running
+    /// on the peer just migrated in from the owner and is stalled
+    /// waiting on a registration this worker holds.
+    ///
+    /// Two ownership-respecting choices make this safe to layer
+    /// on top of the owner-side park:
+    ///
+    /// * `try_lock` on `OpsState` — never blocks. If the owner is
+    ///   mid-dispatch we return zero immediately. The cost of a
+    ///   "lost steal" is one wasted meta wake; the meta is level-
+    ///   triggered, so the next sibling parker will see the same
+    ///   child as fireable and re-attempt. This keeps the owner
+    ///   on its own cache lines without ever stalling on a peer.
+    /// * Non-blocking `epoll_wait(timeout=0)` on the child epoll
+    ///   fd — drains whatever the kernel has queued without
+    ///   blocking the *thread*. The peer never owns the child's
+    ///   `mio::Poll`, so this is a raw `libc::epoll_wait` rather
+    ///   than a `Poll::poll`.
+    ///
+    /// Returns the number of events that resolved to a live
+    /// `ScheduledIo` and fired its waker.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // wired up by the steal-mode park path in the next commit
+    pub(crate) fn try_steal_drain(&self) -> usize {
+        use super::lazy_debug::{bump, COUNTERS};
+        bump(&COUNTERS.steal_drain_calls);
+
+        // Yield to the owner if it is mid-dispatch. Keeping owner
+        // locality is the whole reason we shard — peers should
+        // never block on the owner's slab.
+        let state = match self.ops.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                bump(&COUNTERS.steal_drain_busy);
+                return 0;
+            }
+        };
+
+        // Non-blocking drain of up to `BUDGET` events from the
+        // owner's child epoll. Anything we don't drain remains
+        // queued and the meta epoll will keep firing on this child
+        // until the owner or a future peer call clears it (level-
+        // triggered).
+        const BUDGET: usize = STEAL_DRAIN_BUDGET;
+        let mut events: [libc::epoll_event; BUDGET] =
+            // SAFETY: `epoll_event` is plain old data; `epoll_wait`
+            // overwrites the slots it returns and we only read the
+            // first `n` of them.
+            unsafe { std::mem::zeroed() };
+        let n = unsafe {
+            libc::epoll_wait(
+                self.registry.as_raw_fd(),
+                events.as_mut_ptr(),
+                BUDGET as i32,
+                0, // non-blocking
+            )
+        };
+        if n < 0 {
+            // EINTR is expected and harmless — we'll be re-invoked
+            // on the next steal trigger. Other errors are logged
+            // but not propagated; the owner-side park loop is the
+            // canonical drain.
+            bump(&COUNTERS.steal_drain_err);
+            return 0;
+        }
+        if n == 0 {
+            bump(&COUNTERS.steal_drain_empty);
+            return 0;
+        }
+
+        let mut woken = 0usize;
+        for ev in events.iter().take(n as usize) {
+            let token = Token(ev.u64 as usize);
+            if token == WAKER_TOKEN {
+                // Owner's external waker fired through this child
+                // epoll. Nothing to dispatch — the owner-side
+                // park-state atomics carry the wake; we don't
+                // consume it here so the owner still observes
+                // `NOTIFIED` on its next `begin_park`.
+                continue;
+            }
+            let (_w, key, gen) = unpack_token(token);
+            let Some(io) = state.slab.get(key as usize) else {
+                bump(&COUNTERS.dispatch_slab_miss);
+                continue;
+            };
+            if io.sharded_mio_gen.load(Ordering::Relaxed) != gen {
+                bump(&COUNTERS.dispatch_gen_mismatch);
+                continue;
+            }
+            let ready = ready_from_epoll_bits(ev.events);
+            bump(&COUNTERS.dispatch_woken);
+            if ready.is_readable() {
+                bump(&COUNTERS.dispatch_woken_readable);
+            }
+            if ready.is_writable() {
+                bump(&COUNTERS.dispatch_woken_writable);
+            }
+            io.set_readiness(Tick::Set, |curr| curr | ready);
+            io.wake(ready);
+            woken += 1;
+        }
+        drop(state);
+        if woken > 0 {
+            bump(&COUNTERS.steal_drain_woken);
+            COUNTERS
+                .steal_drain_woken_total
+                .fetch_add(woken as u64, Ordering::Relaxed);
+        }
+        woken
     }
 
     /// Drop the slab entry identified by `(slab_key, gen)` without
