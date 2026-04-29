@@ -156,6 +156,12 @@ impl ShardedMioParker {
         // as their `OpsState` populates and drains. The lock acquire
         // in [`Reactor::slab_is_empty`] is uncontended on the hot
         // path under single-owner registration.
+        //
+        // A userspace "one-watcher gate" was spiked to suppress the
+        // thundering-herd cost on `busy_owner_idle` but was *not*
+        // adopted: it regressed `busy_owner_3burners` by more than it
+        // saved on idle. See `ShardedMioHandle::meta_watcher_busy`
+        // for the empirical write-up and possible follow-ups.
         let park_on_meta = {
             let cell: &RefCell<Reactor> = self
                 .reactor

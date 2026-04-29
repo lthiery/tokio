@@ -42,6 +42,8 @@ use std::cell::{Cell, RefCell};
 use std::io;
 use std::os::fd::RawFd;
 use std::ptr;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -58,6 +60,57 @@ use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 pub(crate) const EMPTY: usize = 0;
 pub(crate) const PARKED: usize = 1;
 pub(crate) const NOTIFIED: usize = 2;
+
+/// RAII handle for the meta-watcher slot. Constructed by
+/// [`ShardedMioHandle::try_acquire_meta_watcher`]; releases the slot
+/// on drop so the next idle worker can take over.
+///
+/// Holds an `Arc<ShardedMioHandle>` rather than borrowing it so the
+/// guard is 'static — required to pass it across `&mut self` method
+/// boundaries inside the parker without tripping the borrow checker.
+/// The clone is one atomic-inc, dwarfed by the syscall the guard
+/// protects.
+///
+/// **Currently unused.** See [`ShardedMioHandle::meta_watcher_busy`]
+/// for why the gate is preserved as dead code.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub(crate) struct MetaWatcherGuard {
+    handle: Arc<ShardedMioHandle>,
+    released: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl MetaWatcherGuard {
+    /// Release the gate explicitly. Subsequent `Drop` becomes a no-op.
+    /// The intended use was to release the gate as soon as
+    /// `epoll_wait` returns so peers could enter `epoll_wait`
+    /// themselves while this thread runs the dispatch loop — the
+    /// herd-protection invariant the gate exists for only matters for
+    /// the *syscall blocking* phase. See
+    /// [`ShardedMioHandle::meta_watcher_busy`] for the experiment
+    /// write-up explaining why this is currently unused.
+    #[allow(dead_code)]
+    pub(crate) fn release(mut self) {
+        self.do_release();
+    }
+
+    fn do_release(&mut self) {
+        if !self.released {
+            self.handle
+                .meta_watcher_busy
+                .store(false, Ordering::Release);
+            self.released = true;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MetaWatcherGuard {
+    fn drop(&mut self) {
+        self.do_release();
+    }
+}
 
 /// Per-worker coordination slot. One per worker, indexed by worker id.
 pub(crate) struct WorkerState {
@@ -153,6 +206,83 @@ pub(crate) struct ShardedMioHandle {
     /// [`Drop`]. Not exposed publicly outside the sharded-mio module.
     #[cfg(target_os = "linux")]
     meta_epfd: RawFd,
+
+    /// Userspace gate: at most one worker at a time blocks on the meta
+    /// epoll. Workers that lose the gate fall back to parking on their
+    /// own child epoll (which, for an empty slab, just waits for their
+    /// own external waker — exactly the behavior an idle peer wants).
+    ///
+    /// # Motivation
+    ///
+    /// Without the gate, all idle workers `epoll_wait` on the same meta
+    /// fd. Every child readiness event wakes them all (no
+    /// `EPOLLEXCLUSIVE`, see below), they race for the steal-drain
+    /// `try_lock`, the loser pays cache-cold migration cost, and IPC
+    /// drops. `perf stat` on `busy_owner_idle` showed:
+    ///
+    /// - `cpu-migrations` 1.67k → 4.68k (+180%) vs. traditional
+    /// - `task-clock` sys time +21%, user time -22%
+    /// - `L1-dcache-miss-rate` 1.94% → 2.82%
+    /// - sharded_mio +17% slower than traditional on the bench
+    ///
+    /// `EPOLLEXCLUSIVE` would have given us "wake exactly one waiter
+    /// per readiness event" at the kernel layer, but `epoll_ctl(2)`
+    /// explicitly rejects it with EINVAL when the target fd is itself
+    /// an epoll instance — which is exactly our meta-of-children
+    /// shape. So the gate has to live in userspace.
+    ///
+    /// # Why this gate is *not* currently wired up
+    ///
+    /// Two variants were spiked and benched against the no-gate
+    /// baseline at commit `0025ef76` ("re-enable owner-burns
+    /// regression test"):
+    ///
+    /// | variant            | `busy_owner_idle` | `busy_owner_3burners` |
+    /// | ------------------ | ----------------- | --------------------- |
+    /// | no gate (baseline) | sharded +17%      | sharded **−54%**      |
+    /// | strict gate        | tied              | sharded +33%          |
+    /// | early-release gate | sharded +14%      | sharded −12%          |
+    ///
+    /// Both variants improve `busy_owner_idle` (the herd they were
+    /// designed to suppress) but regress `busy_owner_3burners`. The
+    /// reason is symmetric: the same herd that wastes wakes in the
+    /// idle case is what *parallelizes work-stealing* in the busy
+    /// case. With the gate, all dispatched tasks land on the watcher's
+    /// run queue (because `try_steal_drain` schedules to the calling
+    /// thread's local queue) and the other peers stay parked on their
+    /// own child epfd waiting for the runtime's
+    /// `notify_parked_local`/`remote` to fire their external waker.
+    /// That detour adds latency relative to "every peer sees every
+    /// event and grabs work directly".
+    ///
+    /// `tcp_echo_throughput` (sharded -11%) and `tcp_connect_churn`
+    /// (sharded -4%) are unaffected by the gate either way, so the
+    /// trade-off is a micro-bench question. We chose to ship the
+    /// no-gate design and accept the +17% `busy_owner_idle` cost in
+    /// exchange for the -54% `busy_owner_3burners` win and the gain on
+    /// real-world TCP load.
+    ///
+    /// # Possible follow-up directions
+    ///
+    /// To re-enable a gate without losing the `3burners` win, the
+    /// dispatch path would need to redistribute work — e.g. push
+    /// woken tasks to the *owner's* remote queue (so the burning
+    /// owner's queue grows and idle peers steal from it via the
+    /// regular work-stealing path), or split meta watching off onto
+    /// a dedicated steward thread that signals per-worker inboxes.
+    /// Both are larger reworks than this single-flag spike and are
+    /// deferred until the idle case proves to matter for a real
+    /// workload.
+    ///
+    /// The field, the guard type, and `try_acquire_meta_watcher` are
+    /// retained for the next attempt. They are unused at runtime —
+    /// no caller ever invokes the acquire — so the gate is a no-op
+    /// today.
+    ///
+    /// [`epoll_ctl(2)`]: https://man7.org/linux/man-pages/man2/epoll_ctl.2.html
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    meta_watcher_busy: AtomicBool,
 }
 
 impl std::fmt::Debug for ShardedMioHandle {
@@ -209,6 +339,41 @@ impl ShardedMioHandle {
             start_barrier: std::sync::Barrier::new(barrier_count),
             #[cfg(target_os = "linux")]
             meta_epfd,
+            #[cfg(target_os = "linux")]
+            meta_watcher_busy: AtomicBool::new(false),
+        }
+    }
+
+    /// Try to become the runtime-wide *meta watcher*: the single
+    /// thread allowed to block in `epoll_wait` on the meta epoll fd
+    /// at any given moment. Returns `Some(guard)` on success — drop
+    /// the guard (or call `MetaWatcherGuard::release`) to release the
+    /// watcher slot. Returns `None` when another worker already holds
+    /// it; the caller should fall back to parking on its own child
+    /// epoll.
+    ///
+    /// Takes `self: &Arc<Self>` so the returned guard can carry an
+    /// `Arc<Self>` clone, decoupling its lifetime from the caller and
+    /// allowing it to cross `&mut self` boundaries on the parker side.
+    ///
+    /// See [`Self::meta_watcher_busy`] for why this gate exists and
+    /// why no caller currently invokes this method.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn try_acquire_meta_watcher(
+        self: &Arc<Self>,
+    ) -> Option<MetaWatcherGuard> {
+        match self.meta_watcher_busy.compare_exchange(
+            false,
+            true,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Some(MetaWatcherGuard {
+                handle: Arc::clone(self),
+                released: false,
+            }),
+            Err(_) => None,
         }
     }
 
