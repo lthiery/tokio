@@ -45,20 +45,61 @@ use std::time::Duration;
 /// changed, but there is no `ScheduledIo` to dispatch to.
 pub(crate) const WAKER_TOKEN: Token = Token(usize::MAX);
 
-/// Mio `Token` is a `usize`. On 64-bit Linux we pack the slab key into
-/// the low 32 bits and a per-slot generation counter into the high
-/// 32 bits. The two combined never produce `usize::MAX` because slab
-/// keys are practically bounded well below `u32::MAX` and no real gen
-/// reaches `u32::MAX` simultaneously, leaving `WAKER_TOKEN` distinct.
+/// Width in bits of the `worker_idx` field inside the packed token.
+/// Sized to cover today's `lazy_debug::MAX_WORKERS = 16` (idx 0..=15).
+/// See `pack_token` / `unpack_token` for the layout.
+pub(crate) const TOKEN_WORKER_BITS: u32 = 4;
+const TOKEN_WORKER_MASK: u32 = (1 << TOKEN_WORKER_BITS) - 1;
+/// Width of the slab-key field. 28 bits gives ~256 M entries per
+/// worker — well above any realistic working set, and we already
+/// rejected wider keys at the `u32::try_from` site below.
+pub(crate) const TOKEN_KEY_BITS: u32 = 32 - TOKEN_WORKER_BITS;
+const TOKEN_KEY_MASK: u32 = (1 << TOKEN_KEY_BITS) - 1;
+
+/// Mio `Token` is a `usize`. On 64-bit Linux we pack:
+///
+/// ```text
+/// bit  63                32 31              4 3      0
+///     +-------------------+-------------------+--------+
+///     |        gen        |        key        |  wrkr  |
+///     +-------------------+-------------------+--------+
+///        32 bits             28 bits           4 bits
+/// ```
+///
+/// `wrkr` is the registering worker's index, used after the
+/// EPOLLEXCLUSIVE-fanout step to route a peer-delivered event back to
+/// the slab that owns its `ScheduledIo`. Until that step lands `wrkr`
+/// is informational — every dispatch already runs on the registering
+/// worker.
+///
+/// `WAKER_TOKEN` (`usize::MAX`) decodes to (`wrkr=0xF`, `key=0xFFFFFFF`,
+/// `gen=0xFFFFFFFF`); a real registration would need worker idx 15
+/// **and** the maximum `gen` **and** the maximum `key` simultaneously
+/// to collide. Slab keys are bounded by the runtime's working set
+/// (orders of magnitude below `0xFFFFFFF`) so this remains safe in
+/// practice — same argument as before the worker_idx field was added.
 #[inline]
-fn pack_token(key: u32, gen: u32) -> Token {
-    Token(((gen as usize) << 32) | (key as usize))
+fn pack_token(worker_idx: u8, key: u32, gen: u32) -> Token {
+    debug_assert!(
+        (worker_idx as u32) <= TOKEN_WORKER_MASK,
+        "worker_idx {worker_idx} exceeds TOKEN_WORKER_MASK ({TOKEN_WORKER_MASK})",
+    );
+    debug_assert!(
+        key <= TOKEN_KEY_MASK,
+        "slab key {key} exceeds TOKEN_KEY_MASK ({TOKEN_KEY_MASK})",
+    );
+    let raw =
+        ((gen as usize) << 32) | ((key as usize) << TOKEN_WORKER_BITS) | (worker_idx as usize);
+    Token(raw)
 }
 
 #[inline]
-fn unpack_token(t: Token) -> (u32, u32) {
+fn unpack_token(t: Token) -> (u8, u32, u32) {
     let raw = t.0;
-    (raw as u32, (raw >> 32) as u32)
+    let worker_idx = (raw as u32) & TOKEN_WORKER_MASK;
+    let key = ((raw as u32) >> TOKEN_WORKER_BITS) & TOKEN_KEY_MASK;
+    let gen = (raw >> 32) as u32;
+    (worker_idx as u8, key, gen)
 }
 
 /// Mirror of `Ready::from_mio` operating on the raw `epoll_event.events`
@@ -203,6 +244,11 @@ impl ExternalWaker {
 /// entire handle is `Send + Sync` and can be cloned onto
 /// [`ShardedMioHandle::workers`] for any-thread access.
 pub(crate) struct SharedRegistry {
+    /// Index of the owning worker. Stamped into the high-bit `worker_idx`
+    /// field of every token this registry packs, so peer-delivered
+    /// events (post-EPOLLEXCLUSIVE-fanout) can route back to the slab
+    /// holding the `ScheduledIo`.
+    worker_idx: u8,
     registry: Registry,
     ops: Arc<StdMutex<OpsState>>,
     waker: Arc<Waker>,
@@ -299,7 +345,7 @@ impl SharedRegistry {
             state.live_fds.insert(fd, key_u32);
             (key_u32, new_gen)
         };
-        let token = pack_token(key_u32, gen);
+        let token = pack_token(self.worker_idx, key_u32, gen);
         if let Err(e) = self.registry.register(source, token, interest.to_mio()) {
             bump(&COUNTERS.sr_register_err);
             let mut state = self.ops.lock().expect("sharded-mio ops poisoned");
@@ -411,7 +457,13 @@ impl SharedRegistry {
                 bump(&COUNTERS.steal_waker_token);
                 continue;
             }
-            let (key, gen) = unpack_token(token);
+            // Step 1 of EPOLLEXCLUSIVE-fanout: token now carries the
+            // owning worker's index. `steal_dispatch` already operates
+            // on the peer registry's own slab, so we discard the
+            // unpacked `worker_idx` here — it would equal `self`'s
+            // own index by construction. Step 3 collapses this into
+            // the unified dispatch path.
+            let (_wrkr_idx, key, gen) = unpack_token(token);
             let Some(io) = state.slab.get(key as usize) else {
                 bump(&COUNTERS.steal_slab_miss);
                 continue;
@@ -473,9 +525,19 @@ impl Reactor {
     /// obtained via `try_clone`, which on Linux duplicates the epoll
     /// fd's reference so the clone and the owned registry target the
     /// same kernel object.
-    pub(crate) fn shared_registry(&self) -> io::Result<SharedRegistry> {
+    ///
+    /// `worker_idx` is the owning worker's index in the
+    /// `ShardedMioHandle::workers` array. It's stamped into every token
+    /// the registry packs (see `pack_token`) so peer-delivered events
+    /// can route back to this slab.
+    pub(crate) fn shared_registry(&self, worker_idx: usize) -> io::Result<SharedRegistry> {
+        debug_assert!(
+            (worker_idx as u32) <= TOKEN_WORKER_MASK,
+            "worker_idx {worker_idx} exceeds TOKEN_WORKER_MASK ({TOKEN_WORKER_MASK})",
+        );
         let registry = self.poll.registry().try_clone()?;
         Ok(SharedRegistry {
+            worker_idx: worker_idx as u8,
             registry,
             ops: Arc::clone(&self.ops),
             waker: Arc::clone(&self.waker),
@@ -553,7 +615,12 @@ impl Reactor {
                 // around the park call; nothing to dispatch here.
                 continue;
             }
-            let (key, gen) = unpack_token(token);
+            // Step 1 of EPOLLEXCLUSIVE-fanout: token now carries the
+            // owning worker's index. Pre-fanout, every event arrives on
+            // its registering worker's epoll, so the unpacked
+            // `worker_idx` is always `self`'s own. Step 3 makes this
+            // the routing key for peer-delivered events.
+            let (_wrkr_idx, key, gen) = unpack_token(token);
             let Some(io) = state.slab.get(key as usize) else {
                 bump(&COUNTERS.dispatch_slab_miss);
                 // Slab slot already vacated (e.g. a deregister raced

@@ -84,7 +84,7 @@ impl ShardedMioParker {
             "failed to construct per-worker mio::Poll Reactor",
         );
         let shared_registry = reactor
-            .shared_registry()
+            .shared_registry(idx)
             .expect("failed to clone mio::Registry for sharded-mio worker");
         let external_waker = reactor.external_waker();
         handle.register_worker(idx, shared_registry, external_waker);
