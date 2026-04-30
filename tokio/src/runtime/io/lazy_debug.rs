@@ -4,10 +4,10 @@
 //! Compiled in only when the runtime is built with `tokio_unstable` +
 //! `io-sharded-mio` (or `io-uring-reactor`) on Linux. Activated at
 //! runtime by setting the `TOKIO_LAZY_DEBUG` environment variable to a
-//! non-empty value before the runtime starts. The counters are always
-//! incremented (cheap relaxed atomic ops); the env var only gates the
-//! periodic stderr dump thread, so the overhead when not enabled is one
-//! `Once::call_once` plus a no-op spawn.
+//! non-empty value before the runtime starts. The env var gates both
+//! the periodic stderr dump thread and the per-call counter increments,
+//! so the steady-state overhead when not enabled is a single relaxed
+//! atomic load on a read-shared cache line.
 //!
 //! The dump thread prints the full counter set to stderr every 250 ms.
 //! It exits when the process exits — we don't try to join it.
@@ -15,7 +15,7 @@
 use std::env;
 use std::io::Write;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -266,80 +266,40 @@ pub(crate) fn bump_per_worker(arr: &[AtomicU64; MAX_WORKERS], idx: usize) {
     if let Some(slot) = arr.get(idx) {
         slot.fetch_add(1, Ordering::Relaxed);
     }
-    ensure_dumper();
 }
 
-static INIT: Once = Once::new();
-
-/// Bump a counter and ensure the periodic dumper is running (no-op if
-/// `TOKIO_LAZY_DEBUG` is unset). Cheap to call: one relaxed add plus an
-/// already-completed `Once` check on the hot path.
+/// Bump a counter (no-op if `TOKIO_LAZY_DEBUG` is unset).
 #[inline]
 pub(crate) fn bump(c: &AtomicU64) {
     if !enabled() {
         return;
     }
     c.fetch_add(1, Ordering::Relaxed);
-    ensure_dumper();
 }
 
-/// Public re-export so non-`bump` call sites (e.g. the direct
-/// `dispatch_events_total.fetch_add` in `sharded_mio_reactor`) can
-/// share the same gate without re-probing `TOKIO_LAZY_DEBUG`.
-#[inline]
-pub(crate) fn is_lazy_debug_enabled() -> bool {
-    enabled()
-}
-
-/// Cheap runtime gate. Returns whether `TOKIO_LAZY_DEBUG` is set.
+/// Cheap runtime gate over `TOKIO_LAZY_DEBUG`.
 ///
-/// Implemented as a single relaxed load on the steady-state hot path.
-/// Cache-line read-shared across all worker CPUs, so it incurs no
-/// contention bouncing — unlike `fetch_add` on the unconditional
-/// counter atomics, which serialize the cache line across cores.
-///
-/// Three states encoded in `AtomicI8`:
-/// - `-1` = not yet probed
-/// -  `0` = probed, env var not set (counters disabled)
-/// -  `1` = probed, env var set (counters enabled)
-///
-/// First call resolves via `env::var_os` and stores the outcome; all
-/// subsequent calls take the single-load fast path. Worth noting:
-/// because every bump call site was previously paying for a contended
-/// `fetch_add` regardless of the env var, gating here was a 17 µs win
-/// on `busy_owner_idle` (4-worker fanout dispatch).
+/// On the steady-state hot path this is a single read-shared atomic
+/// load with no contention bouncing — unlike `fetch_add` on the
+/// counter atomics, which serializes a cache line across cores. The
+/// first call probes the env var and (if enabled) starts the periodic
+/// dumper thread.
 #[inline]
-fn enabled() -> bool {
-    let v = ENABLED.load(Ordering::Relaxed);
-    if v >= 0 {
-        return v == 1;
-    }
-    enabled_slow()
+pub(crate) fn enabled() -> bool {
+    *ENABLED.get_or_init(|| {
+        let on = env::var_os("TOKIO_LAZY_DEBUG")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        if on {
+            spawn_dumper();
+        }
+        on
+    })
 }
 
-#[cold]
-fn enabled_slow() -> bool {
-    let on = env::var_os("TOKIO_LAZY_DEBUG")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    ENABLED.store(if on { 1 } else { 0 }, Ordering::Relaxed);
-    on
-}
-
-static ENABLED: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-
-#[inline]
-fn ensure_dumper() {
-    INIT.call_once(spawn_dumper);
-}
+static ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn spawn_dumper() {
-    let enabled = env::var_os("TOKIO_LAZY_DEBUG")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    if !enabled {
-        return;
-    }
     let _ = thread::Builder::new()
         .name("lazy-debug-dumper".into())
         .spawn(|| loop {

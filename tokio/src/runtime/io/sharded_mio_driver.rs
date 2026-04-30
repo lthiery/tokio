@@ -54,6 +54,7 @@ use crate::runtime::io::sharded_mio_reactor::{
     DeregisterOutcome, ExternalWaker, Reactor, SharedRegistry,
 };
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
+use crate::util::cacheline::CachePadded;
 
 /// Park-state atomic values. Shape mirrors the uring handle's
 /// transitions so scheduler integration stays familiar.
@@ -114,36 +115,11 @@ impl Drop for MetaWatcherGuard {
 
 /// Per-worker coordination slot. One per worker, indexed by worker id.
 ///
-/// Aligned to one cache-line region per architecture so each
-/// `Vec<WorkerState>` element sits on its own coherence unit. Without
-/// this padding, `park_state` (and any future per-worker hot atomics)
-/// from adjacent workers share a line and produce false-sharing traffic
-/// during the parallel-fanout dispatch path; an A/B (3-run mean each)
-/// on `busy_owner_idle` measured ~8 µs of wall-time savings
-/// (322 → 314 µs) vs the unpadded layout. 128 bytes for x86_64 /
-/// aarch64 / ppc64 matches the Sandy-Bridge spatial-prefetcher pair
-/// size also used by `ScheduledIo` and `tokio::util::CachePadded`.
-#[cfg_attr(
-    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64"),
-    repr(align(128))
-)]
-#[cfg_attr(
-    any(target_arch = "arm", target_arch = "mips", target_arch = "mips64"),
-    repr(align(32))
-)]
-#[cfg_attr(target_arch = "s390x", repr(align(256)))]
-#[cfg_attr(
-    not(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "powerpc64",
-        target_arch = "arm",
-        target_arch = "mips",
-        target_arch = "mips64",
-        target_arch = "s390x",
-    )),
-    repr(align(64))
-)]
+/// The owning `ShardedMioHandle` stores these as
+/// `CachePadded<WorkerState>` so each slot sits on its own coherence
+/// unit; without that, `park_state` from adjacent workers shares a
+/// cache line and produces false-sharing traffic on the
+/// parallel-fanout dispatch path.
 pub(crate) struct WorkerState {
     /// `EMPTY | PARKED | NOTIFIED`. Written by the owning worker on
     /// park/resume; read/CAS'd by unparkers.
@@ -213,7 +189,7 @@ impl std::fmt::Debug for WorkerState {
 ///
 /// [uh]: super::uring_driver::UringHandle
 pub(crate) struct ShardedMioHandle {
-    workers: Box<[WorkerState]>,
+    workers: Box<[CachePadded<WorkerState>]>,
     next_worker: AtomicUsize,
 
     pub(crate) metrics: IoDriverMetrics,
@@ -346,7 +322,7 @@ impl ShardedMioHandle {
     pub(crate) fn new(num_workers: usize) -> Self {
         let mut workers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            workers.push(WorkerState::new());
+            workers.push(CachePadded::new(WorkerState::new()));
         }
         let barrier_count = num_workers.max(1);
 
@@ -432,7 +408,7 @@ impl ShardedMioHandle {
     /// `IoDriverHandle` surface — strictly internal to the
     /// sharded-mio backend.
     #[allow(dead_code)]
-    pub(crate) fn workers(&self) -> &[WorkerState] {
+    pub(crate) fn workers(&self) -> &[CachePadded<WorkerState>] {
         &self.workers
     }
 
