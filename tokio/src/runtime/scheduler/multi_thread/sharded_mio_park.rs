@@ -146,24 +146,32 @@ impl ShardedMioParker {
             return;
         }
 
-        // Mode selection. Workers with live registrations (slab
-        // non-empty) try to become the meta-watcher (one worker at a
-        // time parks on the runtime-wide meta-epoll, draining own
-        // events + stealing from peers); losers of the CAS fall back
-        // to the cache-warm `park_on_own_child` path that drains the
-        // `WAKER_TOKEN` eventfd and the worker's own probe fds.
+        // Mode selection.
         //
-        // Workers whose slab is empty (truly idle — no fds, no
-        // active waiters) thread-park on a futex via
-        // `std::thread::park_timeout`. This is cheaper than
-        // `epoll_wait` on an empty child fd because `futex(WAIT)`
-        // has lower overhead and `Thread::unpark` (futex WAKE) is
-        // also cheaper than `mio::Waker::wake` (eventfd write).
+        // The meta-watcher slot is the runtime-wide drain-of-last-
+        // resort: exactly one worker parks on the meta-epoll (which
+        // monitors ALL children level-triggered) and on wake drains
+        // own events plus calls `try_steal_drain` against every peer.
+        // Whichever worker wins the CAS becomes the meta-watcher,
+        // *regardless of its own slab state*. This is critical for
+        // `busy_owner_3burners`-style workloads: when N-1 workers are
+        // burner-pinned and the only free worker happens to hold no
+        // own registrations, that free worker MUST still serve as the
+        // peer-drain — otherwise the queued events on the busy
+        // children would have nobody to harvest them and probes would
+        // stall until the burners' `BURNER_MS` deadline. Pre-fanout
+        // the slab-empty branch went straight to `thread_park`,
+        // leaving no one on the meta and silently disabling the
+        // readiness-stealing path for that arrangement.
         //
-        // NOTE: a slab-empty worker that happens to be the only
-        // free worker in a partially-pinned arrangement will NOT
-        // serve as the meta-watcher under this gate; the next commit
-        // lifts that restriction.
+        // Losers of the CAS:
+        //   - slab non-empty → `park_on_own_child` (cache-warm
+        //     single-owner mio::Poll::poll on the worker's own
+        //     child epoll fd, which also drains the `WAKER_TOKEN`
+        //     eventfd that the cross-worker `unpark` path writes).
+        //   - slab empty → `thread_park` (futex park, cheaper than
+        //     `epoll_wait` on an empty child fd; the meta-watcher
+        //     covers any peer events for us).
         let slab_empty = {
             let cell: &RefCell<Reactor> = self
                 .reactor
@@ -174,15 +182,13 @@ impl ShardedMioParker {
 
         #[cfg(target_os = "linux")]
         {
-            if slab_empty {
+            let guard = self.handle.try_acquire_meta_watcher();
+            if guard.is_some() {
+                self.park_on_meta(duration);
+            } else if slab_empty {
                 self.thread_park(duration);
             } else {
-                let guard = self.handle.try_acquire_meta_watcher();
-                if guard.is_some() {
-                    self.park_on_meta(duration);
-                } else {
-                    self.park_on_own_child(duration);
-                }
+                self.park_on_own_child(duration);
             }
         }
         #[cfg(not(target_os = "linux"))]
