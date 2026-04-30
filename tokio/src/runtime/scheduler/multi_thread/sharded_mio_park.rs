@@ -243,9 +243,12 @@ impl ShardedMioParker {
     /// ALL workers' child epoll fds (level-triggered). When any child
     /// has events — whether our own or a peer's — the meta fires.
     ///
-    /// On wake:
-    /// 1. Non-blocking poll of own child epoll (dispatch own events)
-    /// 2. Non-blocking steal scan of peers' child epolls
+    /// On wake we use the kernel-returned `epoll_event[]` to selectively
+    /// drain: each child fd was registered with `ev.u64 = worker_idx`,
+    /// so the returned events tell us *exactly* which workers' children
+    /// have pending readiness. We only drain those, avoiding redundant
+    /// `epoll_wait(timeout=0)` syscalls on quiescent peers (which is
+    /// almost everyone in steady-state idle workloads).
     ///
     /// This is how a free worker discovers events stuck on busy workers'
     /// child epolls (the `busy_owner_3burners` path). Without meta-epoll
@@ -271,33 +274,65 @@ impl ShardedMioParker {
 
         // Block on the meta-epoll. Each returned event carries the
         // worker_idx in ev.u64 (stamped at register_worker time).
-        // We only need to know THAT something fired; the dispatch
-        // below handles both own and peer events.
-        let mut meta_events: [libc::epoll_event; 16] =
+        // The buffer is sized to one slot per maximum supported
+        // worker — `TOKEN_WORKER_BITS = 4` caps workers at 16 across
+        // the rest of sharded-mio (see `pack_token`).
+        const MAX_META_EVENTS: usize = 16;
+        let mut meta_events: [libc::epoll_event; MAX_META_EVENTS] =
             unsafe { std::mem::zeroed() };
         let n = unsafe {
             libc::epoll_wait(
                 meta_epfd,
                 meta_events.as_mut_ptr(),
-                meta_events.len() as i32,
+                MAX_META_EVENTS as i32,
                 timeout_ms,
             )
         };
-        let _ = n;
-        // Don't check _n — even on EINTR or timeout, fall through
-        // to the non-blocking own-events + steal scan below. A
-        // spurious wake just costs two cheap non-blocking polls.
 
-        // 1. Non-blocking dispatch of own child epoll events.
-        //    This handles our own probes + waker eventfd.
-        self.park_on_own_child(Some(Duration::ZERO));
+        // n <= 0 means timeout, EINTR, or error. Nothing to drain;
+        // bounce back through the scheduler. The meta is level-
+        // triggered, so any racing event will fire us again next park.
+        if n <= 0 {
+            return;
+        }
 
-        // 2. Non-blocking steal from ALL peers.
-        self.steal_from_peers();
+        // Build a peer-mask from the returned events, and remember
+        // whether our own child fired. `worker_idx` was stamped into
+        // `ev.u64` at `register_worker` time, so the `widx <
+        // num_workers` bound below is enforced by sharded-mio's own
+        // registration path — but we still bounds-check defensively
+        // because any malformed event would otherwise shift past the
+        // top of `peer_mask`.
+        let num_workers = self.handle.workers().len();
+        let mut self_fired = false;
+        let mut peer_mask: u64 = 0;
+        for ev in &meta_events[..n as usize] {
+            let widx = ev.u64 as usize;
+            if widx == self.idx {
+                self_fired = true;
+            } else if widx < num_workers {
+                peer_mask |= 1u64 << widx;
+            }
+        }
+
+        // 1. Drain own child only if it fired. This skips a wasted
+        //    `epoll_wait(timeout=0)` syscall in the (common) case
+        //    where the meta woke us solely on a peer's events.
+        if self_fired {
+            self.park_on_own_child(Some(Duration::ZERO));
+        }
+
+        // 2. Steal only from peers whose children fired. Skips
+        //    `try_steal_drain` (which costs a CAS + a non-blocking
+        //    `epoll_wait`) on every quiescent peer.
+        if peer_mask != 0 {
+            self.steal_from_peers_masked(peer_mask);
+        }
     }
 
-    /// Non-blocking steal scan: iterate all peer workers and call
-    /// [`SharedRegistry::try_steal_drain`] on each. Each call does a
+    /// Non-blocking steal scan over a mask of peer workers. Each set
+    /// bit is a peer whose child epoll has pending events (per the
+    /// meta-epoll's last `epoll_wait` result). Each call does a
     /// non-blocking `epoll_wait(timeout=0)` under a `try_lock` of the
     /// peer's `OpsState`, so a miss costs only one atomic CAS.
     ///
@@ -306,22 +341,26 @@ impl ShardedMioParker {
     /// dispatched its own events can pick up events queued on busy
     /// workers' child epolls while those workers are mid-task and
     /// unable to park.
+    ///
+    /// Safety against concurrent `epoll_wait` is provided by the
+    /// CAS-based `epoll_guard` inside `try_steal_drain`: both the
+    /// owner's `mio::Poll::poll` and the stealer's raw `epoll_wait`
+    /// must CAS the guard `false→true` before entering; whoever
+    /// loses the CAS defers. This closes the TOCTOU window that a
+    /// plain flag could not.
     #[cfg(target_os = "linux")]
-    fn steal_from_peers(&self) {
+    fn steal_from_peers_masked(&self, mut mask: u64) {
         let workers = self.handle.workers();
-        for (peer_idx, slot) in workers.iter().enumerate() {
-            if peer_idx == self.idx {
-                continue;
-            }
-            // Steal readiness events from any peer. Safety against
-            // concurrent epoll_wait is provided by the CAS-based
-            // `epoll_guard` inside `try_steal_drain`: both the
-            // owner's `mio::Poll::poll` and the stealer's raw
-            // `epoll_wait` must CAS the guard `false→true` before
-            // entering; whoever loses the CAS defers. This closes
-            // the TOCTOU window that a plain flag could not.
-            if let Some(registry) = slot.shared_registry.get() {
-                registry.try_steal_drain();
+        while mask != 0 {
+            let peer_idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            // `peer_idx` came from a worker_idx stamped at
+            // `register_worker` time; if the slot exists, the
+            // child epoll registration has already been published.
+            if let Some(slot) = workers.get(peer_idx) {
+                if let Some(registry) = slot.shared_registry.get() {
+                    registry.try_steal_drain();
+                }
             }
         }
     }
