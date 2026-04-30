@@ -147,9 +147,11 @@ impl ShardedMioParker {
         }
 
         // Mode selection. Workers with live registrations (slab
-        // non-empty) park on their own child epoll via
-        // `mio::Poll::poll` — the cache-warm path that correctly
-        // drains the `WAKER_TOKEN` eventfd.
+        // non-empty) try to become the meta-watcher (one worker at a
+        // time parks on the runtime-wide meta-epoll, draining own
+        // events + stealing from peers); losers of the CAS fall back
+        // to the cache-warm `park_on_own_child` path that drains the
+        // `WAKER_TOKEN` eventfd and the worker's own probe fds.
         //
         // Workers whose slab is empty (truly idle — no fds, no
         // active waiters) thread-park on a futex via
@@ -158,12 +160,10 @@ impl ShardedMioParker {
         // has lower overhead and `Thread::unpark` (futex WAKE) is
         // also cheaper than `mio::Waker::wake` (eventfd write).
         //
-        // NOTE: the `busy_owner_idle` benchmark distributes probe
-        // fds to ALL workers, so all slabs are non-empty and this
-        // branch is never taken. The thread-park path only activates
-        // for workloads where some workers genuinely have no fd
-        // registrations — e.g. a service with one listener worker
-        // and N-1 compute-only workers.
+        // NOTE: a slab-empty worker that happens to be the only
+        // free worker in a partially-pinned arrangement will NOT
+        // serve as the meta-watcher under this gate; the next commit
+        // lifts that restriction.
         let slab_empty = {
             let cell: &RefCell<Reactor> = self
                 .reactor
@@ -177,7 +177,12 @@ impl ShardedMioParker {
             if slab_empty {
                 self.thread_park(duration);
             } else {
-                self.park_on_own_child(duration);
+                let guard = self.handle.try_acquire_meta_watcher();
+                if guard.is_some() {
+                    self.park_on_meta(duration);
+                } else {
+                    self.park_on_own_child(duration);
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -226,6 +231,93 @@ impl ShardedMioParker {
         };
         // Park errors are spurious; another wake will arrive.
         let _ = result;
+    }
+
+    /// Park on the runtime-wide meta-epoll fd. The meta-epoll monitors
+    /// ALL workers' child epoll fds (level-triggered). When any child
+    /// has events — whether our own or a peer's — the meta fires.
+    ///
+    /// On wake:
+    /// 1. Non-blocking poll of own child epoll (dispatch own events)
+    /// 2. Non-blocking steal scan of peers' child epolls
+    ///
+    /// This is how a free worker discovers events stuck on busy workers'
+    /// child epolls (the `busy_owner_3burners` path). Without meta-epoll
+    /// parking, the free worker only checks peers once per wake from its
+    /// own child epoll — missing events that arrive on peers but not
+    /// on self.
+    #[cfg(target_os = "linux")]
+    fn park_on_meta(&mut self, duration: Option<Duration>) {
+        let meta_epfd = self.handle.meta_epfd();
+
+        // Convert duration to epoll_wait timeout in ms.
+        let timeout_ms: i32 = match duration {
+            None => -1,
+            Some(d) => {
+                let ms = d.as_millis();
+                if ms > i32::MAX as u128 {
+                    i32::MAX
+                } else {
+                    ms as i32
+                }
+            }
+        };
+
+        // Block on the meta-epoll. Each returned event carries the
+        // worker_idx in ev.u64 (stamped at register_worker time).
+        // We only need to know THAT something fired; the dispatch
+        // below handles both own and peer events.
+        let mut meta_events: [libc::epoll_event; 16] =
+            unsafe { std::mem::zeroed() };
+        let n = unsafe {
+            libc::epoll_wait(
+                meta_epfd,
+                meta_events.as_mut_ptr(),
+                meta_events.len() as i32,
+                timeout_ms,
+            )
+        };
+        let _ = n;
+        // Don't check _n — even on EINTR or timeout, fall through
+        // to the non-blocking own-events + steal scan below. A
+        // spurious wake just costs two cheap non-blocking polls.
+
+        // 1. Non-blocking dispatch of own child epoll events.
+        //    This handles our own probes + waker eventfd.
+        self.park_on_own_child(Some(Duration::ZERO));
+
+        // 2. Non-blocking steal from ALL peers.
+        self.steal_from_peers();
+    }
+
+    /// Non-blocking steal scan: iterate all peer workers and call
+    /// [`SharedRegistry::try_steal_drain`] on each. Each call does a
+    /// non-blocking `epoll_wait(timeout=0)` under a `try_lock` of the
+    /// peer's `OpsState`, so a miss costs only one atomic CAS.
+    ///
+    /// This is the readiness-stealing mechanism that closes the
+    /// `busy_owner_3burners` gap: a free worker that has already
+    /// dispatched its own events can pick up events queued on busy
+    /// workers' child epolls while those workers are mid-task and
+    /// unable to park.
+    #[cfg(target_os = "linux")]
+    fn steal_from_peers(&self) {
+        let workers = self.handle.workers();
+        for (peer_idx, slot) in workers.iter().enumerate() {
+            if peer_idx == self.idx {
+                continue;
+            }
+            // Steal readiness events from any peer. Safety against
+            // concurrent epoll_wait is provided by the CAS-based
+            // `epoll_guard` inside `try_steal_drain`: both the
+            // owner's `mio::Poll::poll` and the stealer's raw
+            // `epoll_wait` must CAS the guard `false→true` before
+            // entering; whoever loses the CAS defers. This closes
+            // the TOCTOU window that a plain flag could not.
+            if let Some(registry) = slot.shared_registry.get() {
+                registry.try_steal_drain();
+            }
+        }
     }
 
     /// Build the reactor on the current thread and wait on the startup

@@ -8,7 +8,8 @@
 //! - `IoUring` → `mio::Poll`
 //! - `POLL_ADD_MULTI` SQE → `registry.register(fd, Token, interest)`
 //! - `submit_and_wait(1)` → `poll.poll(&mut events, None)`
-//! - `MSG_RING` + eventfd → a single `mio::Waker` per worker
+//! - `MSG_RING` + eventfd → a [`StealSafeWaker`] per worker (own
+//!   eventfd on Linux, `mio::Waker` fallback elsewhere)
 //! - `user_data` slab/gen/variant → `mio::Token(usize)` keyed into a
 //!   per-reactor `Slab<Arc<ScheduledIo>>` (no gen needed — mio has no
 //!   stale-event race with in-flight kernel ops; once `deregister`
@@ -24,7 +25,9 @@
 //! [`uring_reactor`]: super::uring_reactor
 //! [`ShardedMioHandle::add_source`]: super::sharded_mio_driver::ShardedMioHandle::add_source
 
-use mio::{Events, Poll, Registry, Token, Waker};
+use mio::{Events, Poll, Registry, Token};
+#[cfg(not(target_os = "linux"))]
+use mio::Waker;
 use slab::Slab;
 
 use crate::io::{Interest, Ready};
@@ -36,7 +39,7 @@ use crate::runtime::io::ScheduledIo;
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
@@ -210,20 +213,165 @@ pub(crate) struct Reactor {
     ops: Arc<StdMutex<OpsState>>,
 
     /// Cross-thread waker, cloneable via [`Self::external_waker`] and
-    /// via [`SharedRegistry`]. Mio collapses both the "external thread"
-    /// and "peer worker" wake paths into one [`Waker`] — unlike the
-    /// uring reactor which splits them into eventfd vs. `MSG_RING`.
-    waker: Arc<Waker>,
+    /// via [`SharedRegistry`]. Backed by [`StealSafeWaker`] so peers
+    /// can drain the eventfd via `try_steal_drain` without poisoning
+    /// future wakes.
+    waker: Arc<StealSafeWaker>,
+
+    /// CAS-based mutual-exclusion guard for this worker's child epoll
+    /// fd. `false` = free; `true` = either the owner's
+    /// `mio::Poll::poll` or a peer's raw `epoll_wait` (in
+    /// `try_steal_drain`) is in progress. Both sides CAS `false→true`
+    /// before entering `epoll_wait`; whoever loses the CAS defers.
+    /// This prevents the EPOLLET edge-consumption race that a simple
+    /// TOCTOU flag (`owner_polling`) could not close.
+    #[cfg(target_os = "linux")]
+    epoll_guard: Arc<AtomicBool>,
+}
+
+/// Steal-safe waker: a cross-thread wake primitive that can be
+/// **drained** from any thread without poisoning future wakes.
+///
+/// On Linux this is a raw `eventfd` registered **level-triggered**
+/// (`EPOLLIN`, no `EPOLLET`) on the owning worker's child epoll.
+/// Level-triggered registration guarantees that even if a peer's
+/// raw `libc::epoll_wait` (in `try_steal_drain`) observes the event,
+/// the eventfd keeps firing on subsequent `epoll_wait` calls until
+/// someone drains the count via `read(fd, 8)`. Both the owner's
+/// `poll_and_dispatch` and a peer's `try_steal_drain` call `drain()`
+/// when they see `WAKER_TOKEN`, which resets the count to 0.
+///
+/// This replaces `mio::Waker`, which uses `EPOLLET` internally and
+/// hides the raw eventfd fd — making it impossible to drain from a
+/// peer's raw `epoll_wait` without losing future edges. See
+/// `WATCHER_GATE_STATUS.md` § "The eventfd hazard" for the full
+/// analysis.
+///
+/// On non-Linux, falls back to `mio::Waker` (steal-drain is
+/// Linux-only anyway).
+pub(crate) struct StealSafeWaker {
+    #[cfg(target_os = "linux")]
+    fd: RawFd,
+    #[cfg(not(target_os = "linux"))]
+    mio_waker: Waker,
+}
+
+// SAFETY: eventfd is a kernel object; read/write are thread-safe.
+// mio::Waker is already Send + Sync.
+unsafe impl Send for StealSafeWaker {}
+unsafe impl Sync for StealSafeWaker {}
+
+impl StealSafeWaker {
+    /// Create a new waker and register it on `poll`'s epoll fd.
+    #[cfg(target_os = "linux")]
+    fn new(poll: &Poll) -> io::Result<Self> {
+        let fd = unsafe {
+            libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Register as level-triggered EPOLLIN on the poll's epoll fd.
+        // Level-triggered (no EPOLLET) means: as long as count > 0,
+        // every epoll_wait reports readiness. This is strictly safer
+        // than EPOLLET for cross-thread draining — no lost edges.
+        let epoll_fd = poll.registry().as_raw_fd();
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: WAKER_TOKEN.0 as u64,
+        };
+        let ret = unsafe {
+            libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut ev)
+        };
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            unsafe { libc::close(fd); }
+            return Err(err);
+        }
+        Ok(Self { fd })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new(poll: &Poll) -> io::Result<Self> {
+        Ok(Self {
+            mio_waker: Waker::new(poll.registry(), WAKER_TOKEN)?,
+        })
+    }
+
+    /// Signal the owning reactor. Thread-safe; may be called from
+    /// any thread. Multiple calls before a drain accumulate count
+    /// but produce at most one event per drain cycle (level-triggered
+    /// fires once per `epoll_wait` as long as count > 0).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn wake(&self) -> io::Result<()> {
+        let val: u64 = 1;
+        let ret = unsafe {
+            libc::write(
+                self.fd,
+                &val as *const u64 as *const libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn wake(&self) -> io::Result<()> {
+        self.mio_waker.wake()
+    }
+
+    /// Drain the eventfd count to zero, re-arming the level-triggered
+    /// registration. Called by both `poll_and_dispatch` (owner) and
+    /// `try_steal_drain` (peer) when they observe `WAKER_TOKEN`.
+    ///
+    /// Non-blocking: if count was already 0 (spurious), the `read`
+    /// returns `EAGAIN` — harmless, we ignore the error.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn drain(&self) {
+        let mut buf: u64 = 0;
+        unsafe {
+            libc::read(
+                self.fd,
+                &mut buf as *mut u64 as *mut libc::c_void,
+                std::mem::size_of::<u64>(),
+            );
+        }
+    }
+
+    /// Non-Linux: mio::Waker drains internally during `Poll::poll`.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn drain(&self) {
+        // no-op
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StealSafeWaker {
+    fn drop(&mut self) {
+        // SAFETY: fd was created by eventfd() in new() and has not
+        // been closed elsewhere.
+        unsafe { libc::close(self.fd); }
+    }
+}
+
+impl std::fmt::Debug for StealSafeWaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StealSafeWaker").finish_non_exhaustive()
+    }
 }
 
 /// Cross-thread wake handle. Analogous to
-/// [`uring_reactor::ExternalWaker`][eu], but backed by a `mio::Waker`
-/// rather than an eventfd. Cheap to clone.
+/// [`uring_reactor::ExternalWaker`][eu], backed by a
+/// [`StealSafeWaker`] that can be drained from any thread.
 ///
 /// [eu]: super::uring_reactor::ExternalWaker
 #[derive(Clone)]
 pub(crate) struct ExternalWaker {
-    waker: Arc<Waker>,
+    waker: Arc<StealSafeWaker>,
 }
 
 impl std::fmt::Debug for ExternalWaker {
@@ -234,8 +382,7 @@ impl std::fmt::Debug for ExternalWaker {
 
 impl ExternalWaker {
     /// Wake the owning reactor. Thread-safe; may be called from any
-    /// thread. Mio coalesces pending wakes: multiple calls before the
-    /// target observes the event produce one event.
+    /// thread.
     pub(crate) fn wake(&self) -> io::Result<()> {
         self.waker.wake()
     }
@@ -257,7 +404,13 @@ pub(crate) struct SharedRegistry {
     worker_idx: u8,
     registry: Registry,
     ops: Arc<StdMutex<OpsState>>,
-    waker: Arc<Waker>,
+    waker: Arc<StealSafeWaker>,
+    /// CAS-based guard shared with the owning [`Reactor`]. See
+    /// [`Reactor::epoll_guard`] for semantics. `try_steal_drain`
+    /// CAS-acquires this before its raw `epoll_wait`; the owner's
+    /// `poll_and_dispatch` CAS-acquires before `mio::Poll::poll`.
+    #[cfg(target_os = "linux")]
+    epoll_guard: Arc<AtomicBool>,
 }
 
 /// Outcome of a [`SharedRegistry::register`] call. Carries the
@@ -296,8 +449,8 @@ impl std::fmt::Debug for SharedRegistry {
 
 impl SharedRegistry {
     /// Clone an [`ExternalWaker`] referring to the owning reactor's
-    /// `mio::Waker`. Used by [`ShardedMioHandle::unpark`] to wake a
-    /// parked worker from arbitrary threads.
+    /// [`StealSafeWaker`]. Used by [`ShardedMioHandle::unpark`] to
+    /// wake a parked worker from arbitrary threads.
     ///
     /// [`ShardedMioHandle::unpark`]: super::sharded_mio_driver::ShardedMioHandle::unpark
     pub(crate) fn waker(&self) -> ExternalWaker {
@@ -473,10 +626,25 @@ impl SharedRegistry {
     /// Returns the number of events that resolved to a live
     /// `ScheduledIo` and fired its waker.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // wired up by the steal-mode park path in the next commit
     pub(crate) fn try_steal_drain(&self) -> usize {
         use super::lazy_debug::{bump, COUNTERS};
         bump(&COUNTERS.steal_drain_calls);
+
+        // CAS-acquire the epoll guard. If the owner (or another
+        // stealer) currently holds it, bail — a concurrent raw
+        // epoll_wait on the same child fd would consume EPOLLET
+        // edges. Unlike a plain load-check, the CAS is atomic with
+        // the acquisition, closing the TOCTOU window that allowed
+        // the owner to enter mio::Poll::poll between our check and
+        // our epoll_wait.
+        if self
+            .epoll_guard
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            bump(&COUNTERS.steal_drain_busy);
+            return 0;
+        }
 
         // Yield to the owner if it is mid-dispatch. Keeping owner
         // locality is the whole reason we shard — peers should
@@ -485,6 +653,7 @@ impl SharedRegistry {
             Ok(g) => g,
             Err(_) => {
                 bump(&COUNTERS.steal_drain_busy);
+                self.epoll_guard.store(false, Ordering::Release);
                 return 0;
             }
         };
@@ -514,10 +683,12 @@ impl SharedRegistry {
             // but not propagated; the owner-side park loop is the
             // canonical drain.
             bump(&COUNTERS.steal_drain_err);
+            self.epoll_guard.store(false, Ordering::Release);
             return 0;
         }
         if n == 0 {
             bump(&COUNTERS.steal_drain_empty);
+            self.epoll_guard.store(false, Ordering::Release);
             return 0;
         }
 
@@ -525,11 +696,16 @@ impl SharedRegistry {
         for ev in events.iter().take(n as usize) {
             let token = Token(ev.u64 as usize);
             if token == WAKER_TOKEN {
-                // Owner's external waker fired through this child
-                // epoll. Nothing to dispatch — the owner-side
-                // park-state atomics carry the wake; we don't
-                // consume it here so the owner still observes
-                // `NOTIFIED` on its next `begin_park`.
+                // Owner's unpark notification — skip without
+                // draining. The owner must see this in its own
+                // `mio::Poll::poll` to return from park. Draining
+                // here would consume the notification and cause the
+                // owner to block in `poll` even though `park_state`
+                // is `NOTIFIED` (the owner has already passed
+                // `begin_park` and won't re-check). The level-
+                // triggered eventfd will keep firing on subsequent
+                // `epoll_wait(0)` calls, but `continue` skips it
+                // cheaply — one wasted event slot per steal call.
                 continue;
             }
             let (_w, key, gen) = unpack_token(token);
@@ -554,6 +730,10 @@ impl SharedRegistry {
             woken += 1;
         }
         drop(state);
+        // Release the epoll guard now that both the raw epoll_wait
+        // and the slab dispatch are complete. The owner's next
+        // poll_and_dispatch CAS will succeed.
+        self.epoll_guard.store(false, Ordering::Release);
         if woken > 0 {
             bump(&COUNTERS.steal_drain_woken);
             COUNTERS
@@ -590,7 +770,7 @@ impl Reactor {
     /// so the `CURRENT_WORKER` TLS install lands at the same point.
     pub(crate) fn new() -> io::Result<Self> {
         let poll = Poll::new()?;
-        let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
+        let waker = Arc::new(StealSafeWaker::new(&poll)?);
         Ok(Self {
             poll,
             events: Events::with_capacity(EVENTS_CAPACITY),
@@ -600,6 +780,8 @@ impl Reactor {
                 live_fds: HashMap::new(),
             })),
             waker,
+            #[cfg(target_os = "linux")]
+            epoll_guard: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -623,12 +805,14 @@ impl Reactor {
             registry,
             ops: Arc::clone(&self.ops),
             waker: Arc::clone(&self.waker),
+            #[cfg(target_os = "linux")]
+            epoll_guard: Arc::clone(&self.epoll_guard),
         })
     }
 
-    /// Cross-thread wake handle. Unlike uring (which has distinct
-    /// eventfd and MSG_RING paths), mio collapses both into one
-    /// `Waker`, so this is the single cross-thread wake mechanism.
+    /// Cross-thread wake handle backed by [`StealSafeWaker`].
+    /// Unlike mio's `Waker` (EPOLLET), this waker is safe to drain
+    /// from any thread — see [`StealSafeWaker`].
     pub(crate) fn external_waker(&self) -> ExternalWaker {
         ExternalWaker {
             waker: Arc::clone(&self.waker),
@@ -658,6 +842,33 @@ impl Reactor {
     }
 
     fn poll_and_dispatch(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        // CAS-acquire the epoll guard before entering mio::Poll::poll.
+        // A peer stealer may briefly hold the guard for a non-blocking
+        // epoll_wait(timeout=0); spin until it releases. The spin is
+        // bounded: the stealer's syscall is non-blocking and the
+        // STEAL_DRAIN_BUDGET caps dispatch work.
+        #[cfg(target_os = "linux")]
+        {
+            while self
+                .epoll_guard
+                .compare_exchange_weak(
+                    false,
+                    true,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                std::hint::spin_loop();
+            }
+        }
+        let result = self.poll_and_dispatch_inner(timeout);
+        #[cfg(target_os = "linux")]
+        self.epoll_guard.store(false, Ordering::Release);
+        result
+    }
+
+    fn poll_and_dispatch_inner(&mut self, timeout: Option<Duration>) -> io::Result<()> {
         use super::lazy_debug::{bump, COUNTERS};
         bump(&COUNTERS.dispatch_calls);
         // Resolve our worker idx once for per-worker attribution. TLS
@@ -706,6 +917,9 @@ impl Reactor {
             let token = event.token();
             if token == WAKER_TOKEN {
                 waker_token_count += 1;
+                // Drain the eventfd count so the level-triggered
+                // registration stops firing until the next wake().
+                self.waker.drain();
                 continue;
             }
             let (_w, key, gen) = unpack_token(token);
