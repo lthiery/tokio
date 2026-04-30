@@ -113,6 +113,37 @@ impl Drop for MetaWatcherGuard {
 }
 
 /// Per-worker coordination slot. One per worker, indexed by worker id.
+///
+/// Aligned to one cache-line region per architecture so each
+/// `Vec<WorkerState>` element sits on its own coherence unit. Without
+/// this padding, `park_state` (and any future per-worker hot atomics)
+/// from adjacent workers share a line and produce false-sharing traffic
+/// during the parallel-fanout dispatch path; an A/B (3-run mean each)
+/// on `busy_owner_idle` measured ~8 µs of wall-time savings
+/// (322 → 314 µs) vs the unpadded layout. 128 bytes for x86_64 /
+/// aarch64 / ppc64 matches the Sandy-Bridge spatial-prefetcher pair
+/// size also used by `ScheduledIo` and `tokio::util::CachePadded`.
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64"),
+    repr(align(128))
+)]
+#[cfg_attr(
+    any(target_arch = "arm", target_arch = "mips", target_arch = "mips64"),
+    repr(align(32))
+)]
+#[cfg_attr(target_arch = "s390x", repr(align(256)))]
+#[cfg_attr(
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "powerpc64",
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "s390x",
+    )),
+    repr(align(64))
+)]
 pub(crate) struct WorkerState {
     /// `EMPTY | PARKED | NOTIFIED`. Written by the owning worker on
     /// park/resume; read/CAS'd by unparkers.
