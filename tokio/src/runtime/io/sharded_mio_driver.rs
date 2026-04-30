@@ -76,6 +76,7 @@ pub(crate) const NOTIFIED: usize = 2;
 /// guard (or via `release()`) once the gate-protected syscall has
 /// returned and the dispatch loop is ready to release the slot.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 pub(crate) struct MetaWatcherGuard {
     handle: Arc<ShardedMioHandle>,
     released: bool,
@@ -358,6 +359,7 @@ impl ShardedMioHandle {
     ///
     /// See [`Self::meta_watcher_busy`] for the gate's motivation.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub(crate) fn try_acquire_meta_watcher(
         self: &Arc<Self>,
     ) -> Option<MetaWatcherGuard> {
@@ -380,6 +382,7 @@ impl ShardedMioHandle {
     /// the upcoming steal-mode `epoll_wait` on the meta fd. Not
     /// exposed publicly outside the sharded-mio backend.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub(crate) fn meta_epfd(&self) -> RawFd {
         self.meta_epfd
     }
