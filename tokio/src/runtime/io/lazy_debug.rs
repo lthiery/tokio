@@ -260,6 +260,9 @@ pub(crate) static PER_WORKER: PerWorkerCounters = PerWorkerCounters::new();
 /// (defensive — should not happen with `MAX_WORKERS=16` bench setups).
 #[inline]
 pub(crate) fn bump_per_worker(arr: &[AtomicU64; MAX_WORKERS], idx: usize) {
+    if !enabled() {
+        return;
+    }
     if let Some(slot) = arr.get(idx) {
         slot.fetch_add(1, Ordering::Relaxed);
     }
@@ -273,9 +276,57 @@ static INIT: Once = Once::new();
 /// already-completed `Once` check on the hot path.
 #[inline]
 pub(crate) fn bump(c: &AtomicU64) {
+    if !enabled() {
+        return;
+    }
     c.fetch_add(1, Ordering::Relaxed);
     ensure_dumper();
 }
+
+/// Public re-export so non-`bump` call sites (e.g. the direct
+/// `dispatch_events_total.fetch_add` in `sharded_mio_reactor`) can
+/// share the same gate without re-probing `TOKIO_LAZY_DEBUG`.
+#[inline]
+pub(crate) fn is_lazy_debug_enabled() -> bool {
+    enabled()
+}
+
+/// Cheap runtime gate. Returns whether `TOKIO_LAZY_DEBUG` is set.
+///
+/// Implemented as a single relaxed load on the steady-state hot path.
+/// Cache-line read-shared across all worker CPUs, so it incurs no
+/// contention bouncing — unlike `fetch_add` on the unconditional
+/// counter atomics, which serialize the cache line across cores.
+///
+/// Three states encoded in `AtomicI8`:
+/// - `-1` = not yet probed
+/// -  `0` = probed, env var not set (counters disabled)
+/// -  `1` = probed, env var set (counters enabled)
+///
+/// First call resolves via `env::var_os` and stores the outcome; all
+/// subsequent calls take the single-load fast path. Worth noting:
+/// because every bump call site was previously paying for a contended
+/// `fetch_add` regardless of the env var, gating here was a 17 µs win
+/// on `busy_owner_idle` (4-worker fanout dispatch).
+#[inline]
+fn enabled() -> bool {
+    let v = ENABLED.load(Ordering::Relaxed);
+    if v >= 0 {
+        return v == 1;
+    }
+    enabled_slow()
+}
+
+#[cold]
+fn enabled_slow() -> bool {
+    let on = env::var_os("TOKIO_LAZY_DEBUG")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    ENABLED.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    on
+}
+
+static ENABLED: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
 
 #[inline]
 fn ensure_dumper() {

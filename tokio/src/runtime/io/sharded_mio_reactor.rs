@@ -683,9 +683,16 @@ impl Reactor {
         }
 
         let event_count = events.iter().count() as u64;
-        COUNTERS
-            .dispatch_events_total
-            .fetch_add(event_count, Ordering::Relaxed);
+        // Gate the contended `dispatch_events_total` accumulator through
+        // the same env-var-loaded flag as `bump()`. Skipping this
+        // `fetch_add` removed measurable cross-core cache-line traffic
+        // in the 4-worker fanout dispatch hot path; see
+        // `lazy_debug::enabled` for the rationale.
+        if super::lazy_debug::is_lazy_debug_enabled() {
+            COUNTERS
+                .dispatch_events_total
+                .fetch_add(event_count, Ordering::Relaxed);
+        }
         if event_count == 0 {
             bump(&COUNTERS.dispatch_zero_events);
             return Ok(());
