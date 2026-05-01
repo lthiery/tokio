@@ -11,7 +11,7 @@ use crate::loom::sync::Arc;
 use crate::runtime::driver;
 use crate::runtime::io::sharded_mio_driver::{
     clear_local_handle, clear_local_reactor, install_local_handle_raw,
-    install_local_reactor_raw, ShardedMioHandle,
+    install_local_reactor_raw, ParkMode, ShardedMioHandle,
 };
 use crate::runtime::io::sharded_mio_reactor::Reactor;
 use crate::runtime::scheduler::multi_thread::park::HadDriver;
@@ -138,15 +138,26 @@ impl ShardedMioParker {
         // Lazy-init on this thread, the first time we park. Keeps
         // parity with the uring parker's startup ordering so that
         // `SharedRegistry` is published before `park_state` can be
-        // observed as `PARKED`.
+        // observed as `PARKED_*`.
         self.ensure_reactor_installed();
 
-        // Notified fast-path: no syscall needed.
-        if self.handle.begin_park(self.idx) {
+        // Cheap fast-path: if a notification is already pending we
+        // can skip mode selection entirely. Crucial because mode
+        // selection runs `try_acquire_meta_watcher` (a CAS on a
+        // runtime-wide `AtomicBool`), which would otherwise be
+        // contended on every park even in the steady-state hot
+        // loop where `begin_park` will fast-path back. Pre-fix,
+        // sync_mpsc/contention/bounded showed the meta-watcher
+        // gate as a measurable shared-line bouncer when every
+        // worker hit it per park.
+        if self.handle.try_consume_notified(self.idx) {
             return;
         }
 
-        // Mode selection.
+        // Mode selection (must precede the slow-path `begin_park`
+        // so that the CAS can publish the chosen branch's
+        // `PARKED_<mode>` token — see `ParkMode` and
+        // `ShardedMioHandle::unpark`).
         //
         // The meta-watcher slot is the runtime-wide drain-of-last-
         // resort: exactly one worker parks on the meta-epoll (which
@@ -181,19 +192,44 @@ impl ShardedMioParker {
         };
 
         #[cfg(target_os = "linux")]
-        {
+        let (mode, _meta_guard) = {
             let guard = self.handle.try_acquire_meta_watcher();
             if guard.is_some() {
-                self.park_on_meta(duration);
+                (ParkMode::Meta, guard)
             } else if slab_empty {
-                self.thread_park(duration);
+                (ParkMode::Thread, None)
             } else {
-                self.park_on_own_child(duration);
+                (ParkMode::OwnChild, None)
             }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let mode = {
+            let _ = slab_empty;
+            ParkMode::OwnChild
+        };
+
+        // Notified fast-path: no syscall needed. Publishes the
+        // chosen `mode` only on the slow path; the fast-path branch
+        // observes `NOTIFIED` and clears it back to `EMPTY` without
+        // ever recording a `PARKED_*` state — so a racing unpark is
+        // either folded into this same `NOTIFIED` (idempotent) or
+        // hits a fresh `EMPTY` next park and re-CAS'es.
+        //
+        // On linux, dropping `_meta_guard` here on early return
+        // releases the meta-watcher slot so the next idle worker
+        // can take it.
+        if self.handle.begin_park(self.idx, mode) {
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        match mode {
+            ParkMode::Meta => self.park_on_meta(duration),
+            ParkMode::Thread => self.thread_park(duration),
+            ParkMode::OwnChild => self.park_on_own_child(duration),
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = slab_empty;
             self.park_on_own_child(duration);
         }
 
@@ -302,11 +338,20 @@ impl ShardedMioParker {
         // num_workers` bound below is enforced by sharded-mio's own
         // registration path — but we still bounds-check defensively
         // because any malformed event would otherwise shift past the
-        // top of `peer_mask`.
+        // top of `peer_mask`. The sentinel
+        // `ShardedMioHandle::meta_waker_token()` identifies the
+        // meta-waker eventfd that the cross-worker `unpark` path
+        // writes to wake a meta-mode parker; drain it here so the
+        // next wake produces a fresh edge.
         let num_workers = self.handle.workers().len();
+        let meta_waker_token = ShardedMioHandle::meta_waker_token();
         let mut self_fired = false;
         let mut peer_mask: u64 = 0;
         for ev in &meta_events[..n as usize] {
+            if ev.u64 == meta_waker_token {
+                self.handle.drain_meta_waker();
+                continue;
+            }
             let widx = ev.u64 as usize;
             if widx == self.idx {
                 self_fired = true;

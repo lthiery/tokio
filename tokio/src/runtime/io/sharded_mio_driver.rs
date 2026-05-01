@@ -56,11 +56,153 @@ use crate::runtime::io::sharded_mio_reactor::{
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 use crate::util::cacheline::CachePadded;
 
-/// Park-state atomic values. Shape mirrors the uring handle's
-/// transitions so scheduler integration stays familiar.
+/// Park-state atomic values. Five-state encoding so [`ShardedMioHandle::unpark`]
+/// can route to exactly one wake mechanism instead of firing both an
+/// eventfd write and a `Thread::unpark` for every cross-worker unpark.
+///
+/// The parker publishes which branch it took into `park_state`
+/// *before* entering the blocking syscall (via [`ShardedMioHandle::begin_park`]
+/// taking a [`ParkMode`]); the unpark path single-matches on `prev` and
+/// only issues the wake mechanism that is actually load-bearing for the
+/// branch the parker is in. See the unpark module docs for the race
+/// argument: `begin_park`'s CAS publishes the new mode atomically before
+/// any blocking syscall, and `NOTIFIED` short-circuits the entry on the
+/// parker side, so an unpark always wakes the mode the parker is (or is
+/// about to be) blocked in.
 pub(crate) const EMPTY: usize = 0;
-pub(crate) const PARKED: usize = 1;
-pub(crate) const NOTIFIED: usize = 2;
+pub(crate) const PARKED_OWN: usize = 1;
+pub(crate) const PARKED_META: usize = 2;
+pub(crate) const PARKED_THREAD: usize = 3;
+pub(crate) const NOTIFIED: usize = 4;
+
+/// Park branch the worker is about to block in. Passed to
+/// [`ShardedMioHandle::begin_park`] so the published `park_state`
+/// records which wake mechanism the unpark path should use. The
+/// non-Linux variants `Meta` and `Thread` are unreachable but kept
+/// in the enum so callers don't need cfg-fences around the match
+/// expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ParkMode {
+    /// `park_on_own_child` — worker blocks in `mio::Poll::poll` on
+    /// its own child epoll fd. Wake by writing the worker's
+    /// `external_waker` eventfd (registered in the child Poll).
+    OwnChild,
+    /// `park_on_meta` — worker blocks in `epoll_wait` on the
+    /// runtime-wide meta epoll. Wake by writing the meta-waker
+    /// eventfd (registered on the meta epoll with
+    /// `META_WAKER_TOKEN`).
+    #[cfg(target_os = "linux")]
+    Meta,
+    /// `thread_park` — worker blocks in `std::thread::park_timeout`.
+    /// Wake by `Thread::unpark` on the stored handle.
+    #[cfg(target_os = "linux")]
+    Thread,
+}
+
+impl ParkMode {
+    #[inline]
+    fn as_state(self) -> usize {
+        match self {
+            ParkMode::OwnChild => PARKED_OWN,
+            #[cfg(target_os = "linux")]
+            ParkMode::Meta => PARKED_META,
+            #[cfg(target_os = "linux")]
+            ParkMode::Thread => PARKED_THREAD,
+        }
+    }
+}
+
+/// `epoll_event.u64` token used to identify the meta-waker eventfd
+/// when it fires on the meta epoll. Children carry their `worker_idx`
+/// as their u64; this sentinel is well outside any plausible worker
+/// index (`MAX_WORKERS` is 16 on this branch, capped by
+/// `TOKEN_WORKER_BITS`).
+#[cfg(target_os = "linux")]
+const META_WAKER_TOKEN: u64 = u64::MAX;
+
+/// Standalone eventfd registered on the runtime-wide meta epoll fd
+/// with `data.u64 = META_WAKER_TOKEN`. The unpark path writes 1 to
+/// the eventfd to wake whichever worker is currently parked on the
+/// meta epoll (the meta-watcher); the watcher drains it on the way
+/// out of `epoll_wait`.
+///
+/// Sized identical to the per-worker `WAKER_TOKEN` eventfd that
+/// `ExternalWaker` uses, but registered on the meta epoll instead
+/// of any child Poll, so the meta-watcher branch has a wake target
+/// that does not require the watcher to also be the slab owner of
+/// any particular worker.
+#[cfg(target_os = "linux")]
+struct MetaWaker {
+    fd: RawFd,
+}
+
+#[cfg(target_os = "linux")]
+impl MetaWaker {
+    fn new() -> io::Result<Self> {
+        // SAFETY: passing well-defined libc flag constants to
+        // `eventfd(2)` which has no preconditions on the caller.
+        let fd = unsafe {
+            libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    fn fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Increment the eventfd counter, edging the meta epoll
+    /// awake. Idempotent — multiple writes between drains coalesce
+    /// into a single readable edge.
+    fn wake(&self) {
+        let val: u64 = 1;
+        // SAFETY: `self.fd` is a valid eventfd owned by `self` for
+        // the lifetime of `MetaWaker`; `&val` is stack-resident for
+        // the duration of the call. `libc::write` returns `-1` on
+        // failure which we ignore (idempotent best-effort wake; a
+        // spurious EAGAIN cannot happen on a level-counting eventfd
+        // unless the counter would overflow `u64::MAX - 1`, which
+        // we never reach because the watcher drains on every wake).
+        unsafe {
+            let _ = libc::write(
+                self.fd,
+                &val as *const u64 as *const libc::c_void,
+                std::mem::size_of::<u64>(),
+            );
+        }
+    }
+
+    /// Read the eventfd counter back to zero so the next wake
+    /// edge fires `epoll_wait` again. Called by the meta-watcher
+    /// after observing the meta-waker token in the returned
+    /// events.
+    fn drain(&self) {
+        let mut buf: u64 = 0;
+        // SAFETY: same fd lifetime as `wake`; `&mut buf` is stack
+        // resident; `read` may fail with `EAGAIN` if the counter is
+        // already zero (spurious / racing drain), in which case we
+        // simply ignore the error.
+        unsafe {
+            let _ = libc::read(
+                self.fd,
+                &mut buf as *mut u64 as *mut libc::c_void,
+                std::mem::size_of::<u64>(),
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MetaWaker {
+    fn drop(&mut self) {
+        // SAFETY: `self.fd` was created by `eventfd(2)` in `new()`
+        // and not closed elsewhere; `Drop` runs at most once.
+        unsafe { libc::close(self.fd) };
+    }
+}
 
 /// RAII handle for the meta-watcher slot. Constructed by
 /// [`ShardedMioHandle::try_acquire_meta_watcher`]; releases the slot
@@ -284,6 +426,16 @@ pub(crate) struct ShardedMioHandle {
     /// [`epoll_ctl(2)`]: https://man7.org/linux/man-pages/man2/epoll_ctl.2.html
     #[cfg(target_os = "linux")]
     meta_watcher_busy: AtomicBool,
+
+    /// Eventfd registered on `meta_epfd` so the unpark path can wake a
+    /// worker that is currently parked in the meta-watcher branch.
+    /// Owned by the handle: created in [`Self::new`] alongside
+    /// `meta_epfd`, registered on the meta epoll with sentinel
+    /// `META_WAKER_TOKEN`, drained by the meta-watcher in
+    /// [`super::sharded_mio_park::ShardedMioParker::park_on_meta`],
+    /// closed in [`Drop`].
+    #[cfg(target_os = "linux")]
+    meta_waker: MetaWaker,
 }
 
 impl std::fmt::Debug for ShardedMioHandle {
@@ -333,6 +485,46 @@ impl ShardedMioHandle {
             fd
         };
 
+        // Create the meta-waker eventfd and register it on the meta
+        // epoll. The unpark path writes to this fd to wake a worker
+        // currently parked in the meta-watcher branch (see
+        // `ParkMode::Meta`). `META_WAKER_TOKEN` is the sentinel
+        // `epoll_event.u64` the watcher uses to identify the wake
+        // (vs. a child epoll firing on real I/O).
+        #[cfg(target_os = "linux")]
+        let meta_waker = {
+            let mw = match MetaWaker::new() {
+                Ok(mw) => mw,
+                Err(err) => panic!(
+                    "sharded-mio: eventfd for meta_waker failed: {err}",
+                ),
+            };
+            let mut ev = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: META_WAKER_TOKEN,
+            };
+            // SAFETY: `meta_epfd` is freshly created above and
+            // unshared; `mw.fd()` is owned by `mw` for the duration
+            // of this handle (we move it into `Self` below); `&mut
+            // ev` is a fresh stack value the kernel reads but does
+            // not retain.
+            let ret = unsafe {
+                libc::epoll_ctl(
+                    meta_epfd,
+                    libc::EPOLL_CTL_ADD,
+                    mw.fd(),
+                    &mut ev,
+                )
+            };
+            if ret != 0 {
+                let err = io::Error::last_os_error();
+                panic!(
+                    "sharded-mio: epoll_ctl(meta, ADD, meta_waker) failed: {err}",
+                );
+            }
+            mw
+        };
+
         Self {
             workers: workers.into_boxed_slice(),
             next_worker: AtomicUsize::new(0),
@@ -342,6 +534,8 @@ impl ShardedMioHandle {
             meta_epfd,
             #[cfg(target_os = "linux")]
             meta_watcher_busy: AtomicBool::new(false),
+            #[cfg(target_os = "linux")]
+            meta_waker,
         }
     }
 
@@ -385,6 +579,26 @@ impl ShardedMioHandle {
     #[allow(dead_code)]
     pub(crate) fn meta_epfd(&self) -> RawFd {
         self.meta_epfd
+    }
+
+    /// Sentinel `epoll_event.u64` that identifies the meta-waker
+    /// eventfd in the events buffer returned by `epoll_wait` on
+    /// `meta_epfd`. The meta-watcher matches on this token to drain
+    /// the meta-waker (re-arm it for the next wake) instead of
+    /// treating it as a worker child.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn meta_waker_token() -> u64 {
+        META_WAKER_TOKEN
+    }
+
+    /// Drain the meta-waker eventfd. Called by
+    /// `ShardedMioParker::park_on_meta` after observing
+    /// `META_WAKER_TOKEN` in the kernel-returned events.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn drain_meta_waker(&self) {
+        self.meta_waker.drain();
     }
 
     /// Number of workers this handle serves.
@@ -522,29 +736,29 @@ impl ShardedMioHandle {
     }
 
     /// Mark `worker_idx` as notified and — if the worker was parked —
-    /// deliver an actual wake.
+    /// deliver an actual wake to the one mechanism the parker is blocked
+    /// in.
     ///
-    /// Two wake mechanisms are issued unconditionally when the
-    /// previous state was `PARKED`:
+    /// `park_state` carries the [`ParkMode`] the parker took
+    /// ([`PARKED_OWN`] / [`PARKED_META`] / [`PARKED_THREAD`]) so this
+    /// method can issue exactly one kernel wake per cross-worker
+    /// unpark instead of fanning out an `external_waker` eventfd
+    /// write *and* a `Thread::unpark` for every notification.
     ///
-    /// 1. `external_waker.wake()` — eventfd write that wakes the
-    ///    worker if it is the meta-watcher (its child epoll fd is
-    ///    aggregated onto the runtime-wide meta epoll, so the eventfd
-    ///    edge propagates up).
-    /// 2. `Thread::unpark()` on the stored thread handle — wakes the
-    ///    worker if it is thread-parked (lost the watcher CAS and is
-    ///    blocked on `std::thread::park_timeout`).
-    ///
-    /// Both are idempotent and either-or-both-safe to call: the
-    /// `park_state` CAS already gates redundant unparks at the
-    /// application level, so this method is invoked at most once per
-    /// observed `EMPTY → PARKED` cycle. Calling both unconditionally
-    /// avoids a mode-check race (the worker can transition between
-    /// watcher and thread-parker between two parks).
+    /// Race argument (replaces the prior comment that justified the
+    /// double-wake): [`begin_park`] CASes `EMPTY → PARKED_<mode>`
+    /// *before* entering any blocking syscall, with `AcqRel` ordering.
+    /// An unparker that observes `prev = PARKED_<X>` therefore knows
+    /// the parker is either already blocked in `X`'s syscall or has
+    /// just published the mode and is racing toward it; the swap to
+    /// `NOTIFIED` short-circuits the racing parker via `begin_park`'s
+    /// fast-path on the next [`begin_park`] entry. Either way the
+    /// single wake mechanism for `X` is the only one that needs to
+    /// fire.
     ///
     /// Returns `true` if a wake was delivered to the kernel (for
-    /// metrics). Mirrors [`UringHandle::unpark`][uu] but with two
-    /// stacked wake paths instead of one.
+    /// metrics). Mirrors [`UringHandle::unpark`][uu], specialising
+    /// the wake target on the parker's branch.
     ///
     /// [uu]: super::uring_driver::UringHandle::unpark
     pub(crate) fn unpark(&self, worker_idx: usize) -> bool {
@@ -552,36 +766,106 @@ impl ShardedMioHandle {
         bump(&COUNTERS.unpark_calls);
         let slot = &self.workers[worker_idx];
         let prev = slot.park_state.swap(NOTIFIED, Ordering::Release);
-        if prev != PARKED {
-            if prev == EMPTY {
-                bump(&COUNTERS.unpark_was_empty);
-            } else {
-                // prev == NOTIFIED
-                bump(&COUNTERS.unpark_was_notified);
+        match prev {
+            PARKED_OWN => {
+                bump(&COUNTERS.unpark_was_parked);
+                // Worker is in `mio::Poll::poll` on its own child
+                // epoll. The child has its `WAKER_TOKEN` eventfd
+                // registered; writing it edges `epoll_wait` awake.
+                if let Some(waker) = slot.external_waker.get() {
+                    let _ = waker.wake();
+                }
+                true
             }
-            return false;
+            #[cfg(target_os = "linux")]
+            PARKED_META => {
+                bump(&COUNTERS.unpark_was_parked);
+                // Worker is in `epoll_wait` on the runtime-wide meta
+                // epoll. Wake by writing the meta-waker eventfd that
+                // is registered on the meta epoll with sentinel
+                // `META_WAKER_TOKEN`.
+                self.meta_waker.wake();
+                true
+            }
+            #[cfg(target_os = "linux")]
+            PARKED_THREAD => {
+                bump(&COUNTERS.unpark_was_parked);
+                // Worker is in `std::thread::park_timeout`. Wake by
+                // futex via `Thread::unpark`. No eventfd write
+                // needed — saves the redundant syscall the prior
+                // double-wake used to issue.
+                if let Some(thr) = slot.park_thread.get() {
+                    thr.unpark();
+                }
+                true
+            }
+            EMPTY => {
+                bump(&COUNTERS.unpark_was_empty);
+                false
+            }
+            // `NOTIFIED` (or any unexpected state — defensive
+            // fallthrough; the swap above guarantees we never see
+            // `PARKED_*` from a previously-finished cycle).
+            _ => {
+                bump(&COUNTERS.unpark_was_notified);
+                false
+            }
         }
-        bump(&COUNTERS.unpark_was_parked);
-        if let Some(waker) = slot.external_waker.get() {
-            let _ = waker.wake();
-        }
-        if let Some(thr) = slot.park_thread.get() {
-            thr.unpark();
-        }
-        true
     }
 
-    /// Called by the worker on entry to park. Returns `true` if a wake
-    /// was already pending, in which case park should skip the syscall
-    /// and return immediately.
-    pub(crate) fn begin_park(&self, worker_idx: usize) -> bool {
+    /// Cheap pre-park fast-path. If a notification is already
+    /// pending (`park_state == NOTIFIED`), consume it and return
+    /// `true`; otherwise leave state untouched and return `false`.
+    ///
+    /// Called by the parker before mode selection so that the
+    /// hot-loop `notify → wake → re-park → notify` cycle does not
+    /// pay the mode-selection cost (in particular the
+    /// `try_acquire_meta_watcher` `AtomicBool` CAS) on every
+    /// trip through the loop. Workers that pass this check still
+    /// perform the full slow-path [`Self::begin_park`] CAS, so the
+    /// transition `EMPTY → PARKED_<mode>` (and the racing-unparker
+    /// short-circuit) remain atomic.
+    ///
+    /// Race-safe because only the owning worker thread calls this
+    /// method: an unparker can only `swap(NOTIFIED)` and observe
+    /// `prev`; if it observes `prev = NOTIFIED` it does not issue
+    /// a kernel wake (idempotent). If we observe `cur = NOTIFIED`
+    /// here and store `EMPTY`, any unparker swap from `NOTIFIED`
+    /// or `EMPTY` after our store re-arms a fresh `NOTIFIED` for
+    /// the next park (correctly).
+    pub(crate) fn try_consume_notified(&self, worker_idx: usize) -> bool {
+        use super::lazy_debug::{bump, COUNTERS};
+        let slot = &self.workers[worker_idx];
+        // CAS so we don't race with concurrent unparkers that may
+        // be transitioning EMPTY ↔ NOTIFIED. Failure leaves state
+        // untouched; success consumes exactly one notification.
+        if slot
+            .park_state
+            .compare_exchange(NOTIFIED, EMPTY, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            bump(&COUNTERS.begin_park_calls);
+            bump(&COUNTERS.begin_park_fastpath);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Called by the worker on entry to park. Records the chosen
+    /// [`ParkMode`] in `park_state` so a concurrent [`Self::unpark`]
+    /// can route to the matching wake mechanism. Returns `true` if a
+    /// wake was already pending, in which case park should skip the
+    /// syscall and return immediately.
+    pub(crate) fn begin_park(&self, worker_idx: usize, mode: ParkMode) -> bool {
         use super::lazy_debug::{bump, bump_per_worker, COUNTERS, PER_WORKER};
         bump(&COUNTERS.begin_park_calls);
         bump_per_worker(&PER_WORKER.begin_park_calls, worker_idx);
         let slot = &self.workers[worker_idx];
+        let parked_state = mode.as_state();
         match slot.park_state.compare_exchange(
             EMPTY,
-            PARKED,
+            parked_state,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
