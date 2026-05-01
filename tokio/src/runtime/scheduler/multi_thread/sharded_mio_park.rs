@@ -170,43 +170,29 @@ impl ShardedMioParker {
         // own registrations, that free worker MUST still serve as the
         // peer-drain — otherwise the queued events on the busy
         // children would have nobody to harvest them and probes would
-        // stall until the burners' `BURNER_MS` deadline. Pre-fanout
-        // the slab-empty branch went straight to `thread_park`,
-        // leaving no one on the meta and silently disabling the
-        // readiness-stealing path for that arrangement.
+        // stall until the burners' `BURNER_MS` deadline.
         //
-        // Losers of the CAS:
-        //   - slab non-empty → `park_on_own_child` (cache-warm
-        //     single-owner mio::Poll::poll on the worker's own
-        //     child epoll fd, which also drains the `WAKER_TOKEN`
-        //     eventfd that the cross-worker `unpark` path writes).
-        //   - slab empty → `thread_park` (futex park, cheaper than
-        //     `epoll_wait` on an empty child fd; the meta-watcher
-        //     covers any peer events for us).
-        let slab_empty = {
-            let cell: &RefCell<Reactor> = self
-                .reactor
-                .as_deref()
-                .expect("reactor installed");
-            cell.borrow().slab_is_empty()
-        };
-
+        // Loser of the CAS: `park_on_own_child` — cache-warm
+        // single-owner `mio::Poll::poll` on the worker's own child
+        // epoll fd. The Poll always has the `WAKER_TOKEN` eventfd
+        // registered, so it is wakeable even when the slab is
+        // otherwise empty. Slab-empty workers route here rather
+        // than `std::thread::park` so the wake path is uniformly
+        // `external_waker.wake()` (eventfd → epoll edge); a futex
+        // park would be invisible to run-queue activity that lands
+        // before a directly-targeted unpark, which on messaging-
+        // heavy workloads cost ~6% wallclock to `parking_lot::futex_wait`.
         #[cfg(target_os = "linux")]
         let (mode, _meta_guard) = {
             let guard = self.handle.try_acquire_meta_watcher();
             if guard.is_some() {
                 (ParkMode::Meta, guard)
-            } else if slab_empty {
-                (ParkMode::Thread, None)
             } else {
                 (ParkMode::OwnChild, None)
             }
         };
         #[cfg(not(target_os = "linux"))]
-        let mode = {
-            let _ = slab_empty;
-            ParkMode::OwnChild
-        };
+        let mode = ParkMode::OwnChild;
 
         // Notified fast-path: no syscall needed. Publishes the
         // chosen `mode` only on the slow path; the fast-path branch
@@ -225,7 +211,6 @@ impl ShardedMioParker {
         #[cfg(target_os = "linux")]
         match mode {
             ParkMode::Meta => self.park_on_meta(duration),
-            ParkMode::Thread => self.thread_park(duration),
             ParkMode::OwnChild => self.park_on_own_child(duration),
         }
         #[cfg(not(target_os = "linux"))]
@@ -234,22 +219,6 @@ impl ShardedMioParker {
         }
 
         self.handle.end_park(self.idx);
-    }
-
-    /// Thread-park fallback for workers that lost the watcher CAS.
-    /// `Thread::park_timeout` blocks on a futex (cheap park / cheap
-    /// unpark) until either the timeout elapses or the unpark path
-    /// fires `Thread::unpark` on this worker's stored handle. The
-    /// `park_state` CAS already gates redundant unparks at the
-    /// application level, so we don't need a separate "spurious wake"
-    /// loop here — a spurious return just bounces back through the
-    /// scheduler.
-    #[cfg(target_os = "linux")]
-    fn thread_park(&mut self, duration: Option<Duration>) {
-        match duration {
-            None => std::thread::park(),
-            Some(d) => std::thread::park_timeout(d),
-        }
     }
 
     /// Owner-mode park. Block in `mio::Poll::poll` on this worker's
@@ -456,15 +425,6 @@ impl ShardedMioParker {
             install_local_handle_raw(handle_ptr);
         }
         set_current_worker(self.idx);
-
-        // Publish this thread's `Thread` handle so unparkers can
-        // deliver `Thread::unpark` for the thread-park branch of the
-        // watcher gate. Idempotent (`OnceLock::set` returns `Err` on
-        // re-publish, which we ignore — the second caller would land
-        // the same handle anyway).
-        let _ = self.handle.workers()[self.idx]
-            .park_thread
-            .set(std::thread::current());
 
         self.tls_installed = true;
     }

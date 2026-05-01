@@ -819,16 +819,6 @@ impl Reactor {
         }
     }
 
-    /// Returns `true` if this worker currently has no live
-    /// registrations. Used by [`ShardedMioParker`] to choose between
-    /// owner-mode park (own child epoll) and steal-mode park
-    /// (runtime-wide meta epoll). Single short lock acquire — only
-    /// runs once per park decision, not per event.
-    pub(crate) fn slab_is_empty(&self) -> bool {
-        let state = self.ops.lock().expect("sharded-mio ops poisoned");
-        state.slab.is_empty()
-    }
-
     /// Park until at least one event arrives, then dispatch all events.
     /// One `mio::Poll::poll(None)` syscall. Matches the uring reactor's
     /// `park` shape: block, drain, return.

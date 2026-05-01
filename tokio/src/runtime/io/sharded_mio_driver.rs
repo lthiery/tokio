@@ -56,36 +56,40 @@ use crate::runtime::io::sharded_mio_reactor::{
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 use crate::util::cacheline::CachePadded;
 
-/// Park-state atomic values. Five-state encoding so [`ShardedMioHandle::unpark`]
-/// can route to exactly one wake mechanism instead of firing both an
-/// eventfd write and a `Thread::unpark` for every cross-worker unpark.
+/// Park-state atomic values. Encodes which wake mechanism the unpark
+/// path should use so [`ShardedMioHandle::unpark`] can route to exactly
+/// one wake mechanism instead of firing both an eventfd write and a
+/// `Thread::unpark` for every cross-worker unpark.
 ///
-/// The parker publishes which branch it took into `park_state`
-/// *before* entering the blocking syscall (via [`ShardedMioHandle::begin_park`]
+/// The parker publishes which branch it took into `park_state` *before*
+/// entering the blocking syscall (via [`ShardedMioHandle::begin_park`]
 /// taking a [`ParkMode`]); the unpark path single-matches on `prev` and
-/// only issues the wake mechanism that is actually load-bearing for the
-/// branch the parker is in. See the unpark module docs for the race
-/// argument: `begin_park`'s CAS publishes the new mode atomically before
-/// any blocking syscall, and `NOTIFIED` short-circuits the entry on the
-/// parker side, so an unpark always wakes the mode the parker is (or is
-/// about to be) blocked in.
+/// only issues the wake mechanism that is load-bearing for the branch
+/// the parker is in. See the unpark module docs for the race argument:
+/// `begin_park`'s CAS publishes the new mode atomically before any
+/// blocking syscall, and `NOTIFIED` short-circuits the entry on the
+/// parker side, so an unpark always wakes the mode the parker is (or
+/// is about to be) blocked in.
 pub(crate) const EMPTY: usize = 0;
 pub(crate) const PARKED_OWN: usize = 1;
 pub(crate) const PARKED_META: usize = 2;
-pub(crate) const PARKED_THREAD: usize = 3;
-pub(crate) const NOTIFIED: usize = 4;
+pub(crate) const NOTIFIED: usize = 3;
 
 /// Park branch the worker is about to block in. Passed to
 /// [`ShardedMioHandle::begin_park`] so the published `park_state`
 /// records which wake mechanism the unpark path should use. The
-/// non-Linux variants `Meta` and `Thread` are unreachable but kept
-/// in the enum so callers don't need cfg-fences around the match
+/// non-Linux variant `Meta` is unreachable on non-Linux but kept in
+/// the enum so callers don't need cfg-fences around the match
 /// expression.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParkMode {
     /// `park_on_own_child` — worker blocks in `mio::Poll::poll` on
     /// its own child epoll fd. Wake by writing the worker's
     /// `external_waker` eventfd (registered in the child Poll).
+    /// This is the only branch on non-meta-watcher workers; even
+    /// when the worker's slab is empty, the child Poll still has
+    /// the `external_waker` eventfd registered, so `mio::Poll::poll`
+    /// is wakeable by the unpark path.
     OwnChild,
     /// `park_on_meta` — worker blocks in `epoll_wait` on the
     /// runtime-wide meta epoll. Wake by writing the meta-waker
@@ -93,10 +97,6 @@ pub(crate) enum ParkMode {
     /// `META_WAKER_TOKEN`).
     #[cfg(target_os = "linux")]
     Meta,
-    /// `thread_park` — worker blocks in `std::thread::park_timeout`.
-    /// Wake by `Thread::unpark` on the stored handle.
-    #[cfg(target_os = "linux")]
-    Thread,
 }
 
 impl ParkMode {
@@ -106,8 +106,6 @@ impl ParkMode {
             ParkMode::OwnChild => PARKED_OWN,
             #[cfg(target_os = "linux")]
             ParkMode::Meta => PARKED_META,
-            #[cfg(target_os = "linux")]
-            ParkMode::Thread => PARKED_THREAD,
         }
     }
 }
@@ -310,18 +308,6 @@ pub(crate) struct WorkerState {
     /// [`ShardedMioHandle::record_owner_interest`] from the polling
     /// worker's TLS-resolved index.
     pub(crate) interested_workers: AtomicU64,
-
-    /// `std::thread::Thread` handle for the worker that owns this slot.
-    /// Published once by the worker on its first park call (idempotent
-    /// `OnceLock::set`); read by the unpark path to deliver
-    /// `Thread::unpark` for thread-parked (non-watcher) workers.
-    ///
-    /// Uses `OnceLock` rather than eagerly publishing in
-    /// `register_worker` because `register_worker` runs on the
-    /// scheduler-spawn thread, not on the worker's run thread; the
-    /// `Thread` we want is the one that calls `park`. Setting on first
-    /// park is the simplest hook.
-    pub(crate) park_thread: OnceLock<std::thread::Thread>,
 }
 
 impl WorkerState {
@@ -334,7 +320,6 @@ impl WorkerState {
             registrations,
             synced: Mutex::new(synced),
             interested_workers: AtomicU64::new(0),
-            park_thread: OnceLock::new(),
         }
     }
 }
@@ -392,9 +377,10 @@ pub(crate) struct ShardedMioHandle {
     meta_epfd: RawFd,
 
     /// Userspace gate: at most one worker at a time blocks on the
-    /// meta epoll. Workers that lose the gate fall back to
-    /// `std::thread::park_timeout` on the same duration the caller
-    /// requested.
+    /// meta epoll. Workers that lose the gate park on their own
+    /// child epoll fd via [`ShardedMioParker::park_on_own_child`]
+    /// for the duration the caller requested; the meta-watcher
+    /// covers any peer events for them.
     ///
     /// # Motivation
     ///
@@ -740,10 +726,10 @@ impl ShardedMioHandle {
     /// in.
     ///
     /// `park_state` carries the [`ParkMode`] the parker took
-    /// ([`PARKED_OWN`] / [`PARKED_META`] / [`PARKED_THREAD`]) so this
-    /// method can issue exactly one kernel wake per cross-worker
-    /// unpark instead of fanning out an `external_waker` eventfd
-    /// write *and* a `Thread::unpark` for every notification.
+    /// ([`PARKED_OWN`] or [`PARKED_META`]) so this method can issue
+    /// exactly one kernel wake per cross-worker unpark instead of
+    /// fanning out an `external_waker` eventfd write *and* a
+    /// `Thread::unpark` for every notification.
     ///
     /// Race argument (replaces the prior comment that justified the
     /// double-wake): [`begin_park`] CASes `EMPTY → PARKED_<mode>`
@@ -785,18 +771,6 @@ impl ShardedMioHandle {
                 // is registered on the meta epoll with sentinel
                 // `META_WAKER_TOKEN`.
                 self.meta_waker.wake();
-                true
-            }
-            #[cfg(target_os = "linux")]
-            PARKED_THREAD => {
-                bump(&COUNTERS.unpark_was_parked);
-                // Worker is in `std::thread::park_timeout`. Wake by
-                // futex via `Thread::unpark`. No eventfd write
-                // needed — saves the redundant syscall the prior
-                // double-wake used to issue.
-                if let Some(thr) = slot.park_thread.get() {
-                    thr.unpark();
-                }
                 true
             }
             EMPTY => {
