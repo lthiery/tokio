@@ -179,6 +179,56 @@ fn sleep_fires_via_alt_timer() {
 }
 
 #[test]
+fn cross_worker_notify_storm() {
+    // Stress test for the 5-state `park_state` encoding introduced
+    // when `unpark` was specialised to single-route. Hammers
+    // `Notify::notify_one` from many threads while the workers split
+    // between meta-watcher, own-child, and thread-park branches —
+    // exercising every prev-state arm of `unpark`'s match without any
+    // I/O registrations, so the wakes are pure parker traffic.
+    //
+    // The original bug this guards against is the inverse of the
+    // double-wake fix: if `begin_park` published the wrong
+    // `PARKED_<mode>` (e.g. published the slab-empty `Thread`
+    // selection but then took the meta-watcher branch instead),
+    // unpark would write to the futex while the parker is in
+    // `epoll_wait`, the wake would be silently dropped, and this
+    // test would deadlock.
+    use tokio::sync::Notify;
+
+    const TASKS: usize = 32;
+    const ITERS: usize = 1_000;
+
+    for trial in 0..10 {
+        let rt = build_rt(4);
+        rt.block_on(async {
+            let notifies: Vec<Arc<Notify>> = (0..TASKS)
+                .map(|_| Arc::new(Notify::new()))
+                .collect();
+            let mut handles = Vec::with_capacity(TASKS);
+            for i in 0..TASKS {
+                let n = notifies[i].clone();
+                let next = notifies[(i + 1) % TASKS].clone();
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..ITERS {
+                        n.notified().await;
+                        next.notify_one();
+                    }
+                }));
+            }
+            // Kick the chain.
+            notifies[0].notify_one();
+            for h in handles {
+                tokio::time::timeout(Duration::from_secs(30), h)
+                    .await
+                    .unwrap_or_else(|_| panic!("trial {trial}: notify chain deadlocked"))
+                    .unwrap();
+            }
+        });
+    }
+}
+
+#[test]
 fn many_yield_now_across_workers() {
     // Pathological task mix that constantly re-queues itself; exercises
     // the park/unpark atomic fast path repeatedly without actually going
