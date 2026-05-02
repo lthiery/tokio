@@ -45,28 +45,31 @@ use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Default pre-park spin budget. `256` `core::hint::spin_loop()`
-/// iterations was chosen via the budget sweep on `sync_watch` /
-/// `sync_mpsc` / `rt_multi_threaded` benches recorded in the C3
-/// commit message:
+/// Default pre-park spin budget. **Zero (opt-in).**
 ///
-/// | bench | b=0 | b=256 |
-/// |---|---|---|
-/// | `sync_watch/cr/100` | 8.48 ms | 7.56 ms (**-11%**) |
-/// | `sync_watch/cr/1000` | 65.99 ms | 64.39 ms (-2%) |
-/// | `sync_mpsc/contention/bounded` | 1.89 ms | 1.89 ms (=) |
-/// | `rt/spawn_many_remote_idle` | 13.05 ms | 13.01 ms (=) |
+/// The pre-park spin window is a workload-dependent optimisation:
+/// it pays for itself on high-fanout cross-worker wake patterns
+/// (e.g. `tokio::sync::watch::Sender::send` to many subscribers,
+/// `broadcast::Sender` contention), and costs CPU/wall-time on
+/// patterns where most workers never see a cross-worker wake (e.g.
+/// `Notify::notify_one` from one external thread, single-tenant RPC
+/// streams).
 ///
-/// At this budget, ~54% of cross-worker `unpark`s on the watch bench
-/// are caught in the userspace spin window (no syscall delivered);
-/// `sync_mpsc` and `rt` are statistically unchanged.
+/// Because the right value depends on the workload, the substrate
+/// ships with spin disabled and exposes it as an explicit knob. With
+/// `spin_budget == 0` the parker uses a direct
+/// `EMPTY → PARKED_<mode>` CAS (the original pre-SEARCHING path)
+/// and the substrate cost is identical to the prior 4-state machine.
 ///
-/// Override with `TOKIO_PARK_SPIN_BUDGET=<u32>` env var (process-wide)
-/// or [`Builder::enable_park_spin_budget`][bps] (per-runtime, takes
-/// precedence over the env var).
+/// Opt in via [`Builder::enable_park_spin_budget`][bps] (per-runtime,
+/// preferred) or the `TOKIO_PARK_SPIN_BUDGET=<u32>` env var
+/// (process-wide). The Builder method takes precedence over the env
+/// var. A budget around `256` iterations recovers ~10% on
+/// `sync_watch/contention_resubscribe/100` against traditional mio;
+/// see `bench-sweep-results/SUMMARY.txt` for a full sweep.
 ///
 /// [bps]: crate::runtime::Builder::enable_park_spin_budget
-const DEFAULT_SPIN_BUDGET: u32 = 256;
+const DEFAULT_SPIN_BUDGET: u32 = 0;
 
 /// Read `TOKIO_PARK_SPIN_BUDGET` once per process. Each
 /// `ShardedMioParker` snapshots the resolved budget into a local
@@ -283,53 +286,63 @@ impl ShardedMioParker {
         self.ensure_reactor_installed();
 
         // Cheap fast-path: if a notification is already pending we
-        // can skip the SEARCHING gate and mode selection entirely.
+        // can skip the spin gate and mode selection entirely.
         if self.handle.try_consume_notified(self.idx) {
             return;
         }
 
-        // Enter the pre-park spin window: CAS EMPTY → SEARCHING.
-        // From here until either the spin sees NOTIFIED or
-        // `commit_park` succeeds, a concurrent `unpark` is yanked
-        // back into userspace (no kernel wake) — the swap to NOTIFIED
-        // happens against `prev = SEARCHING`, and the parker observes
-        // it either via `park_state_load` inside the spin loop or via
-        // the `commit_park` CAS failing with `Err(NOTIFIED)`.
+        // Two substrate paths:
         //
-        // `Err` here means we lost a race against an unpark from
-        // EMPTY (state was already NOTIFIED on entry); the call has
-        // already cleared state back to EMPTY for us.
-        if self.handle.begin_searching(self.idx).is_err() {
-            return;
-        }
+        // - `spin_budget > 0`: enter the pre-park spin window via
+        //   `begin_searching` (CAS EMPTY → SEARCHING). A concurrent
+        //   `unpark` swap against `prev = SEARCHING` is yanked back
+        //   into userspace; we observe it from `park_state_load` in
+        //   the spin loop or via `commit_park` failing with NOTIFIED.
+        //
+        // - `spin_budget == 0`: skip SEARCHING entirely and use the
+        //   direct `EMPTY → PARKED_<mode>` CAS via `begin_park_direct`.
+        //   This is one CAS instead of two and matches the original
+        //   pre-SEARCHING substrate cost. Workloads that have not
+        //   opted into spin pay zero substrate overhead vs the prior
+        //   4-state machine.
+        let spin = self.spin_budget;
 
-        // Spin window. Each iteration reads `park_state`; if a
-        // cross-worker `unpark` ran during the spin (swapping
-        // `prev = SEARCHING` to `NOTIFIED`) we observe it here and
-        // bail without ever entering the kernel. The number of
-        // iterations is sized by `TOKIO_PARK_SPIN_BUDGET`,
-        // snapshotted into `self.spin_budget` at construction so
-        // the inner loop does not pay an atomic load per park to
-        // re-read it.
-        //
-        // `core::hint::spin_loop()` lowers to the architecture's
-        // spin-pause hint (`PAUSE` on x86) so the SMT sibling and
-        // the pipeline backend stay free for whatever cross-core
-        // wake activity is in flight. The cost per iteration on
-        // recent x86 is dominated by `PAUSE` itself (~100 cycles).
-        for _ in 0..self.spin_budget {
-            if self.handle.park_state_load(self.idx) == NOTIFIED {
-                self.handle.abort_searching(self.idx);
+        if spin > 0 {
+            // `Err` here means we lost a race against an unpark from
+            // EMPTY (state was already NOTIFIED on entry); the call
+            // has already cleared state back to EMPTY for us.
+            if self.handle.begin_searching(self.idx).is_err() {
                 return;
             }
-            core::hint::spin_loop();
+
+            // Spin window. Each iteration reads `park_state`; if a
+            // cross-worker `unpark` ran during the spin (swapping
+            // `prev = SEARCHING` to `NOTIFIED`) we observe it here and
+            // bail without ever entering the kernel. The number of
+            // iterations is sized by `TOKIO_PARK_SPIN_BUDGET`,
+            // snapshotted into `self.spin_budget` at construction so
+            // the inner loop does not pay an atomic load per park to
+            // re-read it.
+            //
+            // `core::hint::spin_loop()` lowers to the architecture's
+            // spin-pause hint (`PAUSE` on x86) so the SMT sibling and
+            // the pipeline backend stay free for whatever cross-core
+            // wake activity is in flight. The cost per iteration on
+            // recent x86 is dominated by `PAUSE` itself (~100 cycles).
+            for _ in 0..spin {
+                if self.handle.park_state_load(self.idx) == NOTIFIED {
+                    self.handle.abort_searching(self.idx);
+                    return;
+                }
+                core::hint::spin_loop();
+            }
         }
 
-        // Mode selection — only runs on entries that go past the
-        // SEARCHING gate, i.e. that are committing to a kernel park.
-        // The hot `notify → wake → re-park → notify` cycle is caught
-        // by `try_consume_notified` above, so the meta-watcher CAS
-        // no longer fires on the steady-state notification loop.
+        // Mode selection — only runs on entries that are committing
+        // to a kernel park. The hot `notify → wake → re-park → notify`
+        // cycle is caught by `try_consume_notified` above, so the
+        // meta-watcher CAS no longer fires on the steady-state
+        // notification loop.
         //
         // The meta-watcher slot is the runtime-wide drain-of-last-
         // resort: exactly one worker parks on the meta-epoll (which
@@ -361,13 +374,16 @@ impl ShardedMioParker {
         #[cfg(not(target_os = "linux"))]
         let mode = ParkMode::OwnChild;
 
-        // Commit to a kernel park: CAS SEARCHING → PARKED_<mode>.
-        // `Err` here means we were yanked while selecting a mode
-        // (state observed NOTIFIED); the call has already cleared
-        // state back to EMPTY for us. On linux, dropping
-        // `_meta_guard` releases the meta-watcher slot so the next
-        // idle worker can take it.
-        if self.handle.commit_park(self.idx, mode).is_err() {
+        // Commit to a kernel park. `Err` means we were yanked (state
+        // observed NOTIFIED); the call has already cleared state back
+        // to EMPTY for us. On linux, dropping `_meta_guard` releases
+        // the meta-watcher slot so the next idle worker can take it.
+        let commit = if spin > 0 {
+            self.handle.commit_park(self.idx, mode)
+        } else {
+            self.handle.begin_park_direct(self.idx, mode)
+        };
+        if commit.is_err() {
             return;
         }
 

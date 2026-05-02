@@ -886,6 +886,50 @@ impl ShardedMioHandle {
         }
     }
 
+    /// Direct one-step park CAS: `EMPTY → PARKED_<mode>`. Used by the
+    /// no-spin substrate path (`spin_budget == 0`) so workloads that
+    /// opt out of pre-park spin do not pay the two-CAS
+    /// (`EMPTY → SEARCHING → PARKED_*`) transition cost.
+    ///
+    /// Returns `Err(())` if a notification was already pending on
+    /// entry (`park_state == NOTIFIED`); the call clears state back
+    /// to `EMPTY` and the caller should return without parking.
+    ///
+    /// Cross-worker `unpark` correctness is unaffected: the unpark
+    /// path's `swap(NOTIFIED)` produces `prev == PARKED_<mode>` (kernel
+    /// wake) or `prev == EMPTY` (no-op) the same way it did before
+    /// SEARCHING was introduced.
+    pub(crate) fn begin_park_direct(
+        &self,
+        worker_idx: usize,
+        mode: ParkMode,
+    ) -> Result<(), ()> {
+        use super::lazy_debug::{bump, bump_per_worker, COUNTERS, PER_WORKER};
+        bump(&COUNTERS.begin_park_calls);
+        bump_per_worker(&PER_WORKER.begin_park_calls, worker_idx);
+        let slot = &self.workers[worker_idx];
+        let parked_state = mode.as_state();
+        match slot.park_state.compare_exchange(
+            EMPTY,
+            parked_state,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                bump(&COUNTERS.begin_park_parked);
+                Ok(())
+            }
+            Err(NOTIFIED) => {
+                bump(&COUNTERS.begin_park_fastpath);
+                slot.park_state.store(EMPTY, Ordering::Release);
+                Err(())
+            }
+            Err(state) => {
+                panic!("inconsistent park_state on begin_park_direct: {state}")
+            }
+        }
+    }
+
     /// Commit to a kernel park: CAS `SEARCHING → PARKED_<mode>`. The
     /// caller must already hold the SEARCHING token via a successful
     /// [`Self::begin_searching`].
