@@ -148,6 +148,18 @@ pub struct Builder {
     /// Whether or not to enable eager hand-off for the I/O and time drivers (in
     /// `tokio_unstable`).
     enable_eager_driver_handoff: bool,
+
+    /// Optional per-runtime override of the sharded-mio parker's pre-park
+    /// spin budget. `None` means "use `TOKIO_PARK_SPIN_BUDGET` env var
+    /// or the compiled-in default". Set via
+    /// [`Builder::enable_park_spin_budget`].
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    park_spin_budget: Option<u32>,
 }
 
 cfg_unstable! {
@@ -345,6 +357,14 @@ impl Builder {
 
             // Eager driver handoff is disabled by default.
             enable_eager_driver_handoff: false,
+
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-sharded-mio",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            park_spin_budget: None,
         }
     }
 
@@ -414,10 +434,10 @@ impl Builder {
     ///   .unwrap();
     /// # }
     /// ```
-    #[cfg(all(tokio_unstable, feature = "time", feature = "rt-multi-thread"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     #[cfg_attr(
         docsrs,
-        doc(cfg(all(tokio_unstable, feature = "time", feature = "rt-multi-thread")))
+        doc(cfg(all(tokio_unstable, feature = "rt-alt-timer")))
     )]
     pub fn enable_alt_timer(&mut self) -> &mut Self {
         self.enable_time();
@@ -435,9 +455,14 @@ impl Builder {
     /// delivered via an `eventfd`.
     ///
     /// This option only applies to multi-threaded runtimes. It implicitly
-    /// enables I/O as well as [`Builder::enable_alt_timer`] — a per-worker
-    /// timer wheel is required to avoid re-introducing the shared driver lock
-    /// that this mode is designed to eliminate.
+    /// enables I/O. By default the legacy single-mutex timer wheel is used
+    /// via a hybrid park flow: each worker queries
+    /// `time::Handle::next_wake_tick()` (locks the wheel briefly) to compute
+    /// its `io_uring_enter` timeout as `min(scheduler_timeout,
+    /// time_until_next_timer)`, then calls `parker_process(clock)` after wake
+    /// to fire any expired timers. To use the original per-worker timer wheel
+    /// design, also call [`Builder::enable_alt_timer`] (requires the
+    /// `rt-alt-timer` Cargo feature).
     ///
     /// Requires Linux 6.0+ (for `IORING_SETUP_DEFER_TASKRUN` maturity) and is
     /// gated behind the `io-uring-reactor` Cargo feature + `--cfg
@@ -460,7 +485,6 @@ impl Builder {
     pub fn enable_uring_reactor(&mut self) -> &mut Self {
         self.enable_io();
         self.enable_time();
-        self.timer_flavor = TimerFlavor::Alternative;
         self.io_flavor = IoFlavor::UringPerWorker;
         self
     }
@@ -472,9 +496,13 @@ impl Builder {
     /// much of the uring reactor's multi-worker wins come from
     /// sharding the driver vs. from `io_uring` itself.
     ///
-    /// Implies [`TimerFlavor::Alternative`] (per-worker timer wheels)
-    /// for the same reason uring does — a shared timer wheel would
-    /// serialize sleeps across workers.
+    /// By default uses the legacy single-mutex timer wheel via the hybrid
+    /// park flow: each worker queries `time::Handle::next_wake_tick()` to
+    /// compute its `mio::Poll::poll` timeout as `min(scheduler_timeout,
+    /// time_until_next_timer)`, then calls `parker_process(clock)` after
+    /// wake to fire any expired timers. To opt into the original per-worker
+    /// timer wheel design, also call [`Builder::enable_alt_timer`] (requires
+    /// the `rt-alt-timer` Cargo feature).
     ///
     /// The two knobs ([`enable_uring_reactor`] and this one) are
     /// last-write-wins: whichever is called last on the builder wins.
@@ -504,8 +532,65 @@ impl Builder {
     pub fn enable_sharded_mio(&mut self) -> &mut Self {
         self.enable_io();
         self.enable_time();
-        self.timer_flavor = TimerFlavor::Alternative;
         self.io_flavor = IoFlavor::ShardedMio;
+        self
+    }
+
+    /// Set the sharded-mio parker's pre-park spin budget for this runtime.
+    ///
+    /// Each worker, on its way into a kernel park, runs up to `iters`
+    /// iterations of `core::hint::spin_loop()` checking for a
+    /// cross-worker `unpark`. If one arrives during the spin window, the
+    /// wake is absorbed in userspace — no `eventfd` write, no
+    /// `epoll_wait` round trip — and the worker returns directly to the
+    /// scheduler loop. If the budget is exhausted, the worker commits to
+    /// a normal `epoll_wait` park.
+    ///
+    /// The compiled-in default (currently `256`) was chosen via a sweep
+    /// against `sync_watch/contention_resubscribe`,
+    /// `sync_mpsc/contention/bounded`, and `rt/spawn_many_remote_idle`,
+    /// where it gave a ~10% wall-time improvement on the watch bench
+    /// while leaving `sync_mpsc` and `rt` statistically unchanged. See
+    /// the bench notes in the C3 commit message.
+    ///
+    /// Tuning notes:
+    /// - `0` disables the spin window entirely (every park goes
+    ///   straight to `epoll_wait`). Useful for measuring the kernel
+    ///   transport cost in isolation.
+    /// - Larger budgets help send-burst workloads where wakes arrive
+    ///   tens of microseconds after a park starts, but burn user-space
+    ///   CPU on long-idle workloads. Above ~1024 the per-iter PAUSE
+    ///   cost begins to outweigh the kernel saving on most workloads.
+    ///
+    /// Precedence: this option, if set, overrides the
+    /// `TOKIO_PARK_SPIN_BUDGET` env var. If neither is set, the
+    /// compiled-in default applies.
+    ///
+    /// Only meaningful when [`enable_sharded_mio`][esm] is in effect;
+    /// the traditional and uring backends ignore it.
+    ///
+    /// **Note**: this is an [unstable API][unstable] and may be removed
+    /// or changed in 1.x releases.
+    ///
+    /// [esm]: Builder::enable_sharded_mio
+    /// [unstable]: crate#unstable-features
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(
+            tokio_unstable,
+            feature = "io-sharded-mio",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        )))
+    )]
+    pub fn enable_park_spin_budget(&mut self, iters: u32) -> &mut Self {
+        self.park_spin_budget = Some(iters);
         self
     }
 
@@ -1796,6 +1881,15 @@ impl Builder {
                 enable_eager_driver_handoff: false,
                 seed_generator: seed_generator_1,
                 metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
+                // Sharded-mio is multi-thread only; the spin budget has
+                // no meaning on the current-thread runtime.
+                #[cfg(all(
+                    tokio_unstable,
+                    feature = "io-sharded-mio",
+                    feature = "rt-multi-thread",
+                    target_os = "linux",
+                ))]
+                park_spin_budget: None,
             },
             local_tid,
             self.name.clone(),
@@ -1979,6 +2073,13 @@ cfg_rt_multi_thread! {
                     enable_eager_driver_handoff: self.enable_eager_driver_handoff,
                     seed_generator: seed_generator_1,
                     metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
+                    #[cfg(all(
+                        tokio_unstable,
+                        feature = "io-sharded-mio",
+                        feature = "rt-multi-thread",
+                        target_os = "linux",
+                    ))]
+                    park_spin_budget: self.park_spin_budget,
                 },
                 self.timer_flavor,
                 self.io_flavor,

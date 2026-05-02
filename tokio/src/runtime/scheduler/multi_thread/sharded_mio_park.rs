@@ -5,19 +5,91 @@
 //! `mio::Registry`, so the park loop has no pre-park op queue to
 //! apply.
 //!
+//! # Timer integration
+//!
+//! Two flavors are supported (decoupled from this module via the
+//! `rt-alt-timer` Cargo feature on [`Builder::enable_alt_timer`]):
+//!
+//! - **Legacy timer (default)** — the runtime owns a single shared timer
+//!   wheel under a `Mutex<InnerState>` (`time::Handle::Inner::Traditional`).
+//!   The standard time driver wraps the IO stack and runs its own
+//!   `park_internal` (read `next_wake` → park IO → process expired wheel
+//!   entries). Sharded-mio bypasses that wrapper because each worker owns
+//!   its own [`mio::Poll`], so the parker has to drive the wheel itself.
+//!   The hybrid path is implemented by [`Self::compute_legacy_timer_duration`]
+//!   (read `next_wake_tick` → `min(scheduler_timeout, time_dur)`) before
+//!   parking and [`Self::process_legacy_timer_after_park`] (call
+//!   `parker_process(clock)`) after wake. See
+//!   [`time::Handle::next_wake_tick`] for the pre-park query semantics.
+//! - **Alt-timer (opt-in via `enable_alt_timer()`)** — per-worker timer
+//!   wheels co-located with the parker, requires the `rt-alt-timer` Cargo
+//!   feature. The parker leaves wheel processing to the alt-timer hooks
+//!   in [`worker::run`]; the hybrid hooks here are no-ops in that case
+//!   (selected via `time_handle.is_traditional()` at runtime).
+//!
 //! [`uring_park`]: super::uring_park
+//! [`Builder::enable_alt_timer`]: crate::runtime::Builder::enable_alt_timer
+//! [`time::Handle::next_wake_tick`]: crate::runtime::time::Handle::next_wake_tick
+//! [`worker::run`]: super::worker
 
 use crate::loom::sync::Arc;
 use crate::runtime::driver;
 use crate::runtime::io::sharded_mio_driver::{
     clear_local_handle, clear_local_reactor, install_local_handle_raw,
-    install_local_reactor_raw, ParkMode, ShardedMioHandle,
+    install_local_reactor_raw, ParkMode, ShardedMioHandle, NOTIFIED,
 };
 use crate::runtime::io::sharded_mio_reactor::Reactor;
 use crate::runtime::scheduler::multi_thread::park::HadDriver;
 
 use std::cell::{Cell, RefCell};
+use std::sync::OnceLock;
 use std::time::Duration;
+
+/// Default pre-park spin budget. `256` `core::hint::spin_loop()`
+/// iterations was chosen via the budget sweep on `sync_watch` /
+/// `sync_mpsc` / `rt_multi_threaded` benches recorded in the C3
+/// commit message:
+///
+/// | bench | b=0 | b=256 |
+/// |---|---|---|
+/// | `sync_watch/cr/100` | 8.48 ms | 7.56 ms (**-11%**) |
+/// | `sync_watch/cr/1000` | 65.99 ms | 64.39 ms (-2%) |
+/// | `sync_mpsc/contention/bounded` | 1.89 ms | 1.89 ms (=) |
+/// | `rt/spawn_many_remote_idle` | 13.05 ms | 13.01 ms (=) |
+///
+/// At this budget, ~54% of cross-worker `unpark`s on the watch bench
+/// are caught in the userspace spin window (no syscall delivered);
+/// `sync_mpsc` and `rt` are statistically unchanged.
+///
+/// Override with `TOKIO_PARK_SPIN_BUDGET=<u32>` env var (process-wide)
+/// or [`Builder::enable_park_spin_budget`][bps] (per-runtime, takes
+/// precedence over the env var).
+///
+/// [bps]: crate::runtime::Builder::enable_park_spin_budget
+const DEFAULT_SPIN_BUDGET: u32 = 256;
+
+/// Read `TOKIO_PARK_SPIN_BUDGET` once per process. Each
+/// `ShardedMioParker` snapshots the resolved budget into a local
+/// field at construction so the spin loop has no atomic load per
+/// park.
+///
+/// Resolution order (most-specific wins): `override_iters`
+/// (`Builder::enable_park_spin_budget`) → `TOKIO_PARK_SPIN_BUDGET`
+/// env var → [`DEFAULT_SPIN_BUDGET`].
+fn resolve_spin_budget(override_iters: Option<u32>) -> u32 {
+    if let Some(n) = override_iters {
+        return n;
+    }
+    static ENV_BUDGET: OnceLock<Option<u32>> = OnceLock::new();
+    if let Some(n) = *ENV_BUDGET.get_or_init(|| {
+        std::env::var("TOKIO_PARK_SPIN_BUDGET")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+    }) {
+        return n;
+    }
+    DEFAULT_SPIN_BUDGET
+}
 
 thread_local! {
     /// Current worker's index for the running thread, or `None` if not
@@ -62,6 +134,13 @@ pub(crate) struct ShardedMioParker {
     handle: Arc<ShardedMioHandle>,
     reactor: Option<Box<RefCell<Reactor>>>,
     tls_installed: bool,
+    /// Snapshotted at construction from `TOKIO_PARK_SPIN_BUDGET`. The
+    /// pre-park spin loop runs for at most this many `spin_loop()`
+    /// iterations before committing to a kernel park. Each iteration
+    /// reads `park_state`; if it observes `NOTIFIED` (a cross-worker
+    /// `unpark` swapped against `prev = SEARCHING`) the parker yanks
+    /// out without entering the kernel.
+    spin_budget: u32,
 }
 
 /// Unparker counterpart. Cheap to clone — just an `Arc` + worker idx.
@@ -72,7 +151,16 @@ pub(crate) struct ShardedMioUnparker {
 }
 
 impl ShardedMioParker {
-    pub(crate) fn new(idx: usize, handle: Arc<ShardedMioHandle>) -> Self {
+    /// `spin_budget_override` is the per-runtime override sourced from
+    /// [`Builder::enable_park_spin_budget`][bps]; pass `None` to fall
+    /// back to env var / compiled-in default.
+    ///
+    /// [bps]: crate::runtime::Builder::enable_park_spin_budget
+    pub(crate) fn new(
+        idx: usize,
+        handle: Arc<ShardedMioHandle>,
+        spin_budget_override: Option<u32>,
+    ) -> Self {
         // Eager reactor construction. Unlike the uring path (which is
         // pinned to the worker thread by `IORING_SETUP_SINGLE_ISSUER`),
         // `mio::Poll` can be built on any thread and then sent to the
@@ -95,6 +183,7 @@ impl ShardedMioParker {
             handle,
             reactor: Some(Box::new(RefCell::new(reactor))),
             tls_installed: false,
+            spin_budget: resolve_spin_budget(spin_budget_override),
         }
     }
 
@@ -110,18 +199,70 @@ impl ShardedMioParker {
         &self.handle
     }
 
-    pub(crate) fn park(&mut self, _driver: &driver::Handle) -> HadDriver {
-        self.park_internal(None);
+    pub(crate) fn park(&mut self, driver: &driver::Handle) -> HadDriver {
+        let park_dur = self.compute_legacy_timer_duration(driver, None);
+        self.park_internal(park_dur);
+        self.process_legacy_timer_after_park(driver);
         HadDriver::Yes
     }
 
     pub(crate) fn park_timeout(
         &mut self,
-        _driver: &driver::Handle,
+        driver: &driver::Handle,
         duration: Duration,
     ) -> HadDriver {
-        self.park_internal(Some(duration));
+        let park_dur = self.compute_legacy_timer_duration(driver, Some(duration));
+        self.park_internal(park_dur);
+        self.process_legacy_timer_after_park(driver);
         HadDriver::Yes
+    }
+
+    /// Hybrid park flow: legacy timer + sharded-mio I/O.
+    ///
+    /// When the runtime is built with `enable_sharded_mio()` but without
+    /// `enable_alt_timer()` (the default since the rt-alt-timer feature
+    /// gate landed), each worker still owns its own `mio::Poll` but shares
+    /// the legacy single-mutex timer wheel. To make sleeps fire on time,
+    /// each parker has to compute its `epoll_wait` timeout as
+    /// `min(scheduler_timeout, time_until_next_timer)`.
+    ///
+    /// Returns the duration to pass to `park_internal`. `None` means "park
+    /// indefinitely" (no scheduler timeout, no pending timer).
+    fn compute_legacy_timer_duration(
+        &self,
+        driver: &driver::Handle,
+        scheduler_timeout: Option<Duration>,
+    ) -> Option<Duration> {
+        // Only consult the time handle when timers are enabled AND the
+        // runtime is using the legacy timer flavor (alt-timer manages its
+        // own per-worker wheel and doesn't need parker involvement).
+        #[cfg(feature = "time")]
+        if let Some(time_handle) = driver.time_handle_opt() {
+            if time_handle.is_traditional() {
+                if let Some(when) = time_handle.next_wake_tick() {
+                    let now = time_handle.time_source().now(driver.clock());
+                    let time_dur = time_handle
+                        .time_source()
+                        .tick_to_duration(when.saturating_sub(now));
+                    return Some(match scheduler_timeout {
+                        Some(s) => std::cmp::min(s, time_dur),
+                        None => time_dur,
+                    });
+                }
+            }
+        }
+        scheduler_timeout
+    }
+
+    /// Mirror of [`Self::compute_legacy_timer_duration`] for the post-park
+    /// path: process expired timers under the legacy flavor.
+    fn process_legacy_timer_after_park(&self, driver: &driver::Handle) {
+        #[cfg(feature = "time")]
+        if let Some(time_handle) = driver.time_handle_opt() {
+            if time_handle.is_traditional() {
+                time_handle.parker_process(driver.clock());
+            }
+        }
     }
 
     pub(crate) fn shutdown(&mut self, _driver: &driver::Handle) {
@@ -142,22 +283,53 @@ impl ShardedMioParker {
         self.ensure_reactor_installed();
 
         // Cheap fast-path: if a notification is already pending we
-        // can skip mode selection entirely. Crucial because mode
-        // selection runs `try_acquire_meta_watcher` (a CAS on a
-        // runtime-wide `AtomicBool`), which would otherwise be
-        // contended on every park even in the steady-state hot
-        // loop where `begin_park` will fast-path back. Pre-fix,
-        // sync_mpsc/contention/bounded showed the meta-watcher
-        // gate as a measurable shared-line bouncer when every
-        // worker hit it per park.
+        // can skip the SEARCHING gate and mode selection entirely.
         if self.handle.try_consume_notified(self.idx) {
             return;
         }
 
-        // Mode selection (must precede the slow-path `begin_park`
-        // so that the CAS can publish the chosen branch's
-        // `PARKED_<mode>` token — see `ParkMode` and
-        // `ShardedMioHandle::unpark`).
+        // Enter the pre-park spin window: CAS EMPTY → SEARCHING.
+        // From here until either the spin sees NOTIFIED or
+        // `commit_park` succeeds, a concurrent `unpark` is yanked
+        // back into userspace (no kernel wake) — the swap to NOTIFIED
+        // happens against `prev = SEARCHING`, and the parker observes
+        // it either via `park_state_load` inside the spin loop or via
+        // the `commit_park` CAS failing with `Err(NOTIFIED)`.
+        //
+        // `Err` here means we lost a race against an unpark from
+        // EMPTY (state was already NOTIFIED on entry); the call has
+        // already cleared state back to EMPTY for us.
+        if self.handle.begin_searching(self.idx).is_err() {
+            return;
+        }
+
+        // Spin window. Each iteration reads `park_state`; if a
+        // cross-worker `unpark` ran during the spin (swapping
+        // `prev = SEARCHING` to `NOTIFIED`) we observe it here and
+        // bail without ever entering the kernel. The number of
+        // iterations is sized by `TOKIO_PARK_SPIN_BUDGET`,
+        // snapshotted into `self.spin_budget` at construction so
+        // the inner loop does not pay an atomic load per park to
+        // re-read it.
+        //
+        // `core::hint::spin_loop()` lowers to the architecture's
+        // spin-pause hint (`PAUSE` on x86) so the SMT sibling and
+        // the pipeline backend stay free for whatever cross-core
+        // wake activity is in flight. The cost per iteration on
+        // recent x86 is dominated by `PAUSE` itself (~100 cycles).
+        for _ in 0..self.spin_budget {
+            if self.handle.park_state_load(self.idx) == NOTIFIED {
+                self.handle.abort_searching(self.idx);
+                return;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Mode selection — only runs on entries that go past the
+        // SEARCHING gate, i.e. that are committing to a kernel park.
+        // The hot `notify → wake → re-park → notify` cycle is caught
+        // by `try_consume_notified` above, so the meta-watcher CAS
+        // no longer fires on the steady-state notification loop.
         //
         // The meta-watcher slot is the runtime-wide drain-of-last-
         // resort: exactly one worker parks on the meta-epoll (which
@@ -176,12 +348,7 @@ impl ShardedMioParker {
         // single-owner `mio::Poll::poll` on the worker's own child
         // epoll fd. The Poll always has the `WAKER_TOKEN` eventfd
         // registered, so it is wakeable even when the slab is
-        // otherwise empty. Slab-empty workers route here rather
-        // than `std::thread::park` so the wake path is uniformly
-        // `external_waker.wake()` (eventfd → epoll edge); a futex
-        // park would be invisible to run-queue activity that lands
-        // before a directly-targeted unpark, which on messaging-
-        // heavy workloads cost ~6% wallclock to `parking_lot::futex_wait`.
+        // otherwise empty.
         #[cfg(target_os = "linux")]
         let (mode, _meta_guard) = {
             let guard = self.handle.try_acquire_meta_watcher();
@@ -194,17 +361,13 @@ impl ShardedMioParker {
         #[cfg(not(target_os = "linux"))]
         let mode = ParkMode::OwnChild;
 
-        // Notified fast-path: no syscall needed. Publishes the
-        // chosen `mode` only on the slow path; the fast-path branch
-        // observes `NOTIFIED` and clears it back to `EMPTY` without
-        // ever recording a `PARKED_*` state — so a racing unpark is
-        // either folded into this same `NOTIFIED` (idempotent) or
-        // hits a fresh `EMPTY` next park and re-CAS'es.
-        //
-        // On linux, dropping `_meta_guard` here on early return
-        // releases the meta-watcher slot so the next idle worker
-        // can take it.
-        if self.handle.begin_park(self.idx, mode) {
+        // Commit to a kernel park: CAS SEARCHING → PARKED_<mode>.
+        // `Err` here means we were yanked while selecting a mode
+        // (state observed NOTIFIED); the call has already cleared
+        // state back to EMPTY for us. On linux, dropping
+        // `_meta_guard` releases the meta-watcher slot so the next
+        // idle worker can take it.
+        if self.handle.commit_park(self.idx, mode).is_err() {
             return;
         }
 

@@ -136,14 +136,24 @@ counters! {
     unpark_was_empty,
     /// `unpark` saw `prev == NOTIFIED` (already pending; idempotent).
     unpark_was_notified,
+    /// `unpark` saw `prev == SEARCHING` (parker is in the pre-park
+    /// spin window; userspace yank, no kernel wake delivered).
+    unpark_was_searching,
 
-    /// `begin_park` entered.
+    /// `begin_park` entered (legacy name; counts both `begin_searching`
+    /// entries and `try_consume_notified` fast-paths so the existing
+    /// dump format keeps working).
     begin_park_calls,
-    /// `begin_park` parked (CAS EMPTY → PARKED succeeded).
+    /// Parker committed to a kernel park (CAS SEARCHING → PARKED_*
+    /// succeeded). Equivalent to the historical `begin_park_parked`.
     begin_park_parked,
-    /// `begin_park` fast-pathed (state was NOTIFIED on entry; skip
-    /// kernel park).
+    /// Parker fast-pathed (state was NOTIFIED on entry; skip kernel
+    /// park).
     begin_park_fastpath,
+    /// Parker yanked during the spin window (CAS SEARCHING → PARKED_*
+    /// observed NOTIFIED — the spin itself absorbed the wake without a
+    /// syscall).
+    commit_park_yanked,
 
     // ---- mio register call observability ----
     /// `SharedRegistry::register` entered.
