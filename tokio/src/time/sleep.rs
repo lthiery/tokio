@@ -366,7 +366,7 @@ impl Sleep {
             crate::runtime::TimerFlavor::Traditional => {
                 me.entry.as_mut().reset(deadline, false);
             }
-            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
             crate::runtime::TimerFlavor::Alternative => {
                 let handle = me.entry.as_ref().scheduler_handle().clone();
                 me.entry.set(Timer::new(handle, deadline));
@@ -380,7 +380,7 @@ impl Sleep {
             crate::runtime::TimerFlavor::Traditional => {
                 me.entry.as_mut().reset(deadline, true);
             }
-            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
             crate::runtime::TimerFlavor::Alternative => {
                 let handle = me.entry.as_ref().scheduler_handle().clone();
                 me.entry.set(Timer::new(handle, deadline));

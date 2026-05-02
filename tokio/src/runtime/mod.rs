@@ -420,7 +420,7 @@ cfg_process_driver! {
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) enum TimerFlavor {
     Traditional,
-    #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     Alternative,
 }
 
@@ -460,7 +460,7 @@ pub(crate) enum IoFlavor {
 cfg_time! {
     pub(crate) mod time;
 
-    #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     pub(crate) mod time_alt;
 
     use std::task::{Context, Poll};
@@ -470,7 +470,7 @@ cfg_time! {
     pub(crate) enum Timer {
         Traditional(time::TimerEntry),
 
-        #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         Alternative(time_alt::Timer),
     }
 
@@ -484,7 +484,7 @@ cfg_time! {
                 crate::runtime::TimerFlavor::Traditional => {
                     Timer::Traditional(time::TimerEntry::new(handle, deadline))
                 }
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 crate::runtime::TimerFlavor::Alternative => {
                     Timer::Alternative(time_alt::Timer::new(handle, deadline))
                 }
@@ -494,7 +494,7 @@ cfg_time! {
         pub(crate) fn deadline(&self) -> crate::time::Instant {
             match self {
                 Timer::Traditional(entry) => entry.deadline(),
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 Timer::Alternative(entry) => entry.deadline(),
             }
         }
@@ -502,7 +502,7 @@ cfg_time! {
         pub(crate) fn is_elapsed(&self) -> bool {
             match self {
                 Timer::Traditional(entry) => entry.is_elapsed(),
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 Timer::Alternative(entry) => entry.is_elapsed(),
             }
         }
@@ -510,7 +510,7 @@ cfg_time! {
         pub(crate) fn flavor(self: Pin<&Self>) -> TimerFlavor {
             match self.get_ref() {
                 Timer::Traditional(_) => TimerFlavor::Traditional,
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 Timer::Alternative(_) => TimerFlavor::Alternative,
             }
         }
@@ -527,7 +527,7 @@ cfg_time! {
                     // Safety: we never move the inner entries.
                     unsafe { Pin::new_unchecked(entry).reset(new_time, reregister); }
                 }
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 Timer::Alternative(_) => panic!("not implemented yet"),
             }
         }
@@ -543,7 +543,7 @@ cfg_time! {
                     // Safety: we never move the inner entries.
                     unsafe { Pin::new_unchecked(entry).poll_elapsed(cx) }
                 }
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 Timer::Alternative(entry) => {
                     // Safety: we never move the inner entries.
                     unsafe { Pin::new_unchecked(entry).poll_elapsed(cx).map(Ok) }
@@ -551,11 +551,11 @@ cfg_time! {
             }
         }
 
-        #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         pub(crate) fn scheduler_handle(&self) -> &crate::runtime::scheduler::Handle {
             match self {
                 Timer::Traditional(_) => unreachable!("we should not call this on Traditional Timer"),
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 Timer::Alternative(entry) => entry.scheduler_handle(),
             }
         }
@@ -564,7 +564,7 @@ cfg_time! {
         pub(crate) fn driver(self: Pin<&Self>) -> &crate::runtime::time::Handle {
             match self.get_ref() {
                 Timer::Traditional(entry) => entry.driver(),
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 Timer::Alternative(entry) => entry.driver(),
             }
         }
@@ -573,7 +573,7 @@ cfg_time! {
         pub(crate) fn clock(self: Pin<&Self>) -> &crate::time::Clock {
             match self.get_ref() {
                 Timer::Traditional(entry) => entry.clock(),
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 Timer::Alternative(entry) => entry.clock(),
             }
         }

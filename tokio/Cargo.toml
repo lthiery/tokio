@@ -86,12 +86,21 @@ test-util = ["rt", "sync", "time"]
 time = []
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.
 io-uring = ["dep:io-uring", "libc", "mio/os-poll", "mio/os-ext", "dep:slab"]
+# Unstable, experimental. Per-worker timer wheels (`time_alt`) instead of the
+# single shared driver-locked wheel. Currently a prerequisite for the sharded
+# I/O backends; eventually decoupling will let those backends opt back into
+# the legacy timer. Requires `--cfg tokio_unstable` to enable.
+rt-alt-timer = ["rt", "rt-multi-thread", "time"]
 # Unstable, experimental. Replaces mio/epoll with per-worker io_uring rings for
-# readiness-model I/O on Linux. Requires `--cfg tokio_unstable` to enable.
+# readiness-model I/O on Linux. Combine with `rt-alt-timer` for the original
+# per-worker-timer-wheel design, or use the default (legacy timer +
+# sharded-mio hybrid park flow) for the lower-overhead path.
+# Requires `--cfg tokio_unstable` to enable.
 io-uring-reactor = ["rt", "rt-multi-thread", "time", "net", "dep:io-uring", "libc", "dep:slab", "dep:bytes"]
 # Unstable, experimental. Companion to io-uring-reactor for A/B-measuring
 # driver sharding independently from io_uring. Gives each worker its own
-# mio::Poll instance. Requires `--cfg tokio_unstable` to enable.
+# mio::Poll instance. See `io-uring-reactor` for the timer-flavor knob.
+# Requires `--cfg tokio_unstable` to enable.
 io-sharded-mio = ["rt", "rt-multi-thread", "time", "net", "dep:slab"]
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.
 taskdump = ["dep:backtrace"]

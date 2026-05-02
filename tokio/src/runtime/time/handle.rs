@@ -18,6 +18,23 @@ impl Handle {
         self.inner.is_shutdown()
     }
 
+    /// True if this handle is using the legacy single-mutex timer wheel.
+    /// Used by the sharded-mio / uring parkers to decide whether they have
+    /// to drive the wheel themselves; the alt-timer flavor manages per-worker
+    /// wheels inside the worker loop and does not need parker involvement.
+    #[cfg(all(
+        tokio_unstable,
+        any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
+        target_os = "linux",
+    ))]
+    pub(crate) fn is_traditional(&self) -> bool {
+        match self.inner {
+            super::Inner::Traditional { .. } => true,
+            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+            super::Inner::Alternative { .. } => false,
+        }
+    }
+
     /// Track that the driver is being unparked
     pub(crate) fn unpark(&self) {
         #[cfg(feature = "test-util")]
@@ -25,7 +42,7 @@ impl Handle {
             super::Inner::Traditional { ref did_wake, .. } => {
                 did_wake.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
             super::Inner::Alternative { ref did_wake, .. } => {
                 did_wake.store(true, std::sync::atomic::Ordering::SeqCst);
             }

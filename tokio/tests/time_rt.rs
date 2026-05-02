@@ -29,7 +29,7 @@ fn rt_combinations() -> Vec<Runtime> {
         .unwrap();
     rts.push(rt);
 
-    #[cfg(tokio_unstable)]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -72,7 +72,7 @@ fn timer_with_threaded_runtime() {
         rx.recv().unwrap();
     }
 
-    #[cfg(tokio_unstable)]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_alt_timer()

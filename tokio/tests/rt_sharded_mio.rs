@@ -160,8 +160,8 @@ fn cross_worker_channel_round_trip_cap1_stress_4w() {
 
 #[test]
 fn sleep_fires_via_alt_timer() {
-    // `enable_sharded_mio()` implicitly enables `enable_alt_timer()`.
-    // Confirm a per-worker timer wheel fires a sleep.
+    // With sharded-mio (legacy timer flavor), the parker drives the legacy
+    // timer wheel via the hybrid park flow. Confirm a sleep fires.
     let rt = build_rt(2);
     let started = std::time::Instant::now();
     rt.block_on(async {

@@ -18,7 +18,7 @@ cfg_taskdump! {
     mod taskdump;
 }
 
-#[cfg(all(tokio_unstable, feature = "time"))]
+#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
 use crate::loom::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
 /// Handle to the multi thread scheduler
@@ -77,7 +77,7 @@ pub(crate) struct Handle {
     ))]
     pub(crate) io_driver: Option<crate::runtime::io::io_driver::IoDriver>,
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     /// Indicates that the runtime is shutting down.
     pub(crate) is_shutdown: AtomicBool,
 }
@@ -97,7 +97,7 @@ impl Handle {
         Self::bind_new_task(me, future, id, spawned_at)
     }
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     pub(crate) fn is_shutdown(&self) -> bool {
         self.is_shutdown
             .load(crate::loom::sync::atomic::Ordering::SeqCst)
@@ -105,7 +105,7 @@ impl Handle {
 
     pub(crate) fn shutdown(&self) {
         self.close();
-        #[cfg(all(tokio_unstable, feature = "time"))]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         self.is_shutdown.store(true, SeqCst);
     }
 

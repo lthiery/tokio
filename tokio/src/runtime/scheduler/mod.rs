@@ -146,7 +146,7 @@ cfg_rt! {
             }
         }
 
-        #[cfg(all(tokio_unstable, feature = "rt-multi-thread", feature = "time"))]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         /// Returns true if both handles belong to the same runtime instance.
         pub(crate) fn is_same_runtime(&self, other: &Handle) -> bool {
             match (self, other) {
@@ -158,7 +158,7 @@ cfg_rt! {
             }
         }
 
-        #[cfg(all(tokio_unstable, feature = "rt-multi-thread", feature = "time"))]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         /// Returns true if the runtime is shutting down.
         pub(crate) fn is_shutdown(&self) -> bool {
             match self {
@@ -167,7 +167,7 @@ cfg_rt! {
             }
         }
 
-        #[cfg(all(tokio_unstable, feature = "rt-multi-thread", feature = "time"))]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         /// Push a timer entry that was created outside of this runtime
         /// into the runtime-global queue. The pushed timer will be
         /// processed by a random worker thread.
@@ -329,7 +329,7 @@ cfg_rt! {
             }
         }
 
-        #[cfg(all(tokio_unstable, feature = "time", feature = "rt-multi-thread"))]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         pub(crate) fn with_time_temp_local_context<F, R>(&self, f: F) -> R
         where
             F: FnOnce(Option<crate::runtime::time_alt::TempLocalContext<'_>>) -> R,

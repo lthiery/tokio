@@ -19,6 +19,19 @@
 //! a [`LocalReactorGuard`]; this lets *other* workers route `MSG_RING` SQEs
 //! through their own rings.
 //!
+//! # Timer integration
+//!
+//! Same hybrid park flow as [`super::sharded_mio_park`]. When the runtime is
+//! built with `enable_uring_reactor()` but without `enable_alt_timer()` (the
+//! default since the `rt-alt-timer` feature gate landed), each worker still
+//! owns its own ring but shares the legacy single-mutex timer wheel. The
+//! parker computes its `io_uring_enter` timeout as `min(scheduler_timeout,
+//! time_until_next_timer)` via [`Self::compute_legacy_timer_duration`] before
+//! parking, then advances the wheel via [`Self::process_legacy_timer_after_park`]
+//! after wake. With `enable_alt_timer()` the hybrid hooks short-circuit on
+//! `is_traditional() == false` and wheel processing is left to the alt-timer
+//! hooks in [`super::worker::run`].
+//!
 //! [`Parker`]: super::park::Parker
 //! [`Reactor`]: crate::runtime::io::uring_reactor::Reactor
 //! [`ExternalWaker`]: crate::runtime::io::uring_reactor::ExternalWaker
@@ -168,19 +181,66 @@ impl UringParker {
     }
 
     /// Park the worker until woken.
-    pub(crate) fn park(&mut self, _driver: &driver::Handle) -> HadDriver {
-        self.park_internal(None);
+    pub(crate) fn park(&mut self, driver: &driver::Handle) -> HadDriver {
+        let park_dur = self.compute_legacy_timer_duration(driver, None);
+        self.park_internal(park_dur);
+        self.process_legacy_timer_after_park(driver);
         HadDriver::Yes
     }
 
     /// Park with a maximum duration.
     pub(crate) fn park_timeout(
         &mut self,
-        _driver: &driver::Handle,
+        driver: &driver::Handle,
         duration: Duration,
     ) -> HadDriver {
-        self.park_internal(Some(duration));
+        let park_dur = self.compute_legacy_timer_duration(driver, Some(duration));
+        self.park_internal(park_dur);
+        self.process_legacy_timer_after_park(driver);
         HadDriver::Yes
+    }
+
+    /// Hybrid park flow: legacy timer + uring I/O.
+    ///
+    /// Mirror of [`super::sharded_mio_park::ShardedMioParker::compute_legacy_timer_duration`].
+    /// When the runtime is built with `enable_uring_reactor()` but without
+    /// `enable_alt_timer()` (the default since the rt-alt-timer feature gate
+    /// landed), each worker still owns its own `io_uring` ring but shares the
+    /// legacy single-mutex timer wheel. To make sleeps fire on time, each
+    /// parker has to compute its `io_uring_enter` timeout as
+    /// `min(scheduler_timeout, time_until_next_timer)`.
+    fn compute_legacy_timer_duration(
+        &self,
+        driver: &driver::Handle,
+        scheduler_timeout: Option<Duration>,
+    ) -> Option<Duration> {
+        #[cfg(feature = "time")]
+        if let Some(time_handle) = driver.time_handle_opt() {
+            if time_handle.is_traditional() {
+                if let Some(when) = time_handle.next_wake_tick() {
+                    let now = time_handle.time_source().now(driver.clock());
+                    let time_dur = time_handle
+                        .time_source()
+                        .tick_to_duration(when.saturating_sub(now));
+                    return Some(match scheduler_timeout {
+                        Some(s) => std::cmp::min(s, time_dur),
+                        None => time_dur,
+                    });
+                }
+            }
+        }
+        scheduler_timeout
+    }
+
+    /// Mirror of [`Self::compute_legacy_timer_duration`] for the post-park
+    /// path: process expired timers under the legacy flavor.
+    fn process_legacy_timer_after_park(&self, driver: &driver::Handle) {
+        #[cfg(feature = "time")]
+        if let Some(time_handle) = driver.time_handle_opt() {
+            if time_handle.is_traditional() {
+                time_handle.parker_process(driver.clock());
+            }
+        }
     }
 
     /// Shutdown the parker. Clears the TLS install first (un-publishing the

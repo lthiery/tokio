@@ -88,13 +88,13 @@ cfg_not_taskdump! {
     mod taskdump_mock;
 }
 
-#[cfg(all(tokio_unstable, feature = "time"))]
+#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
 use crate::loom::sync::atomic::AtomicBool;
 
-#[cfg(all(tokio_unstable, feature = "time"))]
+#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
 use crate::runtime::time_alt;
 
-#[cfg(all(tokio_unstable, feature = "time"))]
+#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
 use crate::runtime::scheduler::util;
 
 /// A scheduler worker
@@ -121,7 +121,7 @@ struct Core {
     /// The worker-local run queue.
     run_queue: queue::Local<Arc<Handle>>,
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     time_context: time_alt::LocalContext,
 
     /// True if the worker is currently searching for more work. Searching
@@ -212,7 +212,7 @@ pub(crate) struct Synced {
     /// Synchronized state for `Inject`.
     pub(crate) inject: inject::Synced,
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     /// Timers pending to be registered.
     /// This is used to register a timer but the [`Core`]
     /// is not available in the current thread.
@@ -367,7 +367,7 @@ pub(super) fn create(
             tick: 0,
             lifo_enabled: !config.disable_lifo_slot,
             run_queue,
-            #[cfg(all(tokio_unstable, feature = "time"))]
+            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
             time_context: time_alt::LocalContext::new(),
             is_searching: false,
             is_shutdown: false,
@@ -399,7 +399,7 @@ pub(super) fn create(
             synced: Mutex::new(Synced {
                 idle: idle_synced,
                 inject: inject_synced,
-                #[cfg(all(tokio_unstable, feature = "time"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 inject_timers: Vec::new(),
             }),
             shutdown_cores: Mutex::new(vec![]),
@@ -441,7 +441,7 @@ pub(super) fn create(
                 crate::runtime::io::io_driver::IoDriver::from_sharded_mio(std::sync::Arc::clone(h))
             }),
         },
-        #[cfg(all(tokio_unstable, feature = "time"))]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         is_shutdown: AtomicBool::new(false),
     });
 
@@ -838,7 +838,7 @@ impl Context {
             }
         }
 
-        #[cfg(all(tokio_unstable, feature = "time"))]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         {
             match self.worker.handle.timer_flavor {
                 TimerFlavor::Traditional => {}
@@ -1084,7 +1084,7 @@ impl Context {
         #[cfg(feature = "time")]
         let (duration, auto_advance_duration) = match self.worker.handle.timer_flavor {
             TimerFlavor::Traditional => (duration, None::<Duration>),
-            #[cfg(tokio_unstable)]
+            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
             TimerFlavor::Alternative => {
                 // Must happens after taking out the parker, as the `Handle::schedule_local`
                 // will delay the notify if the parker taken out.
@@ -1113,7 +1113,7 @@ impl Context {
                 // suppress unused variable warning
                 let _ = auto_advance_duration;
             }
-            #[cfg(tokio_unstable)]
+            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
             TimerFlavor::Alternative => {
                 // Must happens before placing back the parker, as the `Handle::schedule_local`
                 // will delay the notify if the parker is still in `core`.
@@ -1146,7 +1146,7 @@ impl Context {
         }
     }
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     /// Maintain local timers before parking the resource driver.
     ///
     /// * Remove cancelled timers from the local timer wheel.
@@ -1221,7 +1221,7 @@ impl Context {
         }
     }
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     /// Maintain local timers after unparking the resource driver.
     ///
     /// * Auto-advance time, if required (feature = "test-util").
@@ -1253,7 +1253,7 @@ impl Context {
         wake_queue.wake_all();
     }
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     fn with_core<F, R>(&self, f: F) -> R
     where
         F: FnOnce(Option<&mut Core>) -> R,
@@ -1264,7 +1264,7 @@ impl Context {
         }
     }
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     pub(crate) fn with_time_temp_local_context<F, R>(&self, f: F) -> R
     where
         F: FnOnce(Option<time_alt::TempLocalContext<'_>>) -> R,
@@ -1689,7 +1689,7 @@ impl Handle {
         }
     }
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     pub(crate) fn push_remote_timer(&self, hdl: time_alt::EntryHandle) {
         assert_eq!(self.timer_flavor, TimerFlavor::Alternative);
         {
@@ -1699,7 +1699,7 @@ impl Handle {
         self.notify_parked_remote();
     }
 
-    #[cfg(all(tokio_unstable, feature = "time"))]
+    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
     pub(crate) fn take_remote_timers(&self) -> Vec<time_alt::EntryHandle> {
         assert_eq!(self.timer_flavor, TimerFlavor::Alternative);
         // It's ok to lost the race, as another worker is
@@ -1837,7 +1837,7 @@ impl<'a> Lock<inject::Synced> for &'a Handle {
     }
 }
 
-#[cfg(all(tokio_unstable, feature = "time"))]
+#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
 /// Returned by [`Context::maintain_local_timers_before_parking`].
 struct MaintainLocalTimer {
     park_duration: Option<Duration>,

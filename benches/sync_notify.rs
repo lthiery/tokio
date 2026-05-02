@@ -7,10 +7,11 @@ use criterion::measurement::WallTime;
 use criterion::{criterion_group, criterion_main, BenchmarkGroup, Criterion};
 
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(6)
-        .build()
-        .unwrap()
+    let mut b = tokio::runtime::Builder::new_multi_thread();
+    b.worker_threads(6);
+    #[cfg(all(tokio_unstable, feature = "bench-sharded-mio", target_os = "linux"))]
+    b.enable_sharded_mio();
+    b.build().unwrap()
 }
 
 fn notify_waiters<const N_WAITERS: usize>(g: &mut BenchmarkGroup<WallTime>) {

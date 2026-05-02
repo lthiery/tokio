@@ -115,12 +115,24 @@ impl Handle {
                 .expect("A Tokio 1.x context was found, but timers are disabled. Call `enable_time` on the runtime builder to enable timers.")
         }
 
-        #[cfg(tokio_unstable)]
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         pub(crate) fn with_time<F, R>(&self, f: F) -> R
         where
             F: FnOnce(Option<&crate::runtime::time::Handle>) -> R,
         {
             f(self.time.as_ref())
+        }
+
+        /// Non-panicking accessor for the time driver handle. Used by the
+        /// sharded-mio / uring parker to drive the legacy timer wheel from
+        /// outside the regular `Driver::park_internal` path.
+        #[cfg(all(
+            tokio_unstable,
+            any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
+            target_os = "linux",
+        ))]
+        pub(crate) fn time_handle_opt(&self) -> Option<&crate::runtime::time::Handle> {
+            self.time.as_ref()
         }
 
         pub(crate) fn clock(&self) -> &Clock {
@@ -291,6 +303,7 @@ cfg_time! {
         Enabled {
             driver: crate::runtime::time::Driver,
         },
+        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
         EnabledAlt(IoStack),
         Disabled(IoStack),
     }
@@ -314,7 +327,7 @@ cfg_time! {
                     let (driver, handle) = crate::runtime::time::Driver::new(io_stack, clock);
                     (TimeDriver::Enabled { driver }, Some(handle))
                 }
-                #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 crate::runtime::TimerFlavor::Alternative => {
                     (TimeDriver::EnabledAlt(io_stack), Some(crate::runtime::time::Driver::new_alt(clock)))
                 }
@@ -328,6 +341,7 @@ cfg_time! {
         pub(crate) fn park(&mut self, handle: &Handle) {
             match self {
                 TimeDriver::Enabled { driver, .. } => driver.park(handle),
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 TimeDriver::EnabledAlt(v) => v.park(handle),
                 TimeDriver::Disabled(v) => v.park(handle),
             }
@@ -336,6 +350,7 @@ cfg_time! {
         pub(crate) fn park_timeout(&mut self, handle: &Handle, duration: Duration) {
             match self {
                 TimeDriver::Enabled { driver } => driver.park_timeout(handle, duration),
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 TimeDriver::EnabledAlt(v) => v.park_timeout(handle, duration),
                 TimeDriver::Disabled(v) => v.park_timeout(handle, duration),
             }
@@ -344,6 +359,7 @@ cfg_time! {
         pub(crate) fn shutdown(&mut self, handle: &Handle) {
             match self {
                 TimeDriver::Enabled { driver } => driver.shutdown(handle),
+                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
                 TimeDriver::EnabledAlt(v) => v.shutdown(handle),
                 TimeDriver::Disabled(v) => v.shutdown(handle),
             }

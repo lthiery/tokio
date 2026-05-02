@@ -85,8 +85,8 @@ fn cross_worker_channel_round_trip() {
 
 #[test]
 fn sleep_fires_via_alt_timer() {
-    // `enable_uring_reactor()` implicitly enables `enable_alt_timer()`.
-    // Confirm a per-worker timer wheel fires a sleep.
+    // With uring-reactor (legacy timer flavor by default), the parker drives
+    // the legacy timer wheel via the hybrid park flow. Confirm a sleep fires.
     let rt = build_rt(2);
     let started = std::time::Instant::now();
     rt.block_on(async {

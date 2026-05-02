@@ -95,7 +95,10 @@ fn parallelism_levels() -> Vec<usize> {
 }
 
 fn rt() -> Runtime {
-    runtime::Builder::new_multi_thread().build().unwrap()
+    let mut b = runtime::Builder::new_multi_thread();
+    #[cfg(all(tokio_unstable, feature = "bench-sharded-mio", target_os = "linux"))]
+    b.enable_sharded_mio();
+    b.build().unwrap()
 }
 
 criterion_group!(remote_spawn_benches, remote_spawn_contention);

@@ -20,10 +20,11 @@ impl Default for Large {
 }
 
 fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(6)
-        .build()
-        .unwrap()
+    let mut b = tokio::runtime::Builder::new_multi_thread();
+    b.worker_threads(6);
+    #[cfg(all(tokio_unstable, feature = "bench-sharded-mio", target_os = "linux"))]
+    b.enable_sharded_mio();
+    b.build().unwrap()
 }
 
 fn create_medium<const SIZE: usize>(g: &mut BenchmarkGroup<WallTime>) {
