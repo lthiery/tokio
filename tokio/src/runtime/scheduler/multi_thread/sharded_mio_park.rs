@@ -94,6 +94,30 @@ fn resolve_spin_budget(override_iters: Option<u32>) -> u32 {
     DEFAULT_SPIN_BUDGET
 }
 
+/// Read `TOKIO_FUTEX_PARK` once per process. Until per-worker
+/// slab-empty detection lands, this is the only gate on the
+/// `PARKED_OWN_FUTEX` mode: setting `TOKIO_FUTEX_PARK=1`
+/// unconditionally selects futex park for non-meta-watcher
+/// workers, which is **only safe** for workloads that register
+/// no I/O resources on the runtime (every cross-worker wake
+/// originates from `unpark`, which goes through the consistent
+/// `swap(NOTIFIED)` → wake-dispatch path).
+///
+/// Used by `bench-sharded-mio`-only benches like `sync_broadcast`
+/// and `sync_notify` to validate that the futex path eliminates
+/// the ~9% kernel epoll/eventfd overhead measured on those
+/// workloads (perf attribution in `perf-investigation/`).
+#[cfg(target_os = "linux")]
+fn futex_park_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("TOKIO_FUTEX_PARK")
+            .ok()
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 thread_local! {
     /// Current worker's index for the running thread, or `None` if not
     /// on a sharded-mio worker. Mirrors the uring parker's
@@ -367,6 +391,16 @@ impl ShardedMioParker {
             let guard = self.handle.try_acquire_meta_watcher();
             if guard.is_some() {
                 (ParkMode::Meta, guard)
+            } else if futex_park_enabled() {
+                // Direct futex park on `park_state` — skips the
+                // `mio::Poll::poll` → `epoll_wait` → eventfd_write
+                // → `ep_poll_callback` chain that costs ~9% of CPU
+                // on no-I/O cross-worker-wake benches like
+                // `sync_broadcast/contention/10`. Safe only when the
+                // worker has no I/O sources on its child epoll;
+                // gated by env var `TOKIO_FUTEX_PARK=1` until the
+                // slab-empty detection path lands.
+                (ParkMode::OwnChildFutex, None)
             } else {
                 (ParkMode::OwnChild, None)
             }
@@ -391,6 +425,7 @@ impl ShardedMioParker {
         match mode {
             ParkMode::Meta => self.park_on_meta(duration),
             ParkMode::OwnChild => self.park_on_own_child(duration),
+            ParkMode::OwnChildFutex => self.park_on_own_futex(duration),
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -398,6 +433,28 @@ impl ShardedMioParker {
         }
 
         self.handle.end_park(self.idx);
+    }
+
+    /// Direct-futex park on this worker's `park_state` atomic.
+    /// Block in `SYS_futex(FUTEX_WAIT, &park_state,
+    /// PARKED_OWN_FUTEX, timeout)`.
+    ///
+    /// Selected by `park_internal` only when (a) we lost the
+    /// meta-watcher CAS, (b) the per-worker spin window is
+    /// disabled or has elapsed, and (c) the futex-park path is
+    /// enabled (currently env-var gated; will become slab-empty
+    /// gated once the per-worker registration counter lands).
+    ///
+    /// Wake-side consistency: `ShardedMioHandle::unpark` always
+    /// `swap(NOTIFIED)`s before issuing the wake; on `prev ==
+    /// PARKED_OWN_FUTEX` it issues `FUTEX_WAKE` against the same
+    /// atomic. The kernel's CAS-on-entry to FUTEX_WAIT closes the
+    /// publish/sleep race — a publisher that swapped NOTIFIED
+    /// before we entered the syscall causes the syscall to return
+    /// `EAGAIN` immediately without queuing.
+    #[cfg(target_os = "linux")]
+    fn park_on_own_futex(&mut self, duration: Option<Duration>) {
+        self.handle.park_on_own_futex(self.idx, duration);
     }
 
     /// Owner-mode park. Block in `mio::Poll::poll` on this worker's
