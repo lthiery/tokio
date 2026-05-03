@@ -1,5 +1,5 @@
 #![warn(rust_2018_idioms)]
-#![cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+#![cfg(feature = "rt-alt-timer")]
 
 use tokio::runtime::Runtime;
 use tokio::time::*;

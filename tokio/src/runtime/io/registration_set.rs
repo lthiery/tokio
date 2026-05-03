@@ -77,11 +77,10 @@ impl RegistrationSet {
     /// register it with the per-shard / shared set so shutdown and
     /// pending-release accounting remains uniform.
     #[cfg(all(
-        tokio_unstable,
-        any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
+    any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
     pub(super) fn allocate_existing(
         &self,
         synced: &mut Synced,

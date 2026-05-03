@@ -72,7 +72,6 @@ pub(crate) struct Config {
     ///
     /// [bps]: crate::runtime::Builder::enable_park_spin_budget
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",

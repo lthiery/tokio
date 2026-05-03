@@ -27,9 +27,9 @@ fn build_run_time(workers: usize) -> Runtime {
         //   bench-sharded-mio alone         → sharded-mio I/O + legacy timer
         //                                     (hybrid park flow)
         //   both                            → sharded-mio I/O + alt-timer
-        #[cfg(all(tokio_unstable, feature = "bench-alt-timer"))]
+        #[cfg(feature = "bench-alt-timer")]
         b.enable_alt_timer();
-        #[cfg(all(tokio_unstable, feature = "bench-sharded-mio", target_os = "linux"))]
+        #[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
         b.enable_sharded_mio();
         b.build().unwrap()
     }

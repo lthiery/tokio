@@ -497,7 +497,6 @@ cfg_io_sharded_mio! {
 
 #[cfg(all(
     test,
-    tokio_unstable,
     any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
     feature = "rt-multi-thread",
     target_os = "linux",

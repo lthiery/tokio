@@ -4,7 +4,7 @@ use crate::loom::sync::atomic::AtomicUsize;
 use crate::loom::sync::Mutex;
 #[cfg(any(
     all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-    all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+    all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
 ))]
 use std::sync::atomic::AtomicU32;
 use crate::runtime::io::{Direction, ReadyEvent, Tick};
@@ -161,7 +161,11 @@ pub(crate) struct ScheduledIo {
     /// reassigned between kernel queueing and dispatcher reading.
     ///
     /// [`Reactor`]: crate::runtime::io::sharded_mio_reactor::Reactor
-    #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+    #[cfg(all(
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
     pub(super) sharded_mio_slab_key: AtomicU32,
 
     /// Generation counter stamped at registration time by the
@@ -173,7 +177,11 @@ pub(crate) struct ScheduledIo {
     /// requests whose slot was reassigned to a fresh registration.
     ///
     /// [`queue_deregister`]: crate::runtime::io::sharded_mio_driver::ShardedMioHandle::queue_deregister
-    #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+    #[cfg(all(
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
     pub(super) sharded_mio_gen: AtomicU32,
 
     /// Index of the sharded-mio worker whose `mio::Poll` currently owns
@@ -181,7 +189,11 @@ pub(crate) struct ScheduledIo {
     /// once at `add_source` time; read at `deregister` time to route
     /// the `Registry::deregister` call onto the same worker's
     /// registry.
-    #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+    #[cfg(all(
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
     pub(super) sharded_mio_worker: AtomicU32,
 }
 
@@ -265,11 +277,23 @@ impl Default for ScheduledIo {
             uring_gen: AtomicU32::new(u32::MAX),
             #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
             uring_worker: AtomicU32::new(u32::MAX),
-            #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+            #[cfg(all(
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
             sharded_mio_slab_key: AtomicU32::new(u32::MAX),
-            #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+            #[cfg(all(
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
             sharded_mio_gen: AtomicU32::new(0),
-            #[cfg(all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"))]
+            #[cfg(all(
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
             sharded_mio_worker: AtomicU32::new(u32::MAX),
         }
     }
@@ -404,7 +428,6 @@ impl ScheduledIo {
     /// `LOCAL_HANDLE` installed), or when the polling worker is the
     /// owner (trivial self-stake).
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
@@ -431,11 +454,10 @@ impl ScheduledIo {
     }
 
     #[cfg(not(all(
-        tokio_unstable,
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    )))]
+    feature = "io-sharded-mio",
+    feature = "rt-multi-thread",
+    target_os = "linux",
+)))]
     #[inline(always)]
     fn record_sharded_mio_stake(&self) {}
 

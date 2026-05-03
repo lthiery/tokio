@@ -88,13 +88,13 @@ cfg_not_taskdump! {
     mod taskdump_mock;
 }
 
-#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+#[cfg(feature = "rt-alt-timer")]
 use crate::loom::sync::atomic::AtomicBool;
 
-#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+#[cfg(feature = "rt-alt-timer")]
 use crate::runtime::time_alt;
 
-#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+#[cfg(feature = "rt-alt-timer")]
 use crate::runtime::scheduler::util;
 
 /// A scheduler worker
@@ -121,7 +121,7 @@ struct Core {
     /// The worker-local run queue.
     run_queue: queue::Local<Arc<Handle>>,
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     time_context: time_alt::LocalContext,
 
     /// True if the worker is currently searching for more work. Searching
@@ -212,7 +212,7 @@ pub(crate) struct Synced {
     /// Synchronized state for `Inject`.
     pub(crate) inject: inject::Synced,
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     /// Timers pending to be registered.
     /// This is used to register a timer but the [`Core`]
     /// is not available in the current thread.
@@ -288,16 +288,14 @@ pub(super) fn create(
             crate::runtime::io::uring_driver::UringHandle::new(size),
         )),
         #[cfg(all(
-            tokio_unstable,
-            feature = "io-sharded-mio",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
         IoFlavor::ShardedMio => None,
     };
 
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
@@ -339,11 +337,10 @@ pub(super) fn create(
                 )
             }
             #[cfg(all(
-                tokio_unstable,
-                feature = "io-sharded-mio",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
             IoFlavor::ShardedMio => {
                 let handle = std::sync::Arc::clone(
                     sharded_mio_handle
@@ -369,7 +366,7 @@ pub(super) fn create(
             tick: 0,
             lifo_enabled: !config.disable_lifo_slot,
             run_queue,
-            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+            #[cfg(feature = "rt-alt-timer")]
             time_context: time_alt::LocalContext::new(),
             is_searching: false,
             is_shutdown: false,
@@ -401,7 +398,7 @@ pub(super) fn create(
             synced: Mutex::new(Synced {
                 idle: idle_synced,
                 inject: inject_synced,
-                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+                #[cfg(feature = "rt-alt-timer")]
                 inject_timers: Vec::new(),
             }),
             shutdown_cores: Mutex::new(vec![]),
@@ -417,11 +414,10 @@ pub(super) fn create(
         timer_flavor,
         io_flavor,
         #[cfg(all(
-            tokio_unstable,
-            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
+        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
         io_driver: match io_flavor {
             IoFlavor::Traditional => None,
             #[cfg(all(
@@ -434,16 +430,15 @@ pub(super) fn create(
                 crate::runtime::io::io_driver::IoDriver::from_uring(std::sync::Arc::clone(h))
             }),
             #[cfg(all(
-                tokio_unstable,
-                feature = "io-sharded-mio",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
             IoFlavor::ShardedMio => sharded_mio_handle.as_ref().map(|h| {
                 crate::runtime::io::io_driver::IoDriver::from_sharded_mio(std::sync::Arc::clone(h))
             }),
         },
-        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+        #[cfg(feature = "rt-alt-timer")]
         is_shutdown: AtomicBool::new(false),
     });
 
@@ -679,14 +674,12 @@ fn run(worker: Arc<Worker>) {
     // wake on this thread. See the uring comment block above for the
     // full rationale — the reasoning transfers verbatim.
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
     ))]
     struct ClearShardedMioTls;
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
@@ -698,7 +691,6 @@ fn run(worker: Arc<Worker>) {
         }
     }
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
@@ -708,7 +700,6 @@ fn run(worker: Arc<Worker>) {
         crate::runtime::scheduler::multi_thread::sharded_mio_park::clear_current_worker();
     }
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
@@ -735,7 +726,6 @@ fn run(worker: Arc<Worker>) {
     );
 
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
@@ -840,7 +830,7 @@ impl Context {
             }
         }
 
-        #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+        #[cfg(feature = "rt-alt-timer")]
         {
             match self.worker.handle.timer_flavor {
                 TimerFlavor::Traditional => {}
@@ -1086,7 +1076,7 @@ impl Context {
         #[cfg(feature = "time")]
         let (duration, auto_advance_duration) = match self.worker.handle.timer_flavor {
             TimerFlavor::Traditional => (duration, None::<Duration>),
-            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+            #[cfg(feature = "rt-alt-timer")]
             TimerFlavor::Alternative => {
                 // Must happens after taking out the parker, as the `Handle::schedule_local`
                 // will delay the notify if the parker taken out.
@@ -1115,7 +1105,7 @@ impl Context {
                 // suppress unused variable warning
                 let _ = auto_advance_duration;
             }
-            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+            #[cfg(feature = "rt-alt-timer")]
             TimerFlavor::Alternative => {
                 // Must happens before placing back the parker, as the `Handle::schedule_local`
                 // will delay the notify if the parker is still in `core`.
@@ -1148,7 +1138,7 @@ impl Context {
         }
     }
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     /// Maintain local timers before parking the resource driver.
     ///
     /// * Remove cancelled timers from the local timer wheel.
@@ -1223,7 +1213,7 @@ impl Context {
         }
     }
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     /// Maintain local timers after unparking the resource driver.
     ///
     /// * Auto-advance time, if required (feature = "test-util").
@@ -1255,7 +1245,7 @@ impl Context {
         wake_queue.wake_all();
     }
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     fn with_core<F, R>(&self, f: F) -> R
     where
         F: FnOnce(Option<&mut Core>) -> R,
@@ -1266,7 +1256,7 @@ impl Context {
         }
     }
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     pub(crate) fn with_time_temp_local_context<F, R>(&self, f: F) -> R
     where
         F: FnOnce(Option<time_alt::TempLocalContext<'_>>) -> R,
@@ -1565,7 +1555,7 @@ impl Handle {
             // gate-elided when the cfg is off.
             #[cfg(any(
                 all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
             ))]
             #[allow(unused_assignments)]
             let mut remote_reason: Option<&'static core::sync::atomic::AtomicU64> = None;
@@ -1577,7 +1567,7 @@ impl Handle {
                     if let Some(core) = cx.core.borrow_mut().as_mut() {
                         #[cfg(any(
                             all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                            all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                            all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
                         ))]
                         {
                             crate::runtime::io::lazy_debug::bump(
@@ -1590,7 +1580,7 @@ impl Handle {
                     }
                     #[cfg(any(
                         all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                        all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                        all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
                     ))]
                     {
                         remote_reason = Some(
@@ -1600,7 +1590,7 @@ impl Handle {
                 } else {
                     #[cfg(any(
                         all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                        all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                        all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
                     ))]
                     {
                         remote_reason = Some(
@@ -1612,7 +1602,7 @@ impl Handle {
             } else {
                 #[cfg(any(
                     all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                    all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                    all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
                 ))]
                 {
                     remote_reason = Some(
@@ -1624,7 +1614,7 @@ impl Handle {
             // Otherwise, use the inject queue.
             #[cfg(any(
                 all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+                all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
             ))]
             {
                 if let Some(c) = remote_reason {
@@ -1691,7 +1681,7 @@ impl Handle {
         }
     }
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     pub(crate) fn push_remote_timer(&self, hdl: time_alt::EntryHandle) {
         assert_eq!(self.timer_flavor, TimerFlavor::Alternative);
         {
@@ -1701,7 +1691,7 @@ impl Handle {
         self.notify_parked_remote();
     }
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     pub(crate) fn take_remote_timers(&self) -> Vec<time_alt::EntryHandle> {
         assert_eq!(self.timer_flavor, TimerFlavor::Alternative);
         // It's ok to lost the race, as another worker is
@@ -1839,7 +1829,7 @@ impl<'a> Lock<inject::Synced> for &'a Handle {
     }
 }
 
-#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+#[cfg(feature = "rt-alt-timer")]
 /// Returned by [`Context::maintain_local_timers_before_parking`].
 struct MaintainLocalTimer {
     park_duration: Option<Duration>,

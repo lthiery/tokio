@@ -10,11 +10,10 @@
 //! file added once `Handle::add_source` is wired into the uring backend.
 
 #![cfg(all(
-    tokio_unstable,
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
 #![warn(rust_2018_idioms)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};

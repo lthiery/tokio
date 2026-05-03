@@ -46,7 +46,7 @@ cfg_io_sharded_mio! {
 // vtable is populated; sharded-mio vtable is added in step 2.
 #[cfg(any(
     all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-    all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+    all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
 ))]
 pub(crate) mod io_driver;
 
@@ -56,7 +56,7 @@ pub(crate) mod io_driver;
 // environment.
 #[cfg(any(
     all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-    all(tokio_unstable, feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
+    all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
 ))]
 pub(crate) mod lazy_debug;
 

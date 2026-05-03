@@ -38,7 +38,7 @@ fn rt_traditional() -> Runtime {
         .unwrap()
 }
 
-#[cfg(all(tokio_unstable, feature = "bench-sharded-mio", target_os = "linux"))]
+#[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
 fn rt_sharded_mio() -> Runtime {
     let mut b = Builder::new_multi_thread();
     b.worker_threads(workers()).enable_all();
@@ -148,7 +148,7 @@ fn bench_traditional(c: &mut Criterion) {
     });
 }
 
-#[cfg(all(tokio_unstable, feature = "bench-sharded-mio", target_os = "linux"))]
+#[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
 fn bench_sharded_mio(c: &mut Criterion) {
     let rt = rt_sharded_mio();
     c.bench_function("sharded_mio/tcp_echo_throughput", |b| run_tcp_echo(&rt, b));
@@ -157,7 +157,7 @@ fn bench_sharded_mio(c: &mut Criterion) {
     });
 }
 
-#[cfg(not(all(tokio_unstable, feature = "bench-sharded-mio", target_os = "linux")))]
+#[cfg(not(all(feature = "bench-sharded-mio", target_os = "linux")))]
 fn bench_sharded_mio(_c: &mut Criterion) {}
 
 #[cfg(all(tokio_unstable, feature = "bench-uring-reactor", target_os = "linux"))]

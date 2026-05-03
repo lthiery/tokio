@@ -30,13 +30,13 @@ fn build_rt(workers: usize) -> runtime::Runtime {
     b.worker_threads(workers);
     b.enable_all();
 
-    #[cfg(all(tokio_unstable, feature = "io-sharded-mio"))]
+    #[cfg(feature = "io-sharded-mio")]
     {
         b.enable_sharded_mio();
         eprintln!("# backend: io-sharded-mio");
     }
 
-    #[cfg(not(all(tokio_unstable, feature = "io-sharded-mio")))]
+    #[cfg(not(feature = "io-sharded-mio"))]
     eprintln!("# backend: mio (default)");
 
     b.build().expect("runtime builds")

@@ -16,11 +16,10 @@
 //! Linux + `tokio_unstable` + `io-sharded-mio` only.
 
 #![cfg(all(
-    tokio_unstable,
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
 #![warn(rust_2018_idioms)]
 
 use std::os::fd::AsRawFd;

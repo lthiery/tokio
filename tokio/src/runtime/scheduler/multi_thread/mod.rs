@@ -27,7 +27,6 @@ pub(crate) use park::{Parker, WorkerParker, WorkerUnparker};
 pub(crate) mod uring_park;
 
 #[cfg(all(
-    tokio_unstable,
     feature = "io-sharded-mio",
     feature = "rt-multi-thread",
     target_os = "linux",

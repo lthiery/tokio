@@ -18,7 +18,7 @@ pub(crate) use source::TimeSource;
 
 mod wheel;
 
-#[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+#[cfg(feature = "rt-alt-timer")]
 use super::time_alt;
 
 use crate::loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -134,7 +134,7 @@ enum Inner {
         did_wake: AtomicBool,
     },
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     Alternative {
         /// True if the driver is being shutdown.
         is_shutdown: AtomicBool,
@@ -198,7 +198,7 @@ impl Driver {
         (driver, handle)
     }
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     pub(crate) fn new_alt(clock: &Clock) -> Handle {
         let time_source = TimeSource::new(clock);
 
@@ -231,7 +231,7 @@ impl Driver {
             Inner::Traditional { is_shutdown, .. } => {
                 is_shutdown.store(true, Ordering::SeqCst);
             }
-            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+            #[cfg(feature = "rt-alt-timer")]
             Inner::Alternative { is_shutdown, .. } => {
                 is_shutdown.store(true, Ordering::SeqCst);
             }
@@ -347,7 +347,6 @@ impl Handle {
     /// `Notify` / `watch` notification storms) pay zero cost per park
     /// for the timer subsystem under sharded-mio / io-uring.
     #[cfg(all(
-        tokio_unstable,
         any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
         target_os = "linux",
     ))]
@@ -375,7 +374,6 @@ impl Handle {
     /// entirely. The non-empty path still locks and re-derives the value
     /// from the wheel so newly-registered timers are picked up.
     #[cfg(all(
-        tokio_unstable,
         any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
         target_os = "linux",
     ))]
@@ -444,7 +442,7 @@ impl Handle {
         waker_list.wake_all();
     }
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     pub(crate) fn process_at_time_alt(
         &self,
         wheel: &mut time_alt::Wheel,
@@ -464,7 +462,7 @@ impl Handle {
         wheel.take_expired(now, wake_queue);
     }
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     pub(crate) fn shutdown_alt(&self, wheel: &mut time_alt::Wheel) {
         // self.is_shutdown.store(true, Ordering::SeqCst);
         // Advance time forward to the end of time.
@@ -574,7 +572,7 @@ impl Handle {
         pub(super) fn did_wake(&self) -> bool {
             match &self.inner {
                 Inner::Traditional { did_wake, .. } => did_wake.swap(false, Ordering::SeqCst),
-                #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+                #[cfg(feature = "rt-alt-timer")]
                 Inner::Alternative { did_wake, .. } => did_wake.swap(false, Ordering::SeqCst),
             }
         }
@@ -588,7 +586,7 @@ impl Inner {
     pub(super) fn lock(&self) -> crate::loom::sync::MutexGuard<'_, InnerState> {
         match self {
             Inner::Traditional { state, .. } => state.lock(),
-            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+            #[cfg(feature = "rt-alt-timer")]
             Inner::Alternative { .. } => unreachable!("unreachable in alternative timer"),
         }
     }
@@ -597,7 +595,7 @@ impl Inner {
     pub(super) fn is_shutdown(&self) -> bool {
         match self {
             Inner::Traditional { is_shutdown, .. } => is_shutdown.load(Ordering::SeqCst),
-            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+            #[cfg(feature = "rt-alt-timer")]
             Inner::Alternative { is_shutdown, .. } => is_shutdown.load(Ordering::SeqCst),
         }
     }
@@ -609,7 +607,7 @@ impl Inner {
     fn next_wake_atomic(&self) -> &AtomicU64 {
         match self {
             Inner::Traditional { next_wake_atomic, .. } => next_wake_atomic,
-            #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+            #[cfg(feature = "rt-alt-timer")]
             Inner::Alternative { .. } => {
                 unreachable!("alternative timer does not use next_wake_atomic")
             }

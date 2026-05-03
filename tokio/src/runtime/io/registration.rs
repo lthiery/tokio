@@ -6,7 +6,6 @@ use crate::runtime::io::{Direction, ReadyEvent, ScheduledIo};
 // referenced by the legacy-only `handle()` helper. Importing it
 // unconditionally produces an unused-import warning under the vtable cfg.
 #[cfg(not(all(
-    tokio_unstable,
     any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
     feature = "rt-multi-thread",
     target_os = "linux",
@@ -42,11 +41,10 @@ pub(crate) trait RegistrationSource: Source {
     /// Only called on Linux with `io-uring-reactor` or `io-sharded-mio`
     /// enabled; other builds dead-code-eliminate it.
     #[cfg(all(
-        tokio_unstable,
-        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
     fn registration_raw_fd(&self) -> std::os::fd::RawFd;
 }
 
@@ -57,7 +55,6 @@ pub(crate) trait RegistrationSource: Source {
 // enumerate the concrete types Tokio actually wraps with `PollEvented` /
 // `Registration`.
 #[cfg(all(
-    tokio_unstable,
     any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
     feature = "rt-multi-thread",
     target_os = "linux",
@@ -103,7 +100,6 @@ mod registration_source_impls {
 // Builds without the vtable-routed backends: no fd accessor, just a
 // rename of `Source`.
 #[cfg(not(all(
-    tokio_unstable,
     any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
     feature = "rt-multi-thread",
     target_os = "linux",
@@ -197,21 +193,19 @@ cfg_io_driver! {
         /// deregister can fabricate a `mio::unix::SourceFd` over the
         /// same fd.
         #[cfg(all(
-            tokio_unstable,
-            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
         fd: std::os::fd::RawFd,
 
         /// Interest captured at construction; used by first-poll
         /// register.
         #[cfg(all(
-            tokio_unstable,
-            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
         interest: Interest,
 
         /// Cached error kind from a failed first-poll register.
@@ -219,11 +213,10 @@ cfg_io_driver! {
         /// retrying registration. Empty on the legacy mio path
         /// (errors there are surfaced eagerly from `new_with_interest`).
         #[cfg(all(
-            tokio_unstable,
-            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
         first_poll_error: std::sync::OnceLock<io::ErrorKind>,
     }
 
@@ -233,19 +226,17 @@ cfg_io_driver! {
     /// lazily by `ensure_registered`. Encoded as a single field so
     /// `Registration` doesn't need to cfg-divide its layout.
     #[cfg(not(all(
-        tokio_unstable,
-        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    )))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+)))]
     type HandleSlot = scheduler::Handle;
 
     #[cfg(all(
-        tokio_unstable,
-        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
     type HandleSlot = std::sync::OnceLock<scheduler::Handle>;
 }
 
@@ -288,11 +279,10 @@ impl Registration {
         // no allocation, no driver-side work. Just stash the inputs
         // first poll will need.
         #[cfg(all(
-            tokio_unstable,
-            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
         {
             let fd = io.registration_raw_fd();
             return Ok(Registration {
@@ -308,11 +298,10 @@ impl Registration {
         // `Handle::current()` lookup that callers used to do
         // themselves and pass in.
         #[cfg(not(all(
-            tokio_unstable,
-            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        )))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+)))]
         {
             let handle = scheduler::Handle::current();
             let shared = handle.driver().io().add_source(io, interest)?;
@@ -334,11 +323,10 @@ impl Registration {
     /// runtime has gone away will surface that as an error (or, if
     /// no runtime is in TLS at all, panic via `Handle::current`).
     #[cfg(all(
-        tokio_unstable,
-        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
     fn ensure_registered(&self) -> io::Result<&Arc<ScheduledIo>> {
         use crate::runtime::io::lazy_debug::{bump, COUNTERS};
         bump(&COUNTERS.rin_calls);
@@ -442,11 +430,10 @@ impl Registration {
     /// Legacy-only variant: on builds without any vtable backend the
     /// registration is always eager, so `shared` is always populated.
     #[cfg(not(all(
-        tokio_unstable,
-        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    )))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+)))]
     fn ensure_registered(&self) -> io::Result<&Arc<ScheduledIo>> {
         Ok(self.shared.get().expect("eager registration populated"))
     }
@@ -477,11 +464,10 @@ impl Registration {
         // that is never polled is a no-op at deregister time,
         // regardless of whether the current thread has a runtime.
         #[cfg(all(
-            tokio_unstable,
-            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+))]
         {
             if let (Some(handle), Some(shared)) = (self.handle.get(), self.shared.get()) {
                 // Dispatch on the same axis as `ensure_registered`:
@@ -496,11 +482,10 @@ impl Registration {
         }
 
         #[cfg(not(all(
-            tokio_unstable,
-            any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        )))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+)))]
         {
             let shared = self
                 .shared
@@ -664,11 +649,10 @@ impl Registration {
     }
 
     #[cfg(not(all(
-        tokio_unstable,
-        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    )))]
+    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
+    feature = "rt-multi-thread",
+    target_os = "linux",
+)))]
     fn handle(&self) -> &Handle {
         self.handle.driver().io()
     }

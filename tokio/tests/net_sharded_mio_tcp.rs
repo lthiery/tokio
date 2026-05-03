@@ -13,7 +13,6 @@
 //! `rt-multi-thread` + `net`.
 
 #![cfg(all(
-    tokio_unstable,
     feature = "io-sharded-mio",
     feature = "rt-multi-thread",
     feature = "net",

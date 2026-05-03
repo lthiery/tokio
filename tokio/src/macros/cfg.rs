@@ -765,7 +765,6 @@ macro_rules! cfg_io_sharded_mio {
     ($($item:item)*) => {
         $(
             #[cfg(all(
-                tokio_unstable,
                 feature = "io-sharded-mio",
                 feature = "rt-multi-thread",
                 target_os = "linux",

@@ -154,7 +154,6 @@ pub struct Builder {
     /// or the compiled-in default". Set via
     /// [`Builder::enable_park_spin_budget`].
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
@@ -359,11 +358,10 @@ impl Builder {
             enable_eager_driver_handoff: false,
 
             #[cfg(all(
-                tokio_unstable,
-                feature = "io-sharded-mio",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
             park_spin_budget: None,
         }
     }
@@ -434,10 +432,10 @@ impl Builder {
     ///   .unwrap();
     /// # }
     /// ```
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     #[cfg_attr(
         docsrs,
-        doc(cfg(all(tokio_unstable, feature = "rt-alt-timer")))
+        doc(cfg(feature = "rt-alt-timer"))
     )]
     pub fn enable_alt_timer(&mut self) -> &mut Self {
         self.enable_time();
@@ -509,13 +507,11 @@ impl Builder {
     /// They are not a compile error to set both, deliberately, to keep
     /// benchmark toggling ergonomic.
     ///
-    /// Gated behind the `io-sharded-mio` Cargo feature + `--cfg
-    /// tokio_unstable`. Linux-only to keep the A/B fair on the bench
-    /// platform.
+    /// Gated behind the `io-sharded-mio` Cargo feature. Linux-only to keep
+    /// the A/B fair on the bench platform.
     ///
     /// [`enable_uring_reactor`]: Builder::enable_uring_reactor
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
@@ -523,11 +519,10 @@ impl Builder {
     #[cfg_attr(
         docsrs,
         doc(cfg(all(
-            tokio_unstable,
-            feature = "io-sharded-mio",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        )))
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    )))
     )]
     pub fn enable_sharded_mio(&mut self) -> &mut Self {
         self.enable_io();
@@ -575,7 +570,6 @@ impl Builder {
     /// [esm]: Builder::enable_sharded_mio
     /// [unstable]: crate#unstable-features
     #[cfg(all(
-        tokio_unstable,
         feature = "io-sharded-mio",
         feature = "rt-multi-thread",
         target_os = "linux",
@@ -583,11 +577,10 @@ impl Builder {
     #[cfg_attr(
         docsrs,
         doc(cfg(all(
-            tokio_unstable,
-            feature = "io-sharded-mio",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        )))
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    )))
     )]
     pub fn enable_park_spin_budget(&mut self, iters: u32) -> &mut Self {
         self.park_spin_budget = Some(iters);
@@ -1884,11 +1877,10 @@ impl Builder {
                 // Sharded-mio is multi-thread only; the spin budget has
                 // no meaning on the current-thread runtime.
                 #[cfg(all(
-                    tokio_unstable,
-                    feature = "io-sharded-mio",
-                    feature = "rt-multi-thread",
-                    target_os = "linux",
-                ))]
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
                 park_spin_budget: None,
             },
             local_tid,
@@ -2074,11 +2066,10 @@ cfg_rt_multi_thread! {
                     seed_generator: seed_generator_1,
                     metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
                     #[cfg(all(
-                        tokio_unstable,
-                        feature = "io-sharded-mio",
-                        feature = "rt-multi-thread",
-                        target_os = "linux",
-                    ))]
+        feature = "io-sharded-mio",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
                     park_spin_budget: self.park_spin_budget,
                 },
                 self.timer_flavor,

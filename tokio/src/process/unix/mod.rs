@@ -271,7 +271,6 @@ impl Source for Pipe {
 }
 
 #[cfg(all(
-    tokio_unstable,
     any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
     feature = "rt-multi-thread",
     target_os = "linux",

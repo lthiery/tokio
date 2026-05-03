@@ -36,7 +36,7 @@ fn rt_combinations() -> Vec<Runtime> {
         .unwrap();
     rts.push(rt);
 
-    #[cfg(all(tokio_unstable, feature = "rt-alt-timer"))]
+    #[cfg(feature = "rt-alt-timer")]
     {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
