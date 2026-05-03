@@ -419,6 +419,23 @@ pub(crate) struct WorkerState {
     /// [`ShardedMioHandle::record_owner_interest`] from the polling
     /// worker's TLS-resolved index.
     pub(crate) interested_workers: AtomicU64,
+
+    /// One-shot latch: set to `true` the first time a `ScheduledIo`
+    /// successfully registers on this worker's child epoll. Once set,
+    /// never reset — it is a permanent "this worker has touched I/O"
+    /// flag, used by the futex-park gate to decide whether the worker
+    /// can safely park on its own `park_state` futex (no I/O ⇒ no
+    /// epoll wake source ⇒ futex is sufficient and ~5pp cheaper than
+    /// `epoll_wait` on an empty interest set).
+    ///
+    /// Conservative by design: a worker that ever held a registration
+    /// stays on the epoll path for the rest of its life, even after
+    /// the `ScheduledIo` is deregistered. Tracking exact emptiness
+    /// would require a refcount and a re-check race against in-flight
+    /// `register_on_worker` calls — not worth the complexity for the
+    /// common "one worker handles all the I/O, others are CPU-bound"
+    /// shape this gate is designed to optimise.
+    pub(crate) has_io_registered: AtomicBool,
 }
 
 impl WorkerState {
@@ -431,6 +448,7 @@ impl WorkerState {
             registrations,
             synced: Mutex::new(synced),
             interested_workers: AtomicU64::new(0),
+            has_io_registered: AtomicBool::new(false),
         }
     }
 }
@@ -1111,6 +1129,28 @@ impl ShardedMioHandle {
         futex_wait(&slot.park_state, PARKED_OWN_FUTEX, timeout);
     }
 
+    /// Has this worker ever held a successful I/O registration?
+    ///
+    /// Permanent latch (`AtomicBool`, set-once). `false` means the
+    /// worker has never had a `ScheduledIo` registered against its
+    /// child epoll, so its `epoll_wait` would only ever return on a
+    /// cross-worker `eventfd` kick — which is exactly what the futex
+    /// path delivers more cheaply. `true` means at least one
+    /// registration has landed; the worker must stay on the epoll
+    /// path because real I/O readiness is the only wake source for
+    /// those events.
+    ///
+    /// Acquire-load pairs with the Release-store in
+    /// `register_on_worker`'s success tail, so observing `true`
+    /// implies the registration is fully published into the slab and
+    /// epoll interest set.
+    #[inline]
+    pub(crate) fn worker_has_io_registered(&self, worker_idx: usize) -> bool {
+        self.workers[worker_idx]
+            .has_io_registered
+            .load(Ordering::Acquire)
+    }
+
     /// Snapshot the current `park_state` for the spin loop. Relaxed
     /// because the only consumer is the owning worker on its own
     /// slot — the cross-worker writer (`unpark`'s `swap`) provides
@@ -1306,6 +1346,12 @@ impl ShardedMioHandle {
         shared
             .sharded_mio_slab_key
             .store(ok.slab_key, Ordering::Relaxed);
+        // Permanent latch: this worker has now touched I/O, so all
+        // future parks on it must use the epoll path (events fire
+        // through the child epoll, not through `park_state`).
+        // Release-store pairs with the Acquire-load on the parker side
+        // (`ShardedMioHandle::worker_has_io_registered`).
+        slot.has_io_registered.store(true, Ordering::Release);
         self.metrics.incr_fd_count();
         Ok(worker_idx)
     }

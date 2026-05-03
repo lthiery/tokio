@@ -94,28 +94,48 @@ fn resolve_spin_budget(override_iters: Option<u32>) -> u32 {
     DEFAULT_SPIN_BUDGET
 }
 
-/// Read `TOKIO_FUTEX_PARK` once per process. Until per-worker
-/// slab-empty detection lands, this is the only gate on the
-/// `PARKED_OWN_FUTEX` mode: setting `TOKIO_FUTEX_PARK=1`
-/// unconditionally selects futex park for non-meta-watcher
-/// workers, which is **only safe** for workloads that register
-/// no I/O resources on the runtime (every cross-worker wake
-/// originates from `unpark`, which goes through the consistent
-/// `swap(NOTIFIED)` → wake-dispatch path).
+/// Tri-state futex-park override, parsed once per process from
+/// `TOKIO_FUTEX_PARK`:
 ///
-/// Used by `bench-sharded-mio`-only benches like `sync_broadcast`
-/// and `sync_notify` to validate that the futex path eliminates
-/// the ~9% kernel epoll/eventfd overhead measured on those
-/// workloads (perf attribution in `perf-investigation/`).
+/// * `Some(true)`  — force futex park for every non-meta-watcher
+///   worker, regardless of registered I/O. Useful only for
+///   benchmarks of zero-I/O workloads (e.g. `sync_broadcast`,
+///   `sync_notify`); **unsafe** for workloads with real I/O
+///   sources because epoll readiness can't wake a futex.
+/// * `Some(false)` — force epoll park (legacy behaviour, what the
+///   driver did before the futex branch was added).
+/// * `None`        — auto: per-worker, take the futex path iff
+///   the worker has never had a `ScheduledIo` register on it
+///   (`ShardedMioHandle::worker_has_io_registered(idx) == false`).
+///   This is the production default — no-I/O workers (CPU-bound
+///   tasks, channel/notify benches) avoid the ~9% kernel
+///   epoll/eventfd overhead measured in `perf-investigation/`,
+///   while workers that ever touched I/O stay on the epoll path.
 #[cfg(target_os = "linux")]
-fn futex_park_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
+fn futex_park_override() -> Option<bool> {
+    static FLAG: OnceLock<Option<bool>> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        std::env::var("TOKIO_FUTEX_PARK")
-            .ok()
-            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+        std::env::var("TOKIO_FUTEX_PARK").ok().and_then(|s| {
+            if s == "1" || s.eq_ignore_ascii_case("true") {
+                Some(true)
+            } else if s == "0" || s.eq_ignore_ascii_case("false") {
+                Some(false)
+            } else {
+                None
+            }
+        })
     })
+}
+
+/// Decide whether `worker_idx` should take the `PARKED_OWN_FUTEX`
+/// path on this park entry. See [`futex_park_override`] for the
+/// gate semantics.
+#[cfg(target_os = "linux")]
+fn use_futex_park(handle: &ShardedMioHandle, worker_idx: usize) -> bool {
+    match futex_park_override() {
+        Some(forced) => forced,
+        None => !handle.worker_has_io_registered(worker_idx),
+    }
 }
 
 thread_local! {
@@ -391,15 +411,17 @@ impl ShardedMioParker {
             let guard = self.handle.try_acquire_meta_watcher();
             if guard.is_some() {
                 (ParkMode::Meta, guard)
-            } else if futex_park_enabled() {
+            } else if use_futex_park(&self.handle, self.idx) {
                 // Direct futex park on `park_state` — skips the
                 // `mio::Poll::poll` → `epoll_wait` → eventfd_write
                 // → `ep_poll_callback` chain that costs ~9% of CPU
                 // on no-I/O cross-worker-wake benches like
                 // `sync_broadcast/contention/10`. Safe only when the
                 // worker has no I/O sources on its child epoll;
-                // gated by env var `TOKIO_FUTEX_PARK=1` until the
-                // slab-empty detection path lands.
+                // the auto-gate consults the per-worker
+                // `has_io_registered` latch — workers that ever held
+                // a `ScheduledIo` registration drop back to the
+                // epoll path permanently.
                 (ParkMode::OwnChildFutex, None)
             } else {
                 (ParkMode::OwnChild, None)
