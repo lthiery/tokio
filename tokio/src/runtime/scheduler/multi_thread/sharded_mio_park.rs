@@ -335,23 +335,67 @@ impl ShardedMioParker {
             return;
         }
 
-        // Two substrate paths:
+        // Pre-decide whether this worker would prefer the futex path
+        // (no I/O ever registered ⇒ park on the `park_state` futex
+        // directly). The mode-selection block below may still upgrade
+        // us to `Meta` if we win the meta-watcher CAS, but the common
+        // case for a no-I/O worker is the futex branch.
         //
-        // - `spin_budget > 0`: enter the pre-park spin window via
-        //   `begin_searching` (CAS EMPTY → SEARCHING). A concurrent
-        //   `unpark` swap against `prev = SEARCHING` is yanked back
-        //   into userspace; we observe it from `park_state_load` in
-        //   the spin loop or via `commit_park` failing with NOTIFIED.
+        // We need this *before* the spin window because the futex
+        // path uses a different (lighter) spin substrate — see the
+        // `if !prefer_futex && spin > 0` block.
+        #[cfg(target_os = "linux")]
+        let prefer_futex = use_futex_park(&self.handle, self.idx);
+        #[cfg(not(target_os = "linux"))]
+        let prefer_futex = false;
+
+        // Three substrate paths:
         //
-        // - `spin_budget == 0`: skip SEARCHING entirely and use the
-        //   direct `EMPTY → PARKED_<mode>` CAS via `begin_park_direct`.
-        //   This is one CAS instead of two and matches the original
-        //   pre-SEARCHING substrate cost. Workloads that have not
-        //   opted into spin pay zero substrate overhead vs the prior
-        //   4-state machine.
+        // - `prefer_futex && spin > 0`: passive read-only spin window.
+        //   `park_state` stays `EMPTY` throughout the spin; a racing
+        //   `unpark` observes `prev = EMPTY` and skips the kernel
+        //   wake (same wake-suppression property the SEARCHING dance
+        //   provides) but bookkeeps as `unpark_was_empty`. We poll
+        //   `park_state` for `NOTIFIED` and consume via
+        //   `try_consume_notified` if we observe it. The futex
+        //   wake-side has its own kernel CAS-on-entry inside
+        //   `FUTEX_WAIT`, so the userspace `SEARCHING ↔ commit_park`
+        //   CAS pair is redundant — and measurable: it cost ~17% of
+        //   on-CPU samples in `park_internal` on
+        //   `sync_notify/notify_one/10` (the regression that drove
+        //   this change), where wake intervals are short enough that
+        //   the spin loop dominates rather than amortises against
+        //   the syscall.
+        //
+        // - `!prefer_futex && spin > 0`: full SEARCHING dance. The
+        //   epoll path's `epoll_wait` has no userspace-value
+        //   race-closer; an unparker that races our park needs the
+        //   SEARCHING signal to suppress an eventfd write that would
+        //   otherwise cost ~9% on hot cross-worker fanout (see
+        //   `sync_broadcast/contention/10`).
+        //
+        // - `spin == 0`: skip the spin entirely and use direct
+        //   `EMPTY → PARKED_<mode>` CAS via `begin_park_direct`. Same
+        //   shape as before this change.
         let spin = self.spin_budget;
 
-        if spin > 0 {
+        if prefer_futex && spin > 0 {
+            // Passive (read-only) spin — see comment above. Each
+            // iteration reads `park_state`; on `NOTIFIED` we hand off
+            // to `try_consume_notified` which CAS-clears it back to
+            // `EMPTY`. If the CAS loses to a racing transition we
+            // bail to the slow path which will re-observe NOTIFIED in
+            // its own check.
+            for _ in 0..spin {
+                if self.handle.park_state_load(self.idx) == NOTIFIED {
+                    if self.handle.try_consume_notified(self.idx) {
+                        return;
+                    }
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        } else if spin > 0 {
             // `Err` here means we lost a race against an unpark from
             // EMPTY (state was already NOTIFIED on entry); the call
             // has already cleared state back to EMPTY for us.
@@ -411,7 +455,7 @@ impl ShardedMioParker {
             let guard = self.handle.try_acquire_meta_watcher();
             if guard.is_some() {
                 (ParkMode::Meta, guard)
-            } else if use_futex_park(&self.handle, self.idx) {
+            } else if prefer_futex {
                 // Direct futex park on `park_state` — skips the
                 // `mio::Poll::poll` → `epoll_wait` → eventfd_write
                 // → `ep_poll_callback` chain that costs ~9% of CPU
@@ -434,7 +478,13 @@ impl ShardedMioParker {
         // observed NOTIFIED); the call has already cleared state back
         // to EMPTY for us. On linux, dropping `_meta_guard` releases
         // the meta-watcher slot so the next idle worker can take it.
-        let commit = if spin > 0 {
+        //
+        // For the futex path (whether or not we did the passive
+        // spin) state is `EMPTY`, so we use `begin_park_direct`. For
+        // the epoll path we use `commit_park` iff we entered the
+        // SEARCHING dance.
+        let used_searching = !prefer_futex && spin > 0;
+        let commit = if used_searching {
             self.handle.commit_park(self.idx, mode)
         } else {
             self.handle.begin_park_direct(self.idx, mode)
