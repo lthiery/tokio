@@ -6,9 +6,20 @@ use tokio::sync::{broadcast, Notify};
 use criterion::measurement::WallTime;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion};
 
+const DEFAULT_WORKERS: usize = 6;
+
+/// Override `DEFAULT_WORKERS` at runtime via `TOKIO_BENCH_WORKERS=N`.
+fn workers() -> usize {
+    std::env::var("TOKIO_BENCH_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_WORKERS)
+}
+
 fn rt() -> tokio::runtime::Runtime {
     let mut b = tokio::runtime::Builder::new_multi_thread();
-    b.worker_threads(6);
+    b.worker_threads(workers());
     #[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
     b.enable_sharded_mio();
     b.build().unwrap()
