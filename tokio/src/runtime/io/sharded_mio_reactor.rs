@@ -497,6 +497,22 @@ impl SharedRegistry {
             let new_gen = state.gens[key].wrapping_add(1);
             let new_gen = if new_gen == 0 { 1 } else { new_gen };
             state.gens[key] = new_gen;
+            // Stamp the gen on the ScheduledIo *inside* the lock, before
+            // the kernel-side `registry.register` can produce an event
+            // for `(new_gen, key)`. If we deferred this until after the
+            // mio register call (as we used to), there was a window where
+            // the kernel had already queued an event with token
+            // `(new_gen, K)` but the ScheduledIo's `sharded_mio_gen` was
+            // still its previous value (0 for fresh, or whatever the
+            // prior occupant left). A peer dispatcher acquiring the ops
+            // lock during that window would observe `slab[K]` with a
+            // stale gen, take the `dispatch_gen_mismatch` branch, and
+            // silently drop the live registration's edge — which under
+            // EPOLLET is never redelivered. See
+            // `SHARDED_MIO_DEADLOCK_ASSESSMENT.md` §7e2-result.
+            scheduled_io
+                .sharded_mio_gen
+                .store(new_gen, Ordering::Relaxed);
             // Live-fd map: this fd's epoll record (about to be added)
             // is keyed by `key_u32`. Overwrites any previous entry — a
             // previous entry here means the prior owner's queued
@@ -518,14 +534,12 @@ impl SharedRegistry {
             if state.live_fds.get(&fd) == Some(&key_u32) {
                 state.live_fds.remove(&fd);
             }
+            // The orphan gen stamp on the (now-rolled-back) ScheduledIo
+            // is harmless: the slab entry is gone so no dispatcher can
+            // reach it, and the next register call will allocate a fresh
+            // slot and stamp a fresh gen.
             return Err(e);
         }
-        // Stamp the gen on the ScheduledIo so the apply-deregister
-        // path can compare against `state.gens[key]` later. The
-        // slab_key is stamped by the caller (driver) on success.
-        scheduled_io
-            .sharded_mio_gen
-            .store(gen, Ordering::Relaxed);
         bump(&COUNTERS.sr_register_ok);
         Ok(RegisterOk {
             slab_key: key_u32,
