@@ -70,11 +70,8 @@ use crate::util::cacheline::CachePadded;
 /// kernel wake entirely, and the parker's spin or its
 /// `SEARCHING → PARKED_<mode>` CAS observes the resulting `NOTIFIED`
 /// and bails. See the unpark module docs for the full race argument.
-// `park_state` is an `AtomicU32` because the futex-based park
-// branch (`PARKED_OWN_FUTEX`) calls `SYS_futex` directly on this
-// word, which the Linux ABI requires to be 32-bit-sized. The
-// state values themselves trivially fit in `u32` (max value is
-// `PARKED_OWN_FUTEX = 5`).
+// `park_state` is an `AtomicU32`. The state values trivially fit
+// in `u32` (max value is `SEARCHING = 4`).
 pub(crate) const EMPTY: u32 = 0;
 pub(crate) const PARKED_OWN: u32 = 1;
 pub(crate) const PARKED_META: u32 = 2;
@@ -85,22 +82,6 @@ pub(crate) const NOTIFIED: u32 = 3;
 /// parker will see the resulting `NOTIFIED` from inside its spin
 /// loop or via its `commit_park` CAS).
 pub(crate) const SEARCHING: u32 = 4;
-/// Worker is blocked in `SYS_futex(FUTEX_WAIT_PRIVATE, &park_state,
-/// PARKED_OWN_FUTEX)`. Unpark wakes it via
-/// `SYS_futex(FUTEX_WAKE_PRIVATE, &park_state, 1)`. Used by
-/// workers that have no I/O resources registered on their child
-/// epoll — for those workers, the eventfd-on-epoll wake path costs
-/// ~9% extra CPU vs futex per perf record on `sync_broadcast/
-/// contention/10` (see investigation notes), and the futex path
-/// avoids the entire `ep_*` / `eventfd_*` kernel chain.
-///
-/// Wake-state consistency comes for free: `unpark` swaps `NOTIFIED`
-/// on this same atomic, so a concurrent CAS-on-entry futex_wait
-/// observes the value mismatch and returns without sleeping. No
-/// separate publish-then-wake ordering is required.
-#[cfg(target_os = "linux")]
-pub(crate) const PARKED_OWN_FUTEX: u32 = 5;
-
 /// Park branch the worker is about to block in. Passed to
 /// [`ShardedMioHandle::begin_park`] so the published `park_state`
 /// records which wake mechanism the unpark path should use. The
@@ -123,15 +104,6 @@ pub(crate) enum ParkMode {
     /// `META_WAKER_TOKEN`).
     #[cfg(target_os = "linux")]
     Meta,
-    /// Worker blocks in `SYS_futex(FUTEX_WAIT_PRIVATE, &park_state,
-    /// PARKED_OWN_FUTEX)` directly. Selected by the parker only when
-    /// the worker's child epoll has zero non-WAKER fds registered
-    /// (no I/O resources to monitor), so the only thing the worker
-    /// is waiting on is an unpark from another worker. Avoids the
-    /// `ep_*` / `eventfd_*` kernel overhead that the OwnChild
-    /// path pays per park/wake cycle.
-    #[cfg(target_os = "linux")]
-    OwnChildFutex,
 }
 
 impl ParkMode {
@@ -141,80 +113,7 @@ impl ParkMode {
             ParkMode::OwnChild => PARKED_OWN,
             #[cfg(target_os = "linux")]
             ParkMode::Meta => PARKED_META,
-            #[cfg(target_os = "linux")]
-            ParkMode::OwnChildFutex => PARKED_OWN_FUTEX,
         }
-    }
-}
-
-/// Park the calling worker by blocking in
-/// `SYS_futex(FUTEX_WAIT_PRIVATE, addr, expected, timeout)`.
-///
-/// The kernel atomically compares `*addr` to `expected` against the
-/// queue insertion: if they differ at the moment the queue would be
-/// inserted, the syscall returns immediately with `EAGAIN`. This is
-/// the protection against a concurrent unparker that swaps
-/// `NOTIFIED` between our pre-park CAS and this call — we never
-/// sleep with a notification pending.
-///
-/// `timeout = None` blocks indefinitely. With `Some(d)` the syscall
-/// returns `ETIMEDOUT` after `d`; the caller treats it as a normal
-/// wakeup (next maintenance loop or timer-driven dispatch will
-/// run).
-///
-/// Linux-only. Uses `FUTEX_PRIVATE_FLAG` so the kernel skips the
-/// hash-bucket cross-process lookup; `park_state` is never shared
-/// across address spaces.
-#[cfg(target_os = "linux")]
-fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<std::time::Duration>) {
-    let ts = timeout.map(|d| libc::timespec {
-        tv_sec: d.as_secs() as libc::time_t,
-        tv_nsec: i64::from(d.subsec_nanos()) as libc::c_long,
-    });
-    let ts_ptr: *const libc::timespec = match ts.as_ref() {
-        Some(t) => t,
-        None => ptr::null(),
-    };
-    // SAFETY: `addr` is a valid `AtomicU32` reference for the
-    // duration of the call; the kernel reads through the raw pointer
-    // exactly once during the queue-insertion CAS. `ts_ptr` is
-    // either null (infinite wait) or a stack-resident `timespec`
-    // valid for the duration of the call. Errors are deliberately
-    // ignored (`-EAGAIN` from the comparison race, `-EINTR` from
-    // signal interruption, `-ETIMEDOUT` from the deadline) — every
-    // case is recoverable as a spurious wake; the caller's outer
-    // loop revalidates `park_state` and either re-arms or returns.
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            addr as *const AtomicU32 as *mut u32,
-            libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-            expected,
-            ts_ptr,
-        );
-    }
-}
-
-/// Wake (at most) one waiter blocked in `futex_wait` on `addr`.
-///
-/// Idempotent — if no waiter is queued the syscall is a cheap
-/// no-op (one hash-bucket lookup, no rq lock acquisition). The
-/// caller has already published the wake state via
-/// `swap(NOTIFIED, …)`, so an unparked worker that was in the
-/// futex_wait CAS-on-entry window observes the value mismatch and
-/// returns from the syscall without ever queuing.
-#[cfg(target_os = "linux")]
-fn futex_wake_one(addr: &AtomicU32) {
-    // SAFETY: same lifetime/aliasing reasoning as `futex_wait`. The
-    // FUTEX_WAKE op only reads `addr` for the bucket hash; it never
-    // writes through the pointer.
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            addr as *const AtomicU32 as *mut u32,
-            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-            1i32,
-        );
     }
 }
 
@@ -366,11 +265,9 @@ impl Drop for MetaWatcherGuard {
 /// hot atomics and produces false-sharing traffic on the parallel-fanout
 /// dispatch path.
 pub(crate) struct WorkerState {
-    /// `EMPTY | PARKED | NOTIFIED`. Written by the owning worker on
-    /// park/resume; read/CAS'd by unparkers. `AtomicU32` (not
-    /// `AtomicUsize`) so the futex-park branch can call `SYS_futex`
-    /// directly on this word — the Linux ABI requires the futex
-    /// to be 32-bit-sized.
+    /// `EMPTY | PARKED_OWN | PARKED_META | NOTIFIED | SEARCHING`.
+    /// Written by the owning worker on park/resume; read/CAS'd by
+    /// unparkers.
     pub(crate) park_state: AtomicU32,
 
     /// Cross-thread handle to this worker's mio `Registry` + slab +
@@ -399,15 +296,14 @@ pub(crate) struct WorkerState {
     /// One-shot latch: set to `true` the first time a `ScheduledIo`
     /// successfully registers on this worker's child epoll. Once set,
     /// never reset — it is a permanent "this worker has touched I/O"
-    /// flag, used by the futex-park gate to decide whether the worker
-    /// can safely park on its own `park_state` futex (no I/O ⇒ no
-    /// epoll wake source ⇒ futex is sufficient and ~5pp cheaper than
-    /// `epoll_wait` on an empty interest set).
+    /// flag, used to gate the meta-watcher CAS so pure-sync workloads
+    /// don't pay the global CAS contention on `meta_watcher_busy` per
+    /// park.
     ///
     /// Conservative by design: a worker that ever held a registration
-    /// stays on the epoll path for the rest of its life, even after
-    /// the `ScheduledIo` is deregistered. Tracking exact emptiness
-    /// would require a refcount and a re-check race against in-flight
+    /// stays gated `true` for the rest of its life, even after the
+    /// `ScheduledIo` is deregistered. Tracking exact emptiness would
+    /// require a refcount and a re-check race against in-flight
     /// `register_on_worker` calls — not worth the complexity for the
     /// common "one worker handles all the I/O, others are CPU-bound"
     /// shape this gate is designed to optimise.
@@ -845,19 +741,6 @@ impl ShardedMioHandle {
                 self.meta_waker.wake();
                 true
             }
-            #[cfg(target_os = "linux")]
-            PARKED_OWN_FUTEX => {
-                bump(&COUNTERS.unpark_was_parked);
-                // Worker is blocked in `SYS_futex(FUTEX_WAIT,
-                // &park_state, PARKED_OWN_FUTEX)`. The `swap` above
-                // already published NOTIFIED, so a parker that
-                // hadn't yet entered the syscall will fail its
-                // FUTEX_WAIT comparison and return EAGAIN
-                // immediately. A parker already inside the syscall
-                // is woken by FUTEX_WAKE.
-                futex_wake_one(&slot.park_state);
-                true
-            }
             SEARCHING => {
                 bump(&COUNTERS.unpark_was_searching);
                 // Parker is in the pre-park spin window. The swap
@@ -1032,48 +915,15 @@ impl ShardedMioHandle {
         }
     }
 
-    /// Block the calling worker on `SYS_futex(FUTEX_WAIT, &park_state,
-    /// PARKED_OWN_FUTEX)`. Caller must have already CAS'd the worker's
-    /// `park_state` to `PARKED_OWN_FUTEX` (typically via
-    /// [`Self::begin_park_direct`] with `ParkMode::OwnChildFutex`).
-    ///
-    /// Returns when:
-    /// - Another worker calls [`Self::unpark`] which `swap(NOTIFIED)`s
-    ///   and issues `FUTEX_WAKE`. This caller's `park_state` is now
-    ///   `NOTIFIED`; the caller resets it to `EMPTY` via
-    ///   [`Self::end_park`].
-    /// - A racing unparker swapped `NOTIFIED` *before* this caller
-    ///   entered the syscall: the kernel CAS-on-entry observes the
-    ///   value mismatch and returns `EAGAIN` immediately. Same
-    ///   recovery as above.
-    /// - `timeout` elapses (`Some(d)` only): `ETIMEDOUT`. The caller
-    ///   re-checks for work in the maintenance loop.
-    /// - A signal interrupts the syscall (`EINTR`): treated as a
-    ///   spurious wake; caller revalidates `park_state`.
-    ///
-    /// Linux-only — gated by the same `cfg` as the
-    /// [`PARKED_OWN_FUTEX`] state.
-    #[cfg(target_os = "linux")]
-    #[inline]
-    pub(crate) fn park_on_own_futex(
-        &self,
-        worker_idx: usize,
-        timeout: Option<std::time::Duration>,
-    ) {
-        let slot = &self.workers[worker_idx];
-        futex_wait(&slot.park_state, PARKED_OWN_FUTEX, timeout);
-    }
-
     /// Has this worker ever held a successful I/O registration?
     ///
     /// Permanent latch (`AtomicBool`, set-once). `false` means the
     /// worker has never had a `ScheduledIo` registered against its
-    /// child epoll, so its `epoll_wait` would only ever return on a
-    /// cross-worker `eventfd` kick — which is exactly what the futex
-    /// path delivers more cheaply. `true` means at least one
-    /// registration has landed; the worker must stay on the epoll
-    /// path because real I/O readiness is the only wake source for
-    /// those events.
+    /// child epoll. Used to gate the meta-watcher CAS: a worker with
+    /// no I/O of its own and no peers with I/O has nothing to drain
+    /// from the meta epoll, so we skip the global CAS contention on
+    /// pure-sync workloads. `true` means at least one registration
+    /// has landed.
     ///
     /// Acquire-load pairs with the Release-store in
     /// `register_on_worker`'s success tail, so observing `true`

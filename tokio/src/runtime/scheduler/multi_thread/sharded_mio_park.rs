@@ -94,50 +94,6 @@ fn resolve_spin_budget(override_iters: Option<u32>) -> u32 {
     DEFAULT_SPIN_BUDGET
 }
 
-/// Tri-state futex-park override, parsed once per process from
-/// `TOKIO_FUTEX_PARK`:
-///
-/// * `Some(true)`  — force futex park for every non-meta-watcher
-///   worker, regardless of registered I/O. Useful only for
-///   benchmarks of zero-I/O workloads (e.g. `sync_broadcast`,
-///   `sync_notify`); **unsafe** for workloads with real I/O
-///   sources because epoll readiness can't wake a futex.
-/// * `Some(false)` — force epoll park (legacy behaviour, what the
-///   driver did before the futex branch was added).
-/// * `None`        — auto: per-worker, take the futex path iff
-///   the worker has never had a `ScheduledIo` register on it
-///   (`ShardedMioHandle::worker_has_io_registered(idx) == false`).
-///   This is the production default — no-I/O workers (CPU-bound
-///   tasks, channel/notify benches) avoid the ~9% kernel
-///   epoll/eventfd overhead measured in `perf-investigation/`,
-///   while workers that ever touched I/O stay on the epoll path.
-#[cfg(target_os = "linux")]
-fn futex_park_override() -> Option<bool> {
-    static FLAG: OnceLock<Option<bool>> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("TOKIO_FUTEX_PARK").ok().and_then(|s| {
-            if s == "1" || s.eq_ignore_ascii_case("true") {
-                Some(true)
-            } else if s == "0" || s.eq_ignore_ascii_case("false") {
-                Some(false)
-            } else {
-                None
-            }
-        })
-    })
-}
-
-/// Decide whether `worker_idx` should take the `PARKED_OWN_FUTEX`
-/// path on this park entry. See [`futex_park_override`] for the
-/// gate semantics.
-#[cfg(target_os = "linux")]
-fn use_futex_park(handle: &ShardedMioHandle, worker_idx: usize) -> bool {
-    match futex_park_override() {
-        Some(forced) => forced,
-        None => !handle.worker_has_io_registered(worker_idx),
-    }
-}
-
 thread_local! {
     /// Current worker's index for the running thread, or `None` if not
     /// on a sharded-mio worker. Mirrors the uring parker's
@@ -335,67 +291,21 @@ impl ShardedMioParker {
             return;
         }
 
-        // Pre-decide whether this worker would prefer the futex path
-        // (no I/O ever registered ⇒ park on the `park_state` futex
-        // directly). The mode-selection block below may still upgrade
-        // us to `Meta` if we win the meta-watcher CAS, but the common
-        // case for a no-I/O worker is the futex branch.
+        // Two substrate paths:
         //
-        // We need this *before* the spin window because the futex
-        // path uses a different (lighter) spin substrate — see the
-        // `if !prefer_futex && spin > 0` block.
-        #[cfg(target_os = "linux")]
-        let prefer_futex = use_futex_park(&self.handle, self.idx);
-        #[cfg(not(target_os = "linux"))]
-        let prefer_futex = false;
-
-        // Three substrate paths:
-        //
-        // - `prefer_futex && spin > 0`: passive read-only spin window.
-        //   `park_state` stays `EMPTY` throughout the spin; a racing
-        //   `unpark` observes `prev = EMPTY` and skips the kernel
-        //   wake (same wake-suppression property the SEARCHING dance
-        //   provides) but bookkeeps as `unpark_was_empty`. We poll
-        //   `park_state` for `NOTIFIED` and consume via
-        //   `try_consume_notified` if we observe it. The futex
-        //   wake-side has its own kernel CAS-on-entry inside
-        //   `FUTEX_WAIT`, so the userspace `SEARCHING ↔ commit_park`
-        //   CAS pair is redundant — and measurable: it cost ~17% of
-        //   on-CPU samples in `park_internal` on
-        //   `sync_notify/notify_one/10` (the regression that drove
-        //   this change), where wake intervals are short enough that
-        //   the spin loop dominates rather than amortises against
-        //   the syscall.
-        //
-        // - `!prefer_futex && spin > 0`: full SEARCHING dance. The
-        //   epoll path's `epoll_wait` has no userspace-value
-        //   race-closer; an unparker that races our park needs the
-        //   SEARCHING signal to suppress an eventfd write that would
-        //   otherwise cost ~9% on hot cross-worker fanout (see
+        // - `spin > 0`: full SEARCHING dance. The epoll path's
+        //   `epoll_wait` has no userspace-value race-closer; an
+        //   unparker that races our park needs the SEARCHING signal
+        //   to suppress an eventfd write that would otherwise cost
+        //   ~9% on hot cross-worker fanout (see
         //   `sync_broadcast/contention/10`).
         //
         // - `spin == 0`: skip the spin entirely and use direct
         //   `EMPTY → PARKED_<mode>` CAS via `begin_park_direct`. Same
-        //   shape as before this change.
+        //   shape as before the spin window was added.
         let spin = self.spin_budget;
 
-        if prefer_futex && spin > 0 {
-            // Passive (read-only) spin — see comment above. Each
-            // iteration reads `park_state`; on `NOTIFIED` we hand off
-            // to `try_consume_notified` which CAS-clears it back to
-            // `EMPTY`. If the CAS loses to a racing transition we
-            // bail to the slow path which will re-observe NOTIFIED in
-            // its own check.
-            for _ in 0..spin {
-                if self.handle.park_state_load(self.idx) == NOTIFIED {
-                    if self.handle.try_consume_notified(self.idx) {
-                        return;
-                    }
-                    break;
-                }
-                core::hint::spin_loop();
-            }
-        } else if spin > 0 {
+        if spin > 0 {
             // `Err` here means we lost a race against an unpark from
             // EMPTY (state was already NOTIFIED on entry); the call
             // has already cleared state back to EMPTY for us.
@@ -484,18 +394,6 @@ impl ShardedMioParker {
             };
             if guard.is_some() {
                 (ParkMode::Meta, guard)
-            } else if prefer_futex {
-                // Direct futex park on `park_state` — skips the
-                // `mio::Poll::poll` → `epoll_wait` → eventfd_write
-                // → `ep_poll_callback` chain that costs ~9% of CPU
-                // on no-I/O cross-worker-wake benches like
-                // `sync_broadcast/contention/10`. Safe only when the
-                // worker has no I/O sources on its child epoll;
-                // the auto-gate consults the per-worker
-                // `has_io_registered` latch — workers that ever held
-                // a `ScheduledIo` registration drop back to the
-                // epoll path permanently.
-                (ParkMode::OwnChildFutex, None)
             } else {
                 (ParkMode::OwnChild, None)
             }
@@ -508,11 +406,10 @@ impl ShardedMioParker {
         // to EMPTY for us. On linux, dropping `_meta_guard` releases
         // the meta-watcher slot so the next idle worker can take it.
         //
-        // For the futex path (whether or not we did the passive
-        // spin) state is `EMPTY`, so we use `begin_park_direct`. For
-        // the epoll path we use `commit_park` iff we entered the
-        // SEARCHING dance.
-        let used_searching = !prefer_futex && spin > 0;
+        // We use `commit_park` iff we entered the SEARCHING dance,
+        // otherwise the direct `EMPTY → PARKED_<mode>` CAS via
+        // `begin_park_direct`.
+        let used_searching = spin > 0;
         let commit = if used_searching {
             self.handle.commit_park(self.idx, mode)
         } else {
@@ -526,7 +423,6 @@ impl ShardedMioParker {
         match mode {
             ParkMode::Meta => self.park_on_meta(duration),
             ParkMode::OwnChild => self.park_on_own_child(duration),
-            ParkMode::OwnChildFutex => self.park_on_own_futex(duration),
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -534,28 +430,6 @@ impl ShardedMioParker {
         }
 
         self.handle.end_park(self.idx);
-    }
-
-    /// Direct-futex park on this worker's `park_state` atomic.
-    /// Block in `SYS_futex(FUTEX_WAIT, &park_state,
-    /// PARKED_OWN_FUTEX, timeout)`.
-    ///
-    /// Selected by `park_internal` only when (a) we lost the
-    /// meta-watcher CAS, (b) the per-worker spin window is
-    /// disabled or has elapsed, and (c) the futex-park path is
-    /// enabled (currently env-var gated; will become slab-empty
-    /// gated once the per-worker registration counter lands).
-    ///
-    /// Wake-side consistency: `ShardedMioHandle::unpark` always
-    /// `swap(NOTIFIED)`s before issuing the wake; on `prev ==
-    /// PARKED_OWN_FUTEX` it issues `FUTEX_WAKE` against the same
-    /// atomic. The kernel's CAS-on-entry to FUTEX_WAIT closes the
-    /// publish/sleep race — a publisher that swapped NOTIFIED
-    /// before we entered the syscall causes the syscall to return
-    /// `EAGAIN` immediately without queuing.
-    #[cfg(target_os = "linux")]
-    fn park_on_own_futex(&mut self, duration: Option<Duration>) {
-        self.handle.park_on_own_futex(self.idx, duration);
     }
 
     /// Owner-mode park. Block in `mio::Poll::poll` on this worker's
