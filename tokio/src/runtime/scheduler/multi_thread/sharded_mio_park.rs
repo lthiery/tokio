@@ -450,9 +450,38 @@ impl ShardedMioParker {
         // epoll fd. The Poll always has the `WAKER_TOKEN` eventfd
         // registered, so it is wakeable even when the slab is
         // otherwise empty.
+        //
+        // **Gate on (num_workers > 1) && worker_has_io_registered.**
+        // The meta-watcher's job is to drain peer events when peers are
+        // CPU-stuck and can't park their own children. That requires
+        // (a) at least one peer (otherwise there is nothing to fan-in)
+        // and (b) the calling worker to actually have I/O of its own
+        // (or to be helping another I/O-bearing worker). For pure-sync
+        // workloads (notify/mpsc/rwlock/watch — all the regression
+        // benches) no worker ever registers a `ScheduledIo`, so the
+        // meta-watcher cannot help anyone and the CAS bounce on
+        // `meta_watcher_busy` is pure overhead. The same gate also
+        // collapses the W=1 catastrophic regression where the lone
+        // worker would otherwise always win the CAS and pay an extra
+        // `epoll_wait(meta_epfd)` + non-blocking `poll(own_child, 0)`
+        // per cycle. See INVESTIGATION-sharded-mio-perf.md §Findings
+        // (Targets 1+2) for the full analysis.
+        //
+        // Risk to `busy_owner_3burners` is nil: the burner workers all
+        // hold real I/O registrations (TCP probe sockets), so their
+        // `worker_has_io_registered` latch is true and the gate lets
+        // them through. The only behaviour change is that pure-sync
+        // benches stop bouncing the global meta CAS line, and W=1
+        // runtimes stop double-polling.
         #[cfg(target_os = "linux")]
         let (mode, _meta_guard) = {
-            let guard = self.handle.try_acquire_meta_watcher();
+            let want_meta = self.handle.num_workers() > 1
+                && self.handle.worker_has_io_registered(self.idx);
+            let guard = if want_meta {
+                self.handle.try_acquire_meta_watcher()
+            } else {
+                None
+            };
             if guard.is_some() {
                 (ParkMode::Meta, guard)
             } else if prefer_futex {
