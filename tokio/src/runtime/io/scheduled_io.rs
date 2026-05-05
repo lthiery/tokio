@@ -411,56 +411,6 @@ impl ScheduledIo {
         }
     }
 
-    /// Record cross-worker stake on the sharded-mio backend: when a
-    /// peer worker polls (and thus stores a `Waker` against) a
-    /// `ScheduledIo` whose owning worker is `owner`, OR the polling
-    /// worker's bit into the owner's `interested_workers` bitset. The
-    /// stake is consumed by:
-    ///
-    /// 1. The meta-park steal-drain filter, so an idle peer that has
-    ///    no stake in `owner` skips the drain (avoids the
-    ///    thundering-herd on `busy_owner_idle`).
-    /// 2. The post-drain fan-out, which unparks every stake-holder so
-    ///    the freshly-pushed `io.wake(ready)` task can be picked up
-    ///    promptly.
-    ///
-    /// No-op off the sharded-mio backend, off-runtime (no
-    /// `LOCAL_HANDLE` installed), or when the polling worker is the
-    /// owner (trivial self-stake).
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    #[inline]
-    fn record_sharded_mio_stake(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let owner = self.sharded_mio_worker.load(Relaxed);
-        if owner == u32::MAX {
-            return;
-        }
-        let owner = owner as usize;
-        let Some(caller) =
-            crate::runtime::scheduler::multi_thread::sharded_mio_park::current_worker_index()
-        else {
-            return;
-        };
-        if caller == owner {
-            return;
-        }
-        crate::runtime::io::sharded_mio_driver::with_local_handle(|h| {
-            h.record_owner_interest(owner, caller);
-        });
-    }
-
-    #[cfg(not(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-)))]
-    #[inline(always)]
-    fn record_sharded_mio_stake(&self) {}
-
     /// Polls for readiness events in a given direction.
     ///
     /// These are to support `AsyncRead` and `AsyncWrite` polling methods,
@@ -490,12 +440,6 @@ impl ScheduledIo {
                 Some(waker) => waker.clone_from(cx.waker()),
                 None => *waker = Some(cx.waker().clone()),
             }
-
-            // Stake recording: a `Waker` is now stashed against this
-            // ScheduledIo on behalf of the current (polling) worker.
-            // OR our worker bit into the owner's `interested_workers`
-            // so a future drain knows to fan out wakes to us.
-            self.record_sharded_mio_stake();
 
             // Try again, in case the readiness was changed while we were
             // taking the waiters lock
@@ -674,12 +618,6 @@ impl Future for Readiness<'_> {
                         .list
                         .push_front(unsafe { NonNull::new_unchecked(waiter.get()) });
                     *state = State::Waiting;
-
-                    // Stake recording (sharded-mio): we just stashed
-                    // a `Waker` for the current worker against this
-                    // ScheduledIo's owner. See
-                    // `ScheduledIo::record_sharded_mio_stake`.
-                    scheduled_io.record_sharded_mio_stake();
                 }
                 State::Waiting => {
                     // Currently in the "Waiting" state, implying the caller has
@@ -700,12 +638,6 @@ impl Future for Readiness<'_> {
                     } else {
                         // Update the waker, if necessary.
                         w.waker.as_mut().unwrap().clone_from(cx.waker());
-                        // Stake recording (sharded-mio): re-poll on
-                        // the same ScheduledIo, possibly from a
-                        // *different* worker than the first poll
-                        // (task migration). Re-OR the current worker's
-                        // bit so the owner sees up-to-date stake.
-                        scheduled_io.record_sharded_mio_stake();
                         return Poll::Pending;
                     }
 

@@ -44,7 +44,7 @@ use std::os::fd::RawFd;
 use std::ptr;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::io::interest::Interest;
@@ -362,9 +362,9 @@ impl Drop for MetaWatcherGuard {
 ///
 /// The owning `WorkerSet` stores these as `CachePadded<WorkerState>` so
 /// each slot sits on its own coherence unit; without that, `park_state`
-/// and `interested_workers` from adjacent workers share a cache line
-/// and produce false-sharing traffic on the parallel-fanout dispatch
-/// path.
+/// from adjacent workers shares a cache line with neighbouring slots'
+/// hot atomics and produces false-sharing traffic on the parallel-fanout
+/// dispatch path.
 pub(crate) struct WorkerState {
     /// `EMPTY | PARKED | NOTIFIED`. Written by the owning worker on
     /// park/resume; read/CAS'd by unparkers. `AtomicU32` (not
@@ -396,30 +396,6 @@ pub(crate) struct WorkerState {
     /// touching the slab.
     pub(super) synced: Mutex<registration_set::Synced>,
 
-    /// Bitset of *peer* workers that have polled (a `Waker` register
-    /// site on) a `ScheduledIo` whose owner is this worker. Used to:
-    ///
-    /// 1. Filter the meta-epoll wake fan-out: a peer that wakes from
-    ///    the meta on this worker's child epoll should only run
-    ///    `try_steal_drain` if its own bit is set here. Workers without
-    ///    stake skip the drain entirely (no slab lock, no dispatch),
-    ///    eliminating the thundering-herd on `busy_owner_idle`.
-    /// 2. Optional post-drain fan-out: after a drain
-    ///    (`Reactor::poll_and_dispatch` or
-    ///    `SharedRegistry::try_steal_drain`) completes, the dispatcher
-    ///    `swap(0)`s this bitset and unparks each set worker via its
-    ///    `external_waker` so any stake-holder that hasn't yet observed
-    ///    its `io.wake(ready)`-pushed task can run promptly.
-    ///
-    /// Bit `i` ⇒ worker index `i`. Width is bounded by
-    /// `lazy_debug::MAX_WORKERS = 16`; an `AtomicU64` gives headroom
-    /// for the planned bump to 64 workers.
-    ///
-    /// Initialized to 0 (no stake-holders). Populated by
-    /// [`ShardedMioHandle::record_owner_interest`] from the polling
-    /// worker's TLS-resolved index.
-    pub(crate) interested_workers: AtomicU64,
-
     /// One-shot latch: set to `true` the first time a `ScheduledIo`
     /// successfully registers on this worker's child epoll. Once set,
     /// never reset — it is a permanent "this worker has touched I/O"
@@ -447,7 +423,6 @@ impl WorkerState {
             external_waker: OnceLock::new(),
             registrations,
             synced: Mutex::new(synced),
-            interested_workers: AtomicU64::new(0),
             has_io_registered: AtomicBool::new(false),
         }
     }
@@ -531,12 +506,15 @@ pub(crate) struct ShardedMioHandle {
     /// own `notify_parked_remote` fires later. That extra hop costs
     /// us the cache-locality advantage we get on `busy_owner_3burners`.
     ///
-    /// The current design avoids the regression by having the watcher
-    /// fan out wakes via [`WorkerState::interested_workers`]: after
-    /// dispatching a peer's events, the watcher unparks every
-    /// stake-holder and the owner peer itself, so they re-enter the
-    /// scheduler loop and pick up their share of the freshly-woken
-    /// tasks directly.
+    /// The current design avoids the regression by relying on the
+    /// in-band `io.wake(ready)` push performed by `try_steal_drain`:
+    /// after dispatching a peer's events the freshly-woken tasks are
+    /// already on the owner's run queue, so the owner peer itself
+    /// re-enters the scheduler loop and picks them up directly. (The
+    /// previous design also OR'd a per-worker stake bitset into the
+    /// owner's `WorkerState` for a post-drain fan-out unpark, but that
+    /// substrate was never wired to a consumer and produced
+    /// false-sharing on the owner's hot park line — removed.)
     ///
     /// [`epoll_ctl(2)`]: https://man7.org/linux/man-pages/man2/epoll_ctl.2.html
     #[cfg(target_os = "linux")]
@@ -804,49 +782,6 @@ impl ShardedMioHandle {
         }
         if slot.external_waker.set(external_waker).is_err() {
             debug_assert!(false, "worker {worker_idx} published external_waker twice");
-        }
-    }
-
-    /// Record that the calling worker has stake in `owner_idx`'s slab —
-    /// i.e. it has just registered a `Waker` on a `ScheduledIo` whose
-    /// owning worker is `owner_idx`. ORs `(1 << caller_idx)` into the
-    /// owner's [`WorkerState::interested_workers`] bitset.
-    ///
-    /// No-op if `caller_idx == owner_idx` (owner trivially has stake in
-    /// its own slab; the bitset's purpose is cross-worker stake), if
-    /// `owner_idx` is out of range, or if `caller_idx` exceeds the
-    /// 64-bit width.
-    ///
-    /// Cheap: one atomic `fetch_or` with `Relaxed` ordering. The flag
-    /// is consumed by the meta-park stake filter and the post-drain
-    /// fan-out, both of which run on every kernel wake — so contention
-    /// here is dwarfed by the wake itself.
-    #[inline]
-    pub(crate) fn record_owner_interest(&self, owner_idx: usize, caller_idx: usize) {
-        if caller_idx == owner_idx || caller_idx >= 64 {
-            return;
-        }
-        if let Some(slot) = self.workers.get(owner_idx) {
-            let bit = 1u64 << caller_idx;
-            slot.interested_workers.fetch_or(bit, Ordering::Relaxed);
-        }
-    }
-
-    /// Snapshot-and-clear the `interested_workers` bitset for
-    /// `owner_idx`. Returns the previous bitset; callers iterate over
-    /// the set bits and unpark each peer to fan out wakeups to every
-    /// stake-holder of a freshly-drained slab.
-    ///
-    /// Used by `Reactor::poll_and_dispatch` (owner-side dispatch) and
-    /// `SharedRegistry::try_steal_drain` (peer-side drain) immediately
-    /// after the dispatch loop finishes processing events. The
-    /// `swap(0)` resets stake so the next round of `poll_readiness`
-    /// calls re-asserts interest for the workers that actually re-poll.
-    #[inline]
-    pub(crate) fn take_interested_workers(&self, owner_idx: usize) -> u64 {
-        match self.workers.get(owner_idx) {
-            Some(slot) => slot.interested_workers.swap(0, Ordering::Relaxed),
-            None => 0,
         }
     }
 
@@ -1482,29 +1417,28 @@ pub(crate) fn local_reactor_installed() -> bool {
 
 // ===== LOCAL_HANDLE thread-local =====
 //
-// Used by the "interested workers" stake-tracking spike. Every
-// `ScheduledIo` waker register site (`poll_readiness`, `Readiness::poll`)
-// runs on the polling worker's thread; to OR the polling worker's bit
-// into the *owner's* `interested_workers` slot we need:
+// Per-thread `*const ShardedMioHandle` slot, installed by the parker
+// alongside `LOCAL_REACTOR` and cleared on shutdown / Drop. The handle
+// lets any thread holding a registration on a sharded-mio
+// `ScheduledIo` reach back into the runtime's worker set without
+// threading the `Arc` through the I/O API surface.
 //
-// 1. The polling worker's index — provided by
-//    [`current_worker_index`][cwi] in the parker module.
-// 2. The owner's `WorkerState` — reachable from the [`ShardedMioHandle`]
-//    via `workers[owner_idx]`, where `owner_idx` is stored on the
-//    `ScheduledIo` (`sharded_mio_worker`).
-//
-// The handle pointer is installed alongside `LOCAL_REACTOR` in
-// [`ShardedMioParker::ensure_reactor_installed`] and cleared in
-// `shutdown` / `Drop`. Off-runtime threads observe a null handle and the
-// register hook becomes a no-op (no stake recording).
+// Originally consumed by the "interested workers" stake-tracking spike
+// (peer wake fan-out via `interested_workers: AtomicU64` on each
+// `WorkerState`); the bitset substrate has been removed (see
+// INVESTIGATION-sharded-mio-perf.md, "Patch applied + WorkerState
+// audit") because it produced false-sharing on the owner's hot park
+// line and was never wired to a consumer. The TLS slot itself is kept
+// because `install_local_handle_raw` / `clear_local_handle` callers
+// remain in the parker's lifecycle; if a future meta-watcher fan-out
+// implementation needs cross-worker handle access, it can read this
+// slot via [`with_local_handle`].
 //
 // The slot stores a raw `*const ShardedMioHandle`, not an `Arc`, to keep
 // the install/clear path zero-allocation. Lifetime is bounded by the
 // parker that installs it: the parker holds an `Arc<ShardedMioHandle>`
 // for as long as it is live, and clears the TLS slot before dropping
 // that `Arc`.
-//
-// [cwi]: super::super::scheduler::multi_thread::sharded_mio_park::current_worker_index
 
 thread_local! {
     static LOCAL_HANDLE: Cell<*const ShardedMioHandle> =
