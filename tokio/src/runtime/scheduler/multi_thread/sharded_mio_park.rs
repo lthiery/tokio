@@ -374,9 +374,9 @@ impl ShardedMioParker {
         // Block on the meta-epoll. Each returned event carries the
         // worker_idx in ev.u64 (stamped at register_worker time).
         // The buffer is sized to one slot per maximum supported
-        // worker — `TOKEN_WORKER_BITS = 4` caps workers at 16 across
+        // worker — `TOKEN_WORKER_BITS = 6` caps workers at 64 across
         // the rest of sharded-mio (see `pack_token`).
-        const MAX_META_EVENTS: usize = 16;
+        const MAX_META_EVENTS: usize = 64;
         let mut meta_events: [libc::epoll_event; MAX_META_EVENTS] =
             unsafe { std::mem::zeroed() };
         let n = unsafe {

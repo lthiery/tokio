@@ -223,9 +223,10 @@ counters! {
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();
 
 /// Maximum worker index supported by the per-worker counter arrays.
-/// Bench scenarios use 4 workers; 16 covers reasonable headroom while
-/// keeping the static foot-print trivial.
-pub(crate) const MAX_WORKERS: usize = 16;
+/// Matches `sharded_mio_reactor::TOKEN_WORKER_BITS = 6` (cap 64).
+/// Bumping past 64 requires widening that token field too — see the
+/// audit trail in `INVESTIGATION-sharded-mio-perf.md`.
+pub(crate) const MAX_WORKERS: usize = 64;
 
 /// Per-worker counter arrays. Indexed by worker idx as published by
 /// `ShardedMioParker` / `current_worker_index()`. Out-of-range indices
@@ -259,7 +260,8 @@ impl PerWorkerCounters {
 pub(crate) static PER_WORKER: PerWorkerCounters = PerWorkerCounters::new();
 
 /// Bump a per-worker counter slot. Out-of-range indices are no-ops
-/// (defensive — should not happen with `MAX_WORKERS=16` bench setups).
+/// (defensive — should not happen since
+/// `sharded_mio_reactor::pack_token` panics on idx > 63).
 #[inline]
 pub(crate) fn bump_per_worker(arr: &[AtomicU64; MAX_WORKERS], idx: usize) {
     if !enabled() {
@@ -348,11 +350,23 @@ static PREV_SNAPSHOT: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// first dump.
 static PREV_PER_WORKER: Mutex<Option<PerWorkerSnapshot>> = Mutex::new(None);
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct PerWorkerSnapshot {
     dispatch_woken: [u64; MAX_WORKERS],
     begin_park_calls: [u64; MAX_WORKERS],
     register_per_worker: [u64; MAX_WORKERS],
+}
+
+impl Default for PerWorkerSnapshot {
+    // Manual impl: `std`'s `Default` for `[T; N]` is only provided for
+    // `N <= 32`; with `MAX_WORKERS = 64` the derive no longer applies.
+    fn default() -> Self {
+        Self {
+            dispatch_woken: [0u64; MAX_WORKERS],
+            begin_park_calls: [0u64; MAX_WORKERS],
+            register_per_worker: [0u64; MAX_WORKERS],
+        }
+    }
 }
 
 impl PerWorkerSnapshot {
