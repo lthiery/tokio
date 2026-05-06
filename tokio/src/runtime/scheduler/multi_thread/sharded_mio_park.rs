@@ -36,63 +36,13 @@ use crate::loom::sync::Arc;
 use crate::runtime::driver;
 use crate::runtime::io::sharded_mio_driver::{
     clear_local_handle, clear_local_reactor, install_local_handle_raw,
-    install_local_reactor_raw, ParkMode, ShardedMioHandle, NOTIFIED,
+    install_local_reactor_raw, ParkMode, ShardedMioHandle,
 };
 use crate::runtime::io::sharded_mio_reactor::Reactor;
 use crate::runtime::scheduler::multi_thread::park::HadDriver;
 
 use std::cell::{Cell, RefCell};
-use std::sync::OnceLock;
 use std::time::Duration;
-
-/// Default pre-park spin budget. **Zero (opt-in).**
-///
-/// The pre-park spin window is a workload-dependent optimisation:
-/// it pays for itself on high-fanout cross-worker wake patterns
-/// (e.g. `tokio::sync::watch::Sender::send` to many subscribers,
-/// `broadcast::Sender` contention), and costs CPU/wall-time on
-/// patterns where most workers never see a cross-worker wake (e.g.
-/// `Notify::notify_one` from one external thread, single-tenant RPC
-/// streams).
-///
-/// Because the right value depends on the workload, the substrate
-/// ships with spin disabled and exposes it as an explicit knob. With
-/// `spin_budget == 0` the parker uses a direct
-/// `EMPTY → PARKED_<mode>` CAS (the original pre-SEARCHING path)
-/// and the substrate cost is identical to the prior 4-state machine.
-///
-/// Opt in via [`Builder::enable_park_spin_budget`][bps] (per-runtime,
-/// preferred) or the `TOKIO_PARK_SPIN_BUDGET=<u32>` env var
-/// (process-wide). The Builder method takes precedence over the env
-/// var. A budget around `256` iterations recovers ~10% on
-/// `sync_watch/contention_resubscribe/100` against traditional mio;
-/// see `bench-sweep-results/SUMMARY.txt` for a full sweep.
-///
-/// [bps]: crate::runtime::Builder::enable_park_spin_budget
-const DEFAULT_SPIN_BUDGET: u32 = 0;
-
-/// Read `TOKIO_PARK_SPIN_BUDGET` once per process. Each
-/// `ShardedMioParker` snapshots the resolved budget into a local
-/// field at construction so the spin loop has no atomic load per
-/// park.
-///
-/// Resolution order (most-specific wins): `override_iters`
-/// (`Builder::enable_park_spin_budget`) → `TOKIO_PARK_SPIN_BUDGET`
-/// env var → [`DEFAULT_SPIN_BUDGET`].
-fn resolve_spin_budget(override_iters: Option<u32>) -> u32 {
-    if let Some(n) = override_iters {
-        return n;
-    }
-    static ENV_BUDGET: OnceLock<Option<u32>> = OnceLock::new();
-    if let Some(n) = *ENV_BUDGET.get_or_init(|| {
-        std::env::var("TOKIO_PARK_SPIN_BUDGET")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-    }) {
-        return n;
-    }
-    DEFAULT_SPIN_BUDGET
-}
 
 thread_local! {
     /// Current worker's index for the running thread, or `None` if not
@@ -137,13 +87,6 @@ pub(crate) struct ShardedMioParker {
     handle: Arc<ShardedMioHandle>,
     reactor: Option<Box<RefCell<Reactor>>>,
     tls_installed: bool,
-    /// Snapshotted at construction from `TOKIO_PARK_SPIN_BUDGET`. The
-    /// pre-park spin loop runs for at most this many `spin_loop()`
-    /// iterations before committing to a kernel park. Each iteration
-    /// reads `park_state`; if it observes `NOTIFIED` (a cross-worker
-    /// `unpark` swapped against `prev = SEARCHING`) the parker yanks
-    /// out without entering the kernel.
-    spin_budget: u32,
 }
 
 /// Unparker counterpart. Cheap to clone — just an `Arc` + worker idx.
@@ -154,15 +97,9 @@ pub(crate) struct ShardedMioUnparker {
 }
 
 impl ShardedMioParker {
-    /// `spin_budget_override` is the per-runtime override sourced from
-    /// [`Builder::enable_park_spin_budget`][bps]; pass `None` to fall
-    /// back to env var / compiled-in default.
-    ///
-    /// [bps]: crate::runtime::Builder::enable_park_spin_budget
     pub(crate) fn new(
         idx: usize,
         handle: Arc<ShardedMioHandle>,
-        spin_budget_override: Option<u32>,
     ) -> Self {
         // Eager reactor construction. Unlike the uring path (which is
         // pinned to the worker thread by `IORING_SETUP_SINGLE_ISSUER`),
@@ -186,7 +123,6 @@ impl ShardedMioParker {
             handle,
             reactor: Some(Box::new(RefCell::new(reactor))),
             tls_installed: false,
-            spin_budget: resolve_spin_budget(spin_budget_override),
         }
     }
 
@@ -286,54 +222,9 @@ impl ShardedMioParker {
         self.ensure_reactor_installed();
 
         // Cheap fast-path: if a notification is already pending we
-        // can skip the spin gate and mode selection entirely.
+        // can skip mode selection entirely.
         if self.handle.try_consume_notified(self.idx) {
             return;
-        }
-
-        // Two substrate paths:
-        //
-        // - `spin > 0`: full SEARCHING dance. The epoll path's
-        //   `epoll_wait` has no userspace-value race-closer; an
-        //   unparker that races our park needs the SEARCHING signal
-        //   to suppress an eventfd write that would otherwise cost
-        //   ~9% on hot cross-worker fanout (see
-        //   `sync_broadcast/contention/10`).
-        //
-        // - `spin == 0`: skip the spin entirely and use direct
-        //   `EMPTY → PARKED_<mode>` CAS via `begin_park_direct`. Same
-        //   shape as before the spin window was added.
-        let spin = self.spin_budget;
-
-        if spin > 0 {
-            // `Err` here means we lost a race against an unpark from
-            // EMPTY (state was already NOTIFIED on entry); the call
-            // has already cleared state back to EMPTY for us.
-            if self.handle.begin_searching(self.idx).is_err() {
-                return;
-            }
-
-            // Spin window. Each iteration reads `park_state`; if a
-            // cross-worker `unpark` ran during the spin (swapping
-            // `prev = SEARCHING` to `NOTIFIED`) we observe it here and
-            // bail without ever entering the kernel. The number of
-            // iterations is sized by `TOKIO_PARK_SPIN_BUDGET`,
-            // snapshotted into `self.spin_budget` at construction so
-            // the inner loop does not pay an atomic load per park to
-            // re-read it.
-            //
-            // `core::hint::spin_loop()` lowers to the architecture's
-            // spin-pause hint (`PAUSE` on x86) so the SMT sibling and
-            // the pipeline backend stay free for whatever cross-core
-            // wake activity is in flight. The cost per iteration on
-            // recent x86 is dominated by `PAUSE` itself (~100 cycles).
-            for _ in 0..spin {
-                if self.handle.park_state_load(self.idx) == NOTIFIED {
-                    self.handle.abort_searching(self.idx);
-                    return;
-                }
-                core::hint::spin_loop();
-            }
         }
 
         // Mode selection — only runs on entries that are committing
@@ -401,21 +292,13 @@ impl ShardedMioParker {
         #[cfg(not(target_os = "linux"))]
         let mode = ParkMode::OwnChild;
 
-        // Commit to a kernel park. `Err` means we were yanked (state
-        // observed NOTIFIED); the call has already cleared state back
-        // to EMPTY for us. On linux, dropping `_meta_guard` releases
-        // the meta-watcher slot so the next idle worker can take it.
-        //
-        // We use `commit_park` iff we entered the SEARCHING dance,
-        // otherwise the direct `EMPTY → PARKED_<mode>` CAS via
-        // `begin_park_direct`.
-        let used_searching = spin > 0;
-        let commit = if used_searching {
-            self.handle.commit_park(self.idx, mode)
-        } else {
-            self.handle.begin_park_direct(self.idx, mode)
-        };
-        if commit.is_err() {
+        // Commit to a kernel park via the direct
+        // `EMPTY → PARKED_<mode>` CAS. `Err` means we were yanked
+        // (state observed NOTIFIED); the call has already cleared
+        // state back to EMPTY for us. On linux, dropping
+        // `_meta_guard` releases the meta-watcher slot so the next
+        // idle worker can take it.
+        if self.handle.begin_park_direct(self.idx, mode).is_err() {
             return;
         }
 

@@ -62,26 +62,17 @@ use crate::util::cacheline::CachePadded;
 /// `Thread::unpark` for every cross-worker unpark.
 ///
 /// The parker publishes which branch it took into `park_state` *before*
-/// entering the blocking syscall (via [`ShardedMioHandle::commit_park`]
-/// taking a [`ParkMode`]); the unpark path single-matches on `prev` and
-/// only issues the wake mechanism that is load-bearing for the branch
-/// the parker is in. The intermediate `SEARCHING` state covers the
-/// pre-syscall spin window — an unpark in that window suppresses the
-/// kernel wake entirely, and the parker's spin or its
-/// `SEARCHING → PARKED_<mode>` CAS observes the resulting `NOTIFIED`
-/// and bails. See the unpark module docs for the full race argument.
+/// entering the blocking syscall (via
+/// [`ShardedMioHandle::begin_park_direct`] taking a [`ParkMode`]); the
+/// unpark path single-matches on `prev` and only issues the wake
+/// mechanism that is load-bearing for the branch the parker is in.
+/// See the unpark module docs for the full race argument.
 // `park_state` is an `AtomicU32`. The state values trivially fit
-// in `u32` (max value is `SEARCHING = 4`).
+// in `u32` (max value is `NOTIFIED = 3`).
 pub(crate) const EMPTY: u32 = 0;
 pub(crate) const PARKED_OWN: u32 = 1;
 pub(crate) const PARKED_META: u32 = 2;
 pub(crate) const NOTIFIED: u32 = 3;
-/// Pre-park spin window. The parker has committed to *try* to park
-/// but has not yet entered the kernel; a concurrent `unpark` swap
-/// observes `prev == SEARCHING` and skips the kernel wake (the
-/// parker will see the resulting `NOTIFIED` from inside its spin
-/// loop or via its `commit_park` CAS).
-pub(crate) const SEARCHING: u32 = 4;
 /// Park branch the worker is about to block in. Passed to
 /// [`ShardedMioHandle::begin_park`] so the published `park_state`
 /// records which wake mechanism the unpark path should use. The
@@ -691,18 +682,14 @@ impl ShardedMioHandle {
     /// fanning out an `external_waker` eventfd write *and* a
     /// `Thread::unpark` for every notification.
     ///
-    /// Race argument: the parker transitions through three CAS-published
-    /// states before entering the kernel —
-    /// [`begin_searching`] (`EMPTY → SEARCHING`), then
-    /// [`commit_park`] (`SEARCHING → PARKED_<mode>`), then the
-    /// blocking syscall. All CASes use `AcqRel` ordering. An
+    /// Race argument: the parker transitions through one CAS-published
+    /// state before entering the kernel —
+    /// [`begin_park_direct`] (`EMPTY → PARKED_<mode>`), then the
+    /// blocking syscall. The CAS uses `AcqRel` ordering. An
     /// unparker's `swap(NOTIFIED, Release)` against `prev`:
     ///
     /// - `prev = PARKED_<X>` → parker is in syscall `X`; deliver one
     ///   kernel wake on `X`'s mechanism.
-    /// - `prev = SEARCHING` → parker is in the pre-park spin window;
-    ///   no kernel wake (the spin loop or the `commit_park` CAS will
-    ///   observe NOTIFIED and bail).
     /// - `prev = EMPTY` → parker is mid-task; no kernel wake (the
     ///   next `try_consume_notified` will short-circuit).
     /// - `prev = NOTIFIED` → already pending; idempotent.
@@ -740,15 +727,6 @@ impl ShardedMioHandle {
                 // `META_WAKER_TOKEN`.
                 self.meta_waker.wake();
                 true
-            }
-            SEARCHING => {
-                bump(&COUNTERS.unpark_was_searching);
-                // Parker is in the pre-park spin window. The swap
-                // above already published NOTIFIED; the spin will
-                // observe it (or its `commit_park` CAS will fail
-                // with NOTIFIED) and return without ever entering
-                // a syscall. No kernel wake needed.
-                false
             }
             EMPTY => {
                 bump(&COUNTERS.unpark_was_empty);
@@ -803,56 +781,20 @@ impl ShardedMioHandle {
         }
     }
 
-    /// Enter the pre-park spin window: CAS `EMPTY → SEARCHING`. After
-    /// this call returns `Ok`, the worker is bookkept as "about to
-    /// park" — a concurrent [`Self::unpark`] swap observes
-    /// `prev == SEARCHING` and skips the kernel wake; the parker is
-    /// expected to either notice the resulting `NOTIFIED` from inside
-    /// its spin loop or fail its [`Self::commit_park`] CAS.
-    ///
-    /// Returns `Err(())` if a notification was already pending on
-    /// entry (race against an unpark from `EMPTY`); the call clears
-    /// `park_state` back to `EMPTY` and the caller should return
-    /// without parking.
-    ///
-    /// Replaces the old `begin_park(EMPTY → PARKED_<mode>)` CAS,
-    /// splitting the transition into two steps so the unpark path can
-    /// observe a parker that has committed to wake handling but not
-    /// yet to a syscall.
-    pub(crate) fn begin_searching(&self, worker_idx: usize) -> Result<(), ()> {
-        use super::lazy_debug::{bump, bump_per_worker, COUNTERS, PER_WORKER};
-        bump(&COUNTERS.begin_park_calls);
-        bump_per_worker(&PER_WORKER.begin_park_calls, worker_idx);
-        let slot = &self.workers[worker_idx];
-        match slot.park_state.compare_exchange(
-            EMPTY,
-            SEARCHING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(()),
-            Err(NOTIFIED) => {
-                bump(&COUNTERS.begin_park_fastpath);
-                slot.park_state.store(EMPTY, Ordering::Release);
-                Err(())
-            }
-            Err(state) => panic!("inconsistent park_state on begin_searching: {state}"),
-        }
-    }
-
-    /// Direct one-step park CAS: `EMPTY → PARKED_<mode>`. Used by the
-    /// no-spin substrate path (`spin_budget == 0`) so workloads that
-    /// opt out of pre-park spin do not pay the two-CAS
-    /// (`EMPTY → SEARCHING → PARKED_*`) transition cost.
+    /// Direct one-step park CAS: `EMPTY → PARKED_<mode>`. The
+    /// substrate's only park-CAS path: `try_consume_notified` already
+    /// cleared the fast-path `NOTIFIED` case, so by the time we get
+    /// here we expect either `EMPTY` (we win the CAS, parker commits
+    /// to a syscall) or a fresh `NOTIFIED` from a racing `unpark`
+    /// (we yank back).
     ///
     /// Returns `Err(())` if a notification was already pending on
     /// entry (`park_state == NOTIFIED`); the call clears state back
     /// to `EMPTY` and the caller should return without parking.
     ///
-    /// Cross-worker `unpark` correctness is unaffected: the unpark
-    /// path's `swap(NOTIFIED)` produces `prev == PARKED_<mode>` (kernel
-    /// wake) or `prev == EMPTY` (no-op) the same way it did before
-    /// SEARCHING was introduced.
+    /// Cross-worker `unpark` correctness: the unpark path's
+    /// `swap(NOTIFIED)` produces `prev == PARKED_<mode>` (kernel wake)
+    /// or `prev == EMPTY` (no-op).
     pub(crate) fn begin_park_direct(
         &self,
         worker_idx: usize,
@@ -884,37 +826,6 @@ impl ShardedMioHandle {
         }
     }
 
-    /// Commit to a kernel park: CAS `SEARCHING → PARKED_<mode>`. The
-    /// caller must already hold the SEARCHING token via a successful
-    /// [`Self::begin_searching`].
-    ///
-    /// Returns `Err(())` if the parker was yanked during the spin
-    /// window (state observed `NOTIFIED`); the call clears
-    /// `park_state` back to `EMPTY` and the caller should return
-    /// without entering the kernel.
-    pub(crate) fn commit_park(&self, worker_idx: usize, mode: ParkMode) -> Result<(), ()> {
-        use super::lazy_debug::{bump, COUNTERS};
-        let slot = &self.workers[worker_idx];
-        let parked_state = mode.as_state();
-        match slot.park_state.compare_exchange(
-            SEARCHING,
-            parked_state,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                bump(&COUNTERS.begin_park_parked);
-                Ok(())
-            }
-            Err(NOTIFIED) => {
-                bump(&COUNTERS.commit_park_yanked);
-                slot.park_state.store(EMPTY, Ordering::Release);
-                Err(())
-            }
-            Err(state) => panic!("inconsistent park_state on commit_park: {state}"),
-        }
-    }
-
     /// Has this worker ever held a successful I/O registration?
     ///
     /// Permanent latch (`AtomicBool`, set-once). `false` means the
@@ -934,33 +845,6 @@ impl ShardedMioHandle {
         self.workers[worker_idx]
             .has_io_registered
             .load(Ordering::Acquire)
-    }
-
-    /// Snapshot the current `park_state` for the spin loop. Relaxed
-    /// because the only consumer is the owning worker on its own
-    /// slot — the cross-worker writer (`unpark`'s `swap`) provides
-    /// release ordering, paired with this load's acquire ordering on
-    /// observed transitions to `NOTIFIED` (handled in the caller's
-    /// CAS sequence). For pure spin checks, relaxed is sufficient
-    /// because the next CAS will re-validate.
-    #[inline]
-    pub(crate) fn park_state_load(&self, worker_idx: usize) -> u32 {
-        self.workers[worker_idx]
-            .park_state
-            .load(Ordering::Relaxed)
-    }
-
-    /// Abort the current spin window without entering the kernel:
-    /// store `EMPTY`. Used when the parker observes a `NOTIFIED` from
-    /// inside the spin loop (or any other reason to bail before
-    /// committing to a kernel park). Idempotent w.r.t. a subsequent
-    /// `unpark` because the unpark swap will simply re-arm
-    /// `NOTIFIED` for the next park entry.
-    #[inline]
-    pub(crate) fn abort_searching(&self, worker_idx: usize) {
-        self.workers[worker_idx]
-            .park_state
-            .store(EMPTY, Ordering::Release);
     }
 
     /// Called by the worker on park completion. Clears any notification

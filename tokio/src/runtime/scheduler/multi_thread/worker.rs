@@ -351,7 +351,6 @@ pub(super) fn create(
                     crate::runtime::scheduler::multi_thread::sharded_mio_park::ShardedMioParker::new(
                         worker_idx,
                         handle,
-                        config.park_spin_budget,
                     ),
                 )
             }

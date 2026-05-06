@@ -59,22 +59,4 @@ pub(crate) struct Config {
     /// `tokio_unstable`).
     pub(crate) enable_eager_driver_handoff: bool,
 
-    /// Override for the sharded-mio parker's pre-park spin budget. `None`
-    /// means "use `TOKIO_PARK_SPIN_BUDGET` env var if set, otherwise the
-    /// compiled-in default". When `Some(n)`, the parker spins for up to
-    /// `n` `core::hint::spin_loop()` iterations before committing to a
-    /// kernel park, allowing cross-worker `unpark` swaps to be absorbed
-    /// in userspace.
-    ///
-    /// Only consulted by the sharded-mio backend; ignored by the
-    /// traditional and uring backends. Set via
-    /// [`Builder::enable_park_spin_budget`][bps].
-    ///
-    /// [bps]: crate::runtime::Builder::enable_park_spin_budget
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    pub(crate) park_spin_budget: Option<u32>,
 }
