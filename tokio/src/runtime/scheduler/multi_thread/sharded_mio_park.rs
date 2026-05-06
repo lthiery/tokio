@@ -374,9 +374,9 @@ impl ShardedMioParker {
         // Block on the meta-epoll. Each returned event carries the
         // worker_idx in ev.u64 (stamped at register_worker time).
         // The buffer is sized to one slot per maximum supported
-        // worker — `TOKEN_WORKER_BITS = 6` caps workers at 64 across
+        // worker — `TOKEN_WORKER_BITS = 7` caps workers at 128 across
         // the rest of sharded-mio (see `pack_token`).
-        const MAX_META_EVENTS: usize = 64;
+        const MAX_META_EVENTS: usize = 128;
         let mut meta_events: [libc::epoll_event; MAX_META_EVENTS] =
             unsafe { std::mem::zeroed() };
         let n = unsafe {
@@ -409,7 +409,7 @@ impl ShardedMioParker {
         let num_workers = self.handle.workers().len();
         let meta_waker_token = ShardedMioHandle::meta_waker_token();
         let mut self_fired = false;
-        let mut peer_mask: u64 = 0;
+        let mut peer_mask: u128 = 0;
         for ev in &meta_events[..n as usize] {
             if ev.u64 == meta_waker_token {
                 self.handle.drain_meta_waker();
@@ -419,7 +419,7 @@ impl ShardedMioParker {
             if widx == self.idx {
                 self_fired = true;
             } else if widx < num_workers {
-                peer_mask |= 1u64 << widx;
+                peer_mask |= 1u128 << widx;
             }
         }
 
@@ -457,7 +457,7 @@ impl ShardedMioParker {
     /// loses the CAS defers. This closes the TOCTOU window that a
     /// plain flag could not.
     #[cfg(target_os = "linux")]
-    fn steal_from_peers_masked(&self, mut mask: u64) {
+    fn steal_from_peers_masked(&self, mut mask: u128) {
         let workers = self.handle.workers();
         while mask != 0 {
             let peer_idx = mask.trailing_zeros() as usize;

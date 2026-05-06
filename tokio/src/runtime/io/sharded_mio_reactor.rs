@@ -49,14 +49,15 @@ use std::time::Duration;
 pub(crate) const WAKER_TOKEN: Token = Token(usize::MAX);
 
 /// Width in bits of the `worker_idx` field inside the packed token.
-/// Sized to cover `lazy_debug::MAX_WORKERS = 64` (idx 0..=63), which
-/// matches the width of `peer_mask: u64` in
+/// Sized to cover `lazy_debug::MAX_WORKERS = 128` (idx 0..=127), which
+/// matches the width of `peer_mask: u128` in
 /// [`sharded_mio_park::ShardedMioParker::park_on_meta`]. Bumping past
-/// 64 requires widening `peer_mask` to `u128` or `[u64; 2]`. See
-/// `pack_token` / `unpack_token` for the layout.
-pub(crate) const TOKEN_WORKER_BITS: u32 = 6;
+/// 128 requires widening `peer_mask` to `[u64; 4]` (or similar) and
+/// growing the worker_idx field again. See `pack_token` /
+/// `unpack_token` for the layout.
+pub(crate) const TOKEN_WORKER_BITS: u32 = 7;
 const TOKEN_WORKER_MASK: u32 = (1 << TOKEN_WORKER_BITS) - 1;
-/// Width of the slab-key field. 26 bits gives ~67 M entries per
+/// Width of the slab-key field. 25 bits gives ~33 M entries per
 /// worker — well above any realistic working set, and we already
 /// rejected wider keys at the `u32::try_from` site below.
 pub(crate) const TOKEN_KEY_BITS: u32 = 32 - TOKEN_WORKER_BITS;
@@ -65,11 +66,11 @@ const TOKEN_KEY_MASK: u32 = (1 << TOKEN_KEY_BITS) - 1;
 /// Mio `Token` is a `usize`. On 64-bit Linux we pack:
 ///
 /// ```text
-/// bit  63                32 31              6 5      0
+/// bit  63                32 31              7 6      0
 ///     +-------------------+-------------------+--------+
 ///     |        gen        |        key        |  wrkr  |
 ///     +-------------------+-------------------+--------+
-///        32 bits             26 bits           6 bits
+///        32 bits             25 bits           7 bits
 /// ```
 ///
 /// `wrkr` is the registering worker's index. In the current
@@ -79,11 +80,11 @@ const TOKEN_KEY_MASK: u32 = (1 << TOKEN_KEY_BITS) - 1;
 /// path will use it to route an event observed via a *peer's* drain
 /// pass back to the right slab.
 ///
-/// `WAKER_TOKEN` (`usize::MAX`) decodes to (`wrkr=0x3F`, `key=0x3FFFFFF`,
-/// `gen=0xFFFFFFFF`); a real registration would need worker idx 63
+/// `WAKER_TOKEN` (`usize::MAX`) decodes to (`wrkr=0x7F`, `key=0x1FFFFFF`,
+/// `gen=0xFFFFFFFF`); a real registration would need worker idx 127
 /// **and** the maximum `gen` **and** the maximum `key` simultaneously
 /// to collide. Slab keys are bounded by the runtime's working set
-/// (orders of magnitude below `0x3FFFFFF`) so this remains safe in
+/// (orders of magnitude below `0x1FFFFFF`) so this remains safe in
 /// practice — same argument as before the worker_idx field was added.
 ///
 /// The bounds checks below are hard `assert!`s rather than

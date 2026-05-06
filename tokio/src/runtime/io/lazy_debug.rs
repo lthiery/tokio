@@ -223,10 +223,10 @@ counters! {
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();
 
 /// Maximum worker index supported by the per-worker counter arrays.
-/// Matches `sharded_mio_reactor::TOKEN_WORKER_BITS = 6` (cap 64).
-/// Bumping past 64 requires widening that token field too — see the
+/// Matches `sharded_mio_reactor::TOKEN_WORKER_BITS = 7` (cap 128).
+/// Bumping past 128 requires widening that token field too — see the
 /// audit trail in `INVESTIGATION-sharded-mio-perf.md`.
-pub(crate) const MAX_WORKERS: usize = 64;
+pub(crate) const MAX_WORKERS: usize = 128;
 
 /// Per-worker counter arrays. Indexed by worker idx as published by
 /// `ShardedMioParker` / `current_worker_index()`. Out-of-range indices
@@ -261,7 +261,7 @@ pub(crate) static PER_WORKER: PerWorkerCounters = PerWorkerCounters::new();
 
 /// Bump a per-worker counter slot. Out-of-range indices are no-ops
 /// (defensive — should not happen since
-/// `sharded_mio_reactor::pack_token` panics on idx > 63).
+/// `sharded_mio_reactor::pack_token` panics on idx > 127).
 #[inline]
 pub(crate) fn bump_per_worker(arr: &[AtomicU64; MAX_WORKERS], idx: usize) {
     if !enabled() {
@@ -359,7 +359,7 @@ struct PerWorkerSnapshot {
 
 impl Default for PerWorkerSnapshot {
     // Manual impl: `std`'s `Default` for `[T; N]` is only provided for
-    // `N <= 32`; with `MAX_WORKERS = 64` the derive no longer applies.
+    // `N <= 32`; with `MAX_WORKERS = 128` the derive no longer applies.
     fn default() -> Self {
         Self {
             dispatch_woken: [0u64; MAX_WORKERS],

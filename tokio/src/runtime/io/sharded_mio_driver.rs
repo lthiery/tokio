@@ -111,7 +111,7 @@ impl ParkMode {
 /// `epoll_event.u64` token used to identify the meta-waker eventfd
 /// when it fires on the meta epoll. Children carry their `worker_idx`
 /// as their u64; this sentinel is well outside any plausible worker
-/// index (`MAX_WORKERS` is 64 on this branch, capped by
+/// index (`MAX_WORKERS` is 128 on this branch, capped by
 /// `TOKEN_WORKER_BITS`).
 #[cfg(target_os = "linux")]
 const META_WAKER_TOKEN: u64 = u64::MAX;
