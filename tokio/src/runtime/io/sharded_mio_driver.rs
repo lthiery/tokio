@@ -44,6 +44,8 @@ use std::os::fd::RawFd;
 use std::ptr;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -89,12 +91,13 @@ pub(crate) enum ParkMode {
     /// the `external_waker` eventfd registered, so `mio::Poll::poll`
     /// is wakeable by the unpark path.
     OwnChild,
-    /// `park_on_meta` — worker blocks in `epoll_wait` on the
-    /// runtime-wide meta epoll. Wake by writing the meta-waker
-    /// eventfd (registered on the meta epoll with
-    /// `META_WAKER_TOKEN`).
+    /// `park_on_meta` — worker blocks in `epoll_wait` on its
+    /// chiplet group's meta epoll. Wake by writing that group's
+    /// `meta_waker` eventfd (registered on the group's meta epoll
+    /// with `META_WAKER_TOKEN`). The carried `u8` is the group
+    /// index, threaded through to `park_on_meta` and `unpark`.
     #[cfg(target_os = "linux")]
-    Meta,
+    Meta(u8),
 }
 
 impl ParkMode {
@@ -103,7 +106,7 @@ impl ParkMode {
         match self {
             ParkMode::OwnChild => PARKED_OWN,
             #[cfg(target_os = "linux")]
-            ParkMode::Meta => PARKED_META,
+            ParkMode::Meta(_) => PARKED_META,
         }
     }
 }
@@ -200,23 +203,285 @@ impl Drop for MetaWaker {
     }
 }
 
-/// RAII handle for the meta-watcher slot. Constructed by
-/// [`ShardedMioHandle::try_acquire_meta_watcher`]; releases the slot
-/// on drop so the next idle worker can take over.
+/// One chiplet-local meta-watcher group. The runtime-wide
+/// `meta_epfd` + `meta_watcher_busy` + `meta_waker` triple was
+/// replaced with an array of these to localise the meta-watcher CAS
+/// line and the kernel-side fan-in to a CCX-aligned slice of workers.
+/// See [`ShardedMioHandle`] field docs for the partitioning rationale
+/// and topology source.
+///
+/// Each group owns one `epoll_create1` fd, one `eventfd`, and one
+/// `AtomicBool`. Group count `G` is determined by [`probe_chiplet_groups`]
+/// at handle construction. Workers are assigned to a group at
+/// first-park (best-effort, kernel-migration-tolerant) by reading
+/// `sched_getcpu()` and looking up the L3-shared CCX it belongs to.
+#[cfg(target_os = "linux")]
+struct ChipletGroup {
+    /// Per-group meta epoll fd. Only this group's worker child
+    /// epolls + this group's `meta_waker` are registered on it.
+    /// Closed in [`Drop`].
+    meta_epfd: RawFd,
+
+    /// Per-group meta-watcher gate. At most one worker per group
+    /// blocks in `epoll_wait(meta_epfd)` at any moment. Replaces the
+    /// runtime-wide `AtomicBool` so the CAS line is partitioned `G`
+    /// ways instead of one — this is the targeted fix for the
+    /// `tcp_connect_churn` regression at lourip W=64/128 where the
+    /// global CAS bounced across 8 CCDs.
+    meta_watcher_busy: AtomicBool,
+
+    /// Per-group meta-waker eventfd, registered on `meta_epfd` with
+    /// sentinel `META_WAKER_TOKEN`. The unpark path writes this fd to
+    /// wake a worker currently parked in `ParkMode::Meta` for *this*
+    /// group; cross-group unparks use the per-worker `external_waker`
+    /// path (`PARKED_OWN`) — there is no global meta-waker any more.
+    meta_waker: MetaWaker,
+
+    /// Live count of workers that have first-parked into this group.
+    /// Read by the gate to skip the meta CAS when the group has only
+    /// the calling worker as a member (no fan-out target). Workers
+    /// only ever join, never leave (group assignment is permanent
+    /// for the runtime's life).
+    member_count: AtomicU8,
+}
+
+#[cfg(target_os = "linux")]
+impl ChipletGroup {
+    fn new() -> io::Result<Self> {
+        // SAFETY: passing well-defined libc flag constants to
+        // `epoll_create1`; no caller preconditions.
+        let meta_epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if meta_epfd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let meta_waker = match MetaWaker::new() {
+            Ok(mw) => mw,
+            Err(err) => {
+                // SAFETY: `meta_epfd` was just created above and not
+                // shared; closing on the error path before returning.
+                unsafe { libc::close(meta_epfd) };
+                return Err(err);
+            }
+        };
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: META_WAKER_TOKEN,
+        };
+        // SAFETY: `meta_epfd` is freshly created and unshared;
+        // `meta_waker.fd()` is owned by `meta_waker` for the duration
+        // of this group; `&mut ev` is a stack value the kernel reads
+        // but does not retain.
+        let r = unsafe {
+            libc::epoll_ctl(
+                meta_epfd,
+                libc::EPOLL_CTL_ADD,
+                meta_waker.fd(),
+                &mut ev,
+            )
+        };
+        if r != 0 {
+            let err = io::Error::last_os_error();
+            // SAFETY: `meta_epfd` is owned by this scope and not yet
+            // moved into a `ChipletGroup`; close before the error
+            // returns. `meta_waker` drops normally and closes its fd.
+            unsafe { libc::close(meta_epfd) };
+            return Err(err);
+        }
+        Ok(Self {
+            meta_epfd,
+            meta_watcher_busy: AtomicBool::new(false),
+            meta_waker,
+            member_count: AtomicU8::new(0),
+        })
+    }
+
+    /// Register a worker's child epoll fd onto this group's
+    /// `meta_epfd` as level-triggered `EPOLLIN`, with `worker_idx`
+    /// stamped into `epoll_event.data.u64` (matching the watcher's
+    /// dispatch in `park_on_meta`). Called once per worker on its
+    /// first park, after the worker has been assigned to this group.
+    fn add_child(&self, child_epfd: RawFd, worker_idx: u64) -> io::Result<()> {
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: worker_idx,
+        };
+        // SAFETY: `self.meta_epfd` is owned by `self` and stays open
+        // until `Drop`; `child_epfd` is owned by the worker's
+        // `SharedRegistry`, which outlives this handle (worker
+        // reactor is dropped last on shutdown); `&mut ev` is a stack
+        // value the kernel reads but does not retain.
+        let r = unsafe {
+            libc::epoll_ctl(
+                self.meta_epfd,
+                libc::EPOLL_CTL_ADD,
+                child_epfd,
+                &mut ev,
+            )
+        };
+        if r != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ChipletGroup {
+    fn drop(&mut self) {
+        if self.meta_epfd >= 0 {
+            // SAFETY: `meta_epfd` was created by `epoll_create1` in
+            // `Self::new` and not closed elsewhere; `Drop` runs at
+            // most once. Children remain registered until their
+            // owning `SharedRegistry` is dropped a moment later as
+            // part of runtime teardown — the kernel removes the
+            // meta-side records automatically when the meta fd
+            // closes. `meta_waker` drops afterwards via field-drop
+            // order and closes its eventfd.
+            unsafe { libc::close(self.meta_epfd) };
+        }
+    }
+}
+
+/// Probe `/sys/devices/system/cpu/cpuN/cache/index3/shared_cpu_list`
+/// to build a CPU → group-index lookup table aligned to L3 cache
+/// boundaries. On Zen, the L3 cache is the CCX boundary, so an
+/// L3-aligned partition is a CCX-aligned partition.
+///
+/// **Why not `cluster_id`?** The canonical kernel-exposed CCX source
+/// would be `/sys/devices/system/cpu/cpuN/topology/cluster_id`, but on
+/// the kernels we run (and the Zen 2 / 3 hardware in this fleet) it
+/// reads as `65535` (= unset / -1) for every CPU. `index3/shared_cpu_list`
+/// IS populated and gives the same partition (one L3 == one CCX on
+/// Zen 2, e.g. 4C/8T per CCX on EPYC 7H12 lourip; 2C/4T per CCX on
+/// the partial-CCX EPYC 7302 lounas).
+///
+/// Returns `(cpu_to_group, group_count)`:
+/// - `cpu_to_group[cpu_id] = group_idx` for every CPU we successfully
+///   read; `u8::MAX` for CPUs whose sysfs entry was missing or
+///   unparseable (callers must default to group 0 for those).
+/// - `group_count >= 1` always; falls back to `1` (single-group)
+///   when every read failed (e.g. sysfs missing in a sandbox).
+///
+/// Group index is `u8` because no realistic system has more than
+/// 255 distinct L3 caches; the largest current AMD parts are
+/// dual-socket Genoa with ~24 L3s, well within `u8`.
+#[cfg(target_os = "linux")]
+fn probe_chiplet_groups() -> (Box<[u8]>, u8) {
+    // SAFETY: `sysconf` is async-signal-safe and takes a single
+    // well-defined integer constant; no caller preconditions.
+    let max_cpu = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+    let max_cpu = if max_cpu <= 0 { 1usize } else { max_cpu as usize };
+
+    let mut cpu_to_group = vec![u8::MAX; max_cpu];
+    let mut next_group: u8 = 0;
+
+    for cpu in 0..max_cpu {
+        if cpu_to_group[cpu] != u8::MAX {
+            continue; // already assigned via a peer CPU's L3 list
+        }
+        let path = format!(
+            "/sys/devices/system/cpu/cpu{cpu}/cache/index3/shared_cpu_list"
+        );
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                if next_group == u8::MAX {
+                    // Saturated (>= 255 L3 groups). Should be
+                    // impossible on real hardware. Bucket every
+                    // remaining CPU into the last available group.
+                    cpu_to_group[cpu] = u8::MAX - 1;
+                    continue;
+                }
+                let g = next_group;
+                next_group = next_group.saturating_add(1);
+                for peer in parse_cpu_list(&s) {
+                    if peer < cpu_to_group.len()
+                        && cpu_to_group[peer] == u8::MAX
+                    {
+                        cpu_to_group[peer] = g;
+                    }
+                }
+            }
+            Err(_) => {
+                // sysfs missing for this CPU (offline, or not exposed
+                // in a sandbox). Give it its own group so it isn't
+                // silently funnelled with an arbitrary peer.
+                if next_group != u8::MAX {
+                    cpu_to_group[cpu] = next_group;
+                    next_group = next_group.saturating_add(1);
+                } else {
+                    cpu_to_group[cpu] = u8::MAX - 1;
+                }
+            }
+        }
+    }
+
+    let group_count = if next_group == 0 {
+        // Every read failed. Single-group fallback: every CPU -> 0.
+        // Behaviour collapses to the pre-sharding runtime-wide
+        // meta-watcher.
+        for g in cpu_to_group.iter_mut() {
+            *g = 0;
+        }
+        1
+    } else {
+        next_group
+    };
+
+    (cpu_to_group.into_boxed_slice(), group_count)
+}
+
+/// Parse a `/sys` cpu-list (e.g. `"0-3,64-67"`, `"7"`) into the
+/// concrete CPU IDs it covers. Tolerant of malformed input — returns
+/// the empty iterator on parse failures rather than panicking; a
+/// stray sysfs read on an unfamiliar kernel must not bring the
+/// runtime down.
+#[cfg(target_os = "linux")]
+fn parse_cpu_list(s: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for tok in s.trim().split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = tok.split_once('-') {
+            let lo: usize = match lo.trim().parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let hi: usize = match hi.trim().parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if lo <= hi {
+                for c in lo..=hi {
+                    out.push(c);
+                }
+            }
+        } else if let Ok(c) = tok.parse() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// RAII handle for a per-group meta-watcher slot. Constructed by
+/// [`ShardedMioHandle::try_acquire_meta_watcher`]; releases this
+/// group's `meta_watcher_busy` on drop so the next idle worker in
+/// the same group can take over.
 ///
 /// Holds an `Arc<ShardedMioHandle>` rather than borrowing it so the
 /// guard is 'static — required to pass it across `&mut self` method
 /// boundaries inside the parker without tripping the borrow checker.
 /// The clone is one atomic-inc, dwarfed by the syscall the guard
 /// protects.
-///
-/// Owned by the worker that won the gate; consumed by dropping the
-/// guard (or via `release()`) once the gate-protected syscall has
-/// returned and the dispatch loop is ready to release the slot.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub(crate) struct MetaWatcherGuard {
     handle: Arc<ShardedMioHandle>,
+    /// Index into `handle.groups`; identifies whose `meta_watcher_busy`
+    /// the drop path must clear.
+    group_idx: u8,
     released: bool,
 }
 
@@ -233,11 +498,18 @@ impl MetaWatcherGuard {
 
     fn do_release(&mut self) {
         if !self.released {
-            self.handle
+            self.handle.groups[self.group_idx as usize]
                 .meta_watcher_busy
                 .store(false, Ordering::Release);
             self.released = true;
         }
+    }
+
+    /// Group index this guard owns the watcher slot of. Used by the
+    /// parker's `park_on_meta` to dispatch to the correct meta epfd.
+    #[allow(dead_code)]
+    pub(crate) fn group_idx(&self) -> u8 {
+        self.group_idx
     }
 }
 
@@ -306,6 +578,33 @@ pub(crate) struct WorkerState {
     /// stale-non-zero, or one missed meta-cycle if read stale-zero —
     /// the next park rechecks).
     pub(crate) registered_count: AtomicUsize,
+
+    /// Index into [`ShardedMioHandle::groups`] this worker is
+    /// assigned to, or `u8::MAX` while still unassigned.
+    ///
+    /// **Lazy first-park assignment.** Workers are assigned at their
+    /// first park entry by reading `libc::sched_getcpu()` and looking
+    /// up the L3-sharing CCX of that CPU in
+    /// [`ShardedMioHandle::cpu_to_group`]. Tokio doesn't pin workers,
+    /// so a kernel migration after first-park leaves the worker's
+    /// `group_idx` pointing at its *initial* CCX — best-effort
+    /// routing, never wrong (the meta-watcher's drain locality just
+    /// becomes imperfect, not unsound).
+    ///
+    /// Synchronisation: written exactly once with `Release` ordering
+    /// by the owning worker thread before the first park enters
+    /// `try_acquire_meta_watcher` (which can only succeed for
+    /// `group_idx != u8::MAX`). Read with `Acquire` by the unpark path
+    /// when routing a `PARKED_META` wake to the right group's
+    /// `meta_waker`. Read with `Relaxed` on the owner's own park path
+    /// (no cross-thread visibility concern — the owner wrote it).
+    ///
+    /// Invariant: by the time `park_state` becomes `PARKED_META`,
+    /// `group_idx` has been published. Cross-thread `unpark` observers
+    /// of `PARKED_META` are therefore guaranteed to see a valid group
+    /// index.
+    #[cfg(target_os = "linux")]
+    pub(crate) group_idx: AtomicU8,
 }
 
 impl WorkerState {
@@ -318,6 +617,8 @@ impl WorkerState {
             registrations,
             synced: Mutex::new(synced),
             registered_count: AtomicUsize::new(0),
+            #[cfg(target_os = "linux")]
+            group_idx: AtomicU8::new(u8::MAX),
         }
     }
 }
@@ -363,66 +664,57 @@ pub(crate) struct ShardedMioHandle {
     /// [uhb]: super::uring_driver::UringHandle
     start_barrier: std::sync::Barrier,
 
-    /// Runtime-wide *meta epoll fd*. Each worker's child epoll is
-    /// added here once it publishes its `SharedRegistry`, with the
-    /// child's `worker_idx` carried in `epoll_event.data.u64`. Used
-    /// by the upcoming steal-mode park path to wait for "some
-    /// sibling has events" and resolve back to the firing worker.
+    /// Per-chiplet meta-watcher groups. Replaces the runtime-wide
+    /// `meta_epfd` + `meta_watcher_busy` + `meta_waker` triple with
+    /// an array of [`ChipletGroup`]s, each owning its own
+    /// `meta_epfd`, `meta_watcher_busy` CAS line, and `meta_waker`
+    /// eventfd. Group count `G` is the number of distinct L3 caches
+    /// reported by `/sys` (= number of CCXs on Zen) at runtime
+    /// build; on lourip (EPYC 7H12) that's 16 groups of 8 logical
+    /// CPUs, on lounas (EPYC 7302) 8 groups of 4. Single-group
+    /// fallback when sysfs reads fail.
     ///
-    /// Owned by this handle: created in [`Self::new`], closed in
-    /// [`Drop`]. Not exposed publicly outside the sharded-mio module.
-    #[cfg(target_os = "linux")]
-    meta_epfd: RawFd,
-
-    /// Userspace gate: at most one worker at a time blocks on the
-    /// meta epoll. Workers that lose the gate park on their own
-    /// child epoll fd via [`ShardedMioParker::park_on_own_child`]
-    /// for the duration the caller requested; the meta-watcher
-    /// covers any peer events for them.
+    /// Each worker is assigned to exactly one group at first-park
+    /// (see [`WorkerState::group_idx`]). Cross-group I/O wakes ride
+    /// the existing per-worker `external_waker` path
+    /// (`PARKED_OWN`) — there is no global meta-waker any more,
+    /// and there is no cross-group fan-out bitset (the
+    /// `interested_workers: AtomicU64` substrate that would have
+    /// supported it was removed in `9eb7bed9` for false-sharing on
+    /// the owner's park line and is *not* reintroduced here).
     ///
     /// # Motivation
     ///
-    /// Without the gate, every idle worker `epoll_wait`s on the meta
-    /// fd. With four workers and one fd producing events, sharded-mio
-    /// pays `4 × epoll_wait` overhead vs. traditional's
-    /// `1 × epoll_wait + 3 × futex` — `perf stat` localised the
-    /// `busy_owner_idle` regression to that excess kernel-side syscall
-    /// volume. `EPOLLEXCLUSIVE` would have provided kernel-side
-    /// fan-in but `epoll_ctl(2)` rejects it with `EINVAL` when the
-    /// target fd is itself an epoll instance, which is the meta-of-
-    /// children shape we use. So the gate lives in userspace.
+    /// Without per-group partitioning, every idle worker's
+    /// `try_acquire_meta_watcher` CAS targets a single
+    /// runtime-wide `AtomicBool`. At W=64/128 on lourip the
+    /// register/deregister-heavy `tcp_connect_churn` benchmark
+    /// regressed +2.35% / +5.20% after the live-counter gate
+    /// refinement (`74189589`) — the suspected cause was the global
+    /// CAS line bouncing across CCDs of fabric on every park entry.
+    /// Splitting the CAS line `G` ways localises the contention to
+    /// CCX-local cache traffic.
     ///
-    /// # Why earlier gate spikes regressed `busy_owner_3burners`
-    ///
-    /// A naive gate funnels every wake into the watcher's run queue
-    /// (via `try_steal_drain`'s call to `io.wake(ready)` on the
-    /// watcher thread), leaving peers parked until the scheduler's
-    /// own `notify_parked_remote` fires later. That extra hop costs
-    /// us the cache-locality advantage we get on `busy_owner_3burners`.
-    ///
-    /// The current design avoids the regression by relying on the
-    /// in-band `io.wake(ready)` push performed by `try_steal_drain`:
-    /// after dispatching a peer's events the freshly-woken tasks are
-    /// already on the owner's run queue, so the owner peer itself
-    /// re-enters the scheduler loop and picks them up directly. (The
-    /// previous design also OR'd a per-worker stake bitset into the
-    /// owner's `WorkerState` for a post-drain fan-out unpark, but that
-    /// substrate was never wired to a consumer and produced
-    /// false-sharing on the owner's hot park line — removed.)
+    /// `EPOLLEXCLUSIVE` would have provided kernel-side fan-in but
+    /// `epoll_ctl(2)` rejects it with `EINVAL` when the target fd is
+    /// itself an epoll instance, which is the meta-of-children shape
+    /// we use. So the gate lives in userspace.
     ///
     /// [`epoll_ctl(2)`]: https://man7.org/linux/man-pages/man2/epoll_ctl.2.html
     #[cfg(target_os = "linux")]
-    meta_watcher_busy: AtomicBool,
+    groups: Box<[ChipletGroup]>,
 
-    /// Eventfd registered on `meta_epfd` so the unpark path can wake a
-    /// worker that is currently parked in the meta-watcher branch.
-    /// Owned by the handle: created in [`Self::new`] alongside
-    /// `meta_epfd`, registered on the meta epoll with sentinel
-    /// `META_WAKER_TOKEN`, drained by the meta-watcher in
-    /// [`super::sharded_mio_park::ShardedMioParker::park_on_meta`],
-    /// closed in [`Drop`].
+    /// CPU-id → group-index lookup table built by
+    /// [`probe_chiplet_groups`] at handle construction. Indexed by
+    /// the result of `libc::sched_getcpu()` on a worker's first park
+    /// to assign that worker to its CCX-local group. `u8::MAX` for
+    /// CPUs whose sysfs entry was missing or unparseable; callers
+    /// default to group 0 in that case.
+    ///
+    /// Stable for the lifetime of `self`; never written after
+    /// construction.
     #[cfg(target_os = "linux")]
-    meta_waker: MetaWaker,
+    cpu_to_group: Box<[u8]>,
 }
 
 impl std::fmt::Debug for ShardedMioHandle {
@@ -433,23 +725,12 @@ impl std::fmt::Debug for ShardedMioHandle {
     }
 }
 
-#[cfg(target_os = "linux")]
-impl Drop for ShardedMioHandle {
-    fn drop(&mut self) {
-        // Close the meta epoll fd. Children remain registered until
-        // each worker's `SharedRegistry` (and the underlying child
-        // epoll fd) is dropped a moment later as part of runtime
-        // teardown — the kernel removes the meta-side records
-        // automatically when the meta fd closes, so we don't need to
-        // walk the workers and `EPOLL_CTL_DEL` first.
-        if self.meta_epfd >= 0 {
-            // SAFETY: `meta_epfd` was created by `epoll_create1` in
-            // `Self::new` and has not been closed elsewhere — Drop
-            // runs at most once.
-            unsafe { libc::close(self.meta_epfd) };
-        }
-    }
-}
+// Note: explicit `Drop` impl on `ShardedMioHandle` is no longer
+// needed — `groups: Box<[ChipletGroup]>` field-drops every group's
+// `meta_epfd` + `meta_waker` automatically. Children remain
+// registered until each worker's `SharedRegistry` is dropped a
+// moment later as part of runtime teardown; the kernel removes the
+// meta-side records automatically when each group's meta fd closes.
 
 impl ShardedMioHandle {
     pub(crate) fn new(num_workers: usize) -> Self {
@@ -459,57 +740,26 @@ impl ShardedMioHandle {
         }
         let barrier_count = num_workers.max(1);
 
-        // Create the runtime-wide meta epoll fd up front so it is
-        // available for `register_worker` to add child epolls onto.
-        // `EPOLL_CLOEXEC` keeps the fd from leaking across `exec`.
+        // Probe L3-cache topology and build one ChipletGroup per
+        // distinct L3 (= one per CCX on Zen). On hosts where every
+        // `/sys` read fails (e.g. sandboxes without sysfs), the probe
+        // falls back to a single group and behaviour collapses to the
+        // pre-sharding runtime-wide meta-watcher. `EPOLL_CLOEXEC` keeps
+        // each group's meta epoll fd from leaking across `exec`.
         #[cfg(target_os = "linux")]
-        let meta_epfd = {
-            let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-            if fd < 0 {
-                let err = io::Error::last_os_error();
-                panic!("sharded-mio: epoll_create1 for meta epoll failed: {err}");
-            }
-            fd
-        };
-
-        // Create the meta-waker eventfd and register it on the meta
-        // epoll. The unpark path writes to this fd to wake a worker
-        // currently parked in the meta-watcher branch (see
-        // `ParkMode::Meta`). `META_WAKER_TOKEN` is the sentinel
-        // `epoll_event.u64` the watcher uses to identify the wake
-        // (vs. a child epoll firing on real I/O).
+        let (cpu_to_group, group_count) = probe_chiplet_groups();
         #[cfg(target_os = "linux")]
-        let meta_waker = {
-            let mw = match MetaWaker::new() {
-                Ok(mw) => mw,
-                Err(err) => panic!(
-                    "sharded-mio: eventfd for meta_waker failed: {err}",
-                ),
-            };
-            let mut ev = libc::epoll_event {
-                events: libc::EPOLLIN as u32,
-                u64: META_WAKER_TOKEN,
-            };
-            // SAFETY: `meta_epfd` is freshly created above and
-            // unshared; `mw.fd()` is owned by `mw` for the duration
-            // of this handle (we move it into `Self` below); `&mut
-            // ev` is a fresh stack value the kernel reads but does
-            // not retain.
-            let ret = unsafe {
-                libc::epoll_ctl(
-                    meta_epfd,
-                    libc::EPOLL_CTL_ADD,
-                    mw.fd(),
-                    &mut ev,
-                )
-            };
-            if ret != 0 {
-                let err = io::Error::last_os_error();
-                panic!(
-                    "sharded-mio: epoll_ctl(meta, ADD, meta_waker) failed: {err}",
-                );
+        let groups: Box<[ChipletGroup]> = {
+            let mut v = Vec::with_capacity(group_count as usize);
+            for g in 0..group_count {
+                match ChipletGroup::new() {
+                    Ok(grp) => v.push(grp),
+                    Err(err) => panic!(
+                        "sharded-mio: ChipletGroup::new for group {g} failed: {err}",
+                    ),
+                }
             }
-            mw
+            v.into_boxed_slice()
         };
 
         Self {
@@ -518,33 +768,33 @@ impl ShardedMioHandle {
             metrics: IoDriverMetrics::default(),
             start_barrier: std::sync::Barrier::new(barrier_count),
             #[cfg(target_os = "linux")]
-            meta_epfd,
+            groups,
             #[cfg(target_os = "linux")]
-            meta_watcher_busy: AtomicBool::new(false),
-            #[cfg(target_os = "linux")]
-            meta_waker,
+            cpu_to_group,
         }
     }
 
-    /// Try to become the runtime-wide *meta watcher*: the single
-    /// thread allowed to block in `epoll_wait` on the meta epoll fd
-    /// at any given moment. Returns `Some(guard)` on success — drop
-    /// the guard (or call `MetaWatcherGuard::release`) to release the
-    /// watcher slot. Returns `None` when another worker already holds
-    /// it; the caller should fall back to parking on its own child
-    /// epoll.
+    /// Try to become the *meta watcher* for `group_idx`: the single
+    /// thread allowed to block in `epoll_wait` on that group's meta
+    /// epoll fd at any given moment. Returns `Some(guard)` on success
+    /// — drop the guard (or call `MetaWatcherGuard::release`) to
+    /// release the slot for that group. Returns `None` when another
+    /// worker already holds the slot for this group; the caller
+    /// should fall back to parking on its own child epoll.
     ///
     /// Takes `self: &Arc<Self>` so the returned guard can carry an
     /// `Arc<Self>` clone, decoupling its lifetime from the caller and
     /// allowing it to cross `&mut self` boundaries on the parker side.
     ///
-    /// See [`Self::meta_watcher_busy`] for the gate's motivation.
+    /// See [`Self::groups`] for the partitioning rationale.
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
     pub(crate) fn try_acquire_meta_watcher(
         self: &Arc<Self>,
+        group_idx: u8,
     ) -> Option<MetaWatcherGuard> {
-        match self.meta_watcher_busy.compare_exchange(
+        let group = self.groups.get(group_idx as usize)?;
+        match group.meta_watcher_busy.compare_exchange(
             false,
             true,
             Ordering::Acquire,
@@ -552,40 +802,159 @@ impl ShardedMioHandle {
         ) {
             Ok(_) => Some(MetaWatcherGuard {
                 handle: Arc::clone(self),
+                group_idx,
                 released: false,
             }),
             Err(_) => None,
         }
     }
 
-    /// Raw meta-epoll fd. Stable for the lifetime of `self` and closed
-    /// in [`Drop`]. Currently only the parker module needs this — for
-    /// the upcoming steal-mode `epoll_wait` on the meta fd. Not
-    /// exposed publicly outside the sharded-mio backend.
+    /// Raw meta-epoll fd for `group_idx`. Stable for the lifetime of
+    /// `self`; field-dropped via the `groups` `Box<[..]>`. Used by the
+    /// parker's [`ParkMode::Meta`] branch.
     #[cfg(target_os = "linux")]
     #[allow(dead_code)]
-    pub(crate) fn meta_epfd(&self) -> RawFd {
-        self.meta_epfd
+    pub(crate) fn meta_epfd(&self, group_idx: u8) -> RawFd {
+        self.groups[group_idx as usize].meta_epfd
     }
 
-    /// Sentinel `epoll_event.u64` that identifies the meta-waker
-    /// eventfd in the events buffer returned by `epoll_wait` on
-    /// `meta_epfd`. The meta-watcher matches on this token to drain
-    /// the meta-waker (re-arm it for the next wake) instead of
-    /// treating it as a worker child.
+    /// Sentinel `epoll_event.u64` that identifies a group's
+    /// meta-waker eventfd in the events buffer returned by
+    /// `epoll_wait` on the group's `meta_epfd`. Children carry their
+    /// `worker_idx` as their u64; this sentinel is well outside any
+    /// plausible worker index. Same constant for every group — the
+    /// per-group meta epolls are disjoint, so collision-free.
     #[cfg(target_os = "linux")]
     #[inline]
     pub(crate) fn meta_waker_token() -> u64 {
         META_WAKER_TOKEN
     }
 
-    /// Drain the meta-waker eventfd. Called by
+    /// Drain `group_idx`'s meta-waker eventfd. Called by
     /// `ShardedMioParker::park_on_meta` after observing
     /// `META_WAKER_TOKEN` in the kernel-returned events.
     #[cfg(target_os = "linux")]
     #[inline]
-    pub(crate) fn drain_meta_waker(&self) {
-        self.meta_waker.drain();
+    pub(crate) fn drain_meta_waker(&self, group_idx: u8) {
+        self.groups[group_idx as usize].meta_waker.drain();
+    }
+
+    /// Group-local member set as a `u128` bitmask: bit `i` set iff
+    /// worker `i` is assigned to `group_idx`. Used by the parker's
+    /// `park_on_meta` to bound `peer_mask` to in-group members and
+    /// by the gate to skip the meta CAS when this worker is the only
+    /// member of its group (no fan-out target). Cheap to recompute
+    /// per call: it's a tight loop over `self.workers` reading one
+    /// `AtomicU8` each. Stable after first-park assignment of every
+    /// member.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn group_member_mask(&self, group_idx: u8) -> u128 {
+        let mut mask: u128 = 0;
+        for (i, slot) in self.workers.iter().enumerate() {
+            if i >= 128 {
+                break;
+            }
+            if slot.group_idx.load(Ordering::Acquire) == group_idx {
+                mask |= 1u128 << i;
+            }
+        }
+        mask
+    }
+
+    /// Live count of workers currently assigned to `group_idx`. Read
+    /// by the gate to short-circuit the meta CAS for single-member
+    /// groups (no fan-out value). Maintained by `ensure_group_assigned`
+    /// on each first-park.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    pub(crate) fn group_member_count(&self, group_idx: u8) -> u8 {
+        self.groups[group_idx as usize]
+            .member_count
+            .load(Ordering::Acquire)
+    }
+
+    /// Ensure `worker_idx` has been assigned to a chiplet group. On
+    /// first call (cold path) this reads `libc::sched_getcpu()` to
+    /// pick a CCX-local group, registers the worker's child epoll fd
+    /// onto that group's meta epoll, increments the group's
+    /// `member_count`, and publishes the group index on
+    /// `WorkerState::group_idx` with `Release`. Subsequent calls are
+    /// a single `Acquire` load on the worker's own slot.
+    ///
+    /// Returns the assigned `group_idx`. Always called from the
+    /// owning worker thread (in the parker's first-park path), so no
+    /// concurrent assignment for the same worker_idx is possible.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn ensure_group_assigned(&self, worker_idx: usize) -> u8 {
+        let slot = &self.workers[worker_idx];
+        // Hot path: already assigned. Acquire pairs with the Release
+        // store below and with cross-thread unpark observers.
+        let cur = slot.group_idx.load(Ordering::Acquire);
+        if cur != u8::MAX {
+            return cur;
+        }
+
+        // Cold path: pick group from the CPU we are currently
+        // running on. `sched_getcpu` may return -1 in heavily
+        // restricted sandboxes; bucket those into group 0.
+        // SAFETY: `sched_getcpu` has no caller preconditions and is
+        // signal-safe; failure modes are <0 returns.
+        let cpu = unsafe { libc::sched_getcpu() };
+        let group_idx = if cpu < 0 {
+            0u8
+        } else {
+            let cpu = cpu as usize;
+            let g = self
+                .cpu_to_group
+                .get(cpu)
+                .copied()
+                .unwrap_or(u8::MAX);
+            if g == u8::MAX {
+                0u8
+            } else {
+                g
+            }
+        };
+        // Defensive bound: if topology probe somehow reported a
+        // group beyond what we built, fall back to group 0. Should
+        // not happen — groups[] was sized from probe's group_count.
+        let group_idx = if (group_idx as usize) >= self.groups.len() {
+            0u8
+        } else {
+            group_idx
+        };
+
+        // Register own child epfd onto the group's meta epoll. Must
+        // happen before the Release store of `group_idx` so any peer
+        // that observes our published group_idx (e.g. via the
+        // unpark path's PARKED_META branch) is guaranteed the meta
+        // epoll has already been wired to wake on our child.
+        let registry = slot
+            .shared_registry
+            .get()
+            .expect("shared_registry published before first park");
+        let child_epfd = registry.epoll_fd();
+        if let Err(err) = self.groups[group_idx as usize]
+            .add_child(child_epfd, worker_idx as u64)
+        {
+            panic!(
+                "sharded-mio: epoll_ctl(group {group_idx} meta, ADD, \
+                 child={child_epfd}, worker={worker_idx}) failed: {err}",
+            );
+        }
+
+        // Bump member_count then publish group_idx. The order of
+        // these two is irrelevant for correctness — both are
+        // Release/Acquire-paired with their respective readers and
+        // single-writer (this thread is the only writer for both
+        // this slot's group_idx and a unique increment of the
+        // group's member_count).
+        self.groups[group_idx as usize]
+            .member_count
+            .fetch_add(1, Ordering::Release);
+        slot.group_idx.store(group_idx, Ordering::Release);
+        group_idx
     }
 
     /// Number of workers this handle serves.
@@ -618,14 +987,23 @@ impl ShardedMioHandle {
     /// worker's thread. After this returns, other threads can target
     /// the worker via `add_source` / `unpark`.
     ///
-    /// On Linux this also registers the worker's child epoll fd onto
-    /// the runtime-wide meta epoll as level-triggered `EPOLLIN`, with
-    /// `worker_idx` stamped into `epoll_event.data.u64`. The level-
-    /// triggered shape is deliberate: we want the meta `epoll_wait`
-    /// to keep reporting a child as ready until that child has been
-    /// drained, so a peer parker that wakes on the meta but loses the
-    /// try-lock race can be re-woken on the next attempt without any
-    /// intervening event.
+    /// **Per-chiplet meta epoll registration is deferred to first-park.**
+    /// Originally this method also registered the worker's child epoll
+    /// fd onto a runtime-wide meta epoll. With per-chiplet sharding the
+    /// worker doesn't yet know its group at scheduler startup — group
+    /// assignment depends on `sched_getcpu()` and is best done once
+    /// the worker has actually started running tasks. The meta-side
+    /// `epoll_ctl(ADD)` therefore lives in
+    /// [`Self::ensure_group_assigned`], called from the parker on its
+    /// first park.
+    ///
+    /// Acceptable hole: between scheduler startup and first park, this
+    /// worker is invisible to every group's meta-watcher. Events
+    /// queued on its child during that window are still picked up by
+    /// the worker itself on its first `mio::Poll::poll`. Peers can't
+    /// fan-in for it during that window, but the worker is by
+    /// definition not yet CPU-bound (it hasn't started polling
+    /// anything), so there are no peer-stuck events to harvest.
     pub(crate) fn register_worker(
         &self,
         worker_idx: usize,
@@ -633,43 +1011,6 @@ impl ShardedMioHandle {
         external_waker: ExternalWaker,
     ) {
         let slot = &self.workers[worker_idx];
-
-        // Register the child epoll onto the meta epoll *before*
-        // publishing `shared_registry` so that any thread that
-        // subsequently observes the published registry can also rely
-        // on the child being visible to the meta. Failure here is a
-        // hard error — the runtime cannot honor steal-mode park
-        // without the registration in place.
-        #[cfg(target_os = "linux")]
-        {
-            let child_epfd = shared_registry.epoll_fd();
-            let mut ev = libc::epoll_event {
-                events: libc::EPOLLIN as u32,
-                u64: worker_idx as u64,
-            };
-            // SAFETY: `self.meta_epfd` is owned by this handle and
-            // stays open until `Drop`; `child_epfd` is owned by the
-            // soon-to-be-published `SharedRegistry`, which itself
-            // outlives the handle (the worker's `Reactor` is dropped
-            // last on shutdown via `ShardedMioParker::shutdown`).
-            // `&mut ev` is a fresh stack value the kernel reads but
-            // does not retain.
-            let ret = unsafe {
-                libc::epoll_ctl(
-                    self.meta_epfd,
-                    libc::EPOLL_CTL_ADD,
-                    child_epfd,
-                    &mut ev,
-                )
-            };
-            if ret != 0 {
-                let err = io::Error::last_os_error();
-                panic!(
-                    "sharded-mio: epoll_ctl(meta, ADD, child={child_epfd}, \
-                     worker={worker_idx}) failed: {err}",
-                );
-            }
-        }
 
         if slot.shared_registry.set(shared_registry).is_err() {
             debug_assert!(false, "worker {worker_idx} published shared_registry twice");
@@ -728,11 +1069,27 @@ impl ShardedMioHandle {
             #[cfg(target_os = "linux")]
             PARKED_META => {
                 bump(&COUNTERS.unpark_was_parked);
-                // Worker is in `epoll_wait` on the runtime-wide meta
-                // epoll. Wake by writing the meta-waker eventfd that
-                // is registered on the meta epoll with sentinel
-                // `META_WAKER_TOKEN`.
-                self.meta_waker.wake();
+                // Worker is in `epoll_wait` on its chiplet group's
+                // meta epoll. Wake by writing that group's
+                // `meta_waker` eventfd (registered on the group's
+                // meta epoll with sentinel `META_WAKER_TOKEN`).
+                //
+                // `group_idx` is published with `Release` before the
+                // park CAS that publishes `PARKED_META`; observing
+                // `PARKED_META` here therefore guarantees a valid
+                // `group_idx` (the swap above is `Release`/`Acquire`
+                // and pairs with the parker's `begin_park_direct`
+                // CAS).
+                let g = slot.group_idx.load(Ordering::Acquire);
+                if let Some(group) = self.groups.get(g as usize) {
+                    group.meta_waker.wake();
+                } else {
+                    debug_assert!(
+                        false,
+                        "unpark: PARKED_META observed without valid group_idx \
+                         (worker_idx={worker_idx}, group_idx={g})",
+                    );
+                }
                 true
             }
             EMPTY => {

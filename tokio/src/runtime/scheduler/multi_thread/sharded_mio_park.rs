@@ -233,18 +233,18 @@ impl ShardedMioParker {
         // meta-watcher CAS no longer fires on the steady-state
         // notification loop.
         //
-        // The meta-watcher slot is the runtime-wide drain-of-last-
-        // resort: exactly one worker parks on the meta-epoll (which
-        // monitors ALL children level-triggered) and on wake drains
-        // own events plus calls `try_steal_drain` against every peer.
-        // Whichever worker wins the CAS becomes the meta-watcher,
-        // *regardless of its own slab state*. This is critical for
-        // `busy_owner_3burners`-style workloads: when N-1 workers are
-        // burner-pinned and the only free worker happens to hold no
-        // own registrations, that free worker MUST still serve as the
-        // peer-drain — otherwise the queued events on the busy
-        // children would have nobody to harvest them and probes would
-        // stall until the burners' `BURNER_MS` deadline.
+        // The meta-watcher slot is the chiplet-group drain-of-last-
+        // resort: exactly one worker per group parks on that group's
+        // meta-epoll (which monitors all *group-local* children
+        // level-triggered) and on wake drains own events plus calls
+        // `try_steal_drain` against in-group peers. Whichever worker
+        // wins the per-group CAS becomes that group's meta-watcher,
+        // *regardless of its own slab state*. Cross-group events are
+        // not visible to this watcher — those workers' children are
+        // registered on a *different* group's meta epoll. Cross-group
+        // wakes ride the existing per-worker `external_waker`
+        // (`PARKED_OWN`) path that `unpark` already uses; there is no
+        // global watcher and no cross-group fanout substrate.
         //
         // Loser of the CAS: `park_on_own_child` — cache-warm
         // single-owner `mio::Poll::poll` on the worker's own child
@@ -252,52 +252,48 @@ impl ShardedMioParker {
         // registered, so it is wakeable even when the slab is
         // otherwise empty.
         //
-        // **Gate on (num_workers > 1) && worker_has_io_registered.**
-        // The meta-watcher's job is to drain peer events when peers are
-        // CPU-stuck and can't park their own children. That requires
-        // (a) at least one peer (otherwise there is nothing to fan-in)
-        // and (b) the calling worker to actually have I/O of its own
-        // (or to be helping another I/O-bearing worker). For pure-sync
-        // workloads (notify/mpsc/rwlock/watch — all the regression
-        // benches) no worker ever registers a `ScheduledIo`, so the
-        // meta-watcher cannot help anyone and the CAS bounce on
-        // `meta_watcher_busy` is pure overhead. The same gate also
-        // collapses the W=1 catastrophic regression where the lone
-        // worker would otherwise always win the CAS and pay an extra
-        // `epoll_wait(meta_epfd)` + non-blocking `poll(own_child, 0)`
-        // per cycle. See INVESTIGATION-sharded-mio-perf.md §Findings
-        // (Targets 1+2) for the full analysis.
+        // **Gate on (num_workers > 1) && worker_has_io_registered &&
+        // group_member_count > 1.** The meta-watcher's job is to
+        // drain peer events when peers are CPU-stuck and can't park
+        // their own children. That requires:
         //
-        // Risk to `busy_owner_3burners` is nil: the burner workers all
-        // hold real I/O registrations (TCP probe sockets), so their
-        // live `registered_count` is `> 0` and the gate lets them
-        // through. The only behaviour change is that pure-sync
-        // benches stop bouncing the global meta CAS line, and W=1
-        // runtimes stop double-polling.
+        // - (a) at least one peer in the *runtime* (the W=1 escape
+        //   hatch — the lone worker pays nothing extra),
+        // - (b) the calling worker to hold *current* I/O of its own,
+        //   so the meta CAS pays for itself,
+        // - (c) at least one peer in the *group* (a single-member
+        //   group's meta epoll only contains this worker's own child,
+        //   so a meta park is no different from `park_on_own_child`
+        //   minus a wasted CAS + meta-side `epoll_wait` overhead).
+        //
+        // For pure-sync workloads (notify/mpsc/rwlock/watch) no
+        // worker ever registers a `ScheduledIo`, so condition (b)
+        // fails and the meta CAS is skipped. For per-group runtimes
+        // where workers haven't yet first-parked, condition (c) keeps
+        // them on `park_on_own_child` until peers join the group.
         //
         // The `worker_has_io_registered` predicate tracks the *live*
-        // registration count (incremented on `register_on_worker`
-        // success, decremented on `queue_deregister`), not a sticky
-        // "ever held I/O" latch. A worker that used to own I/O and
-        // has since dropped all of it falls out of the gate
-        // immediately — it stops paying the meta CAS + extra
-        // `epoll_wait(meta_epfd)` per park. Trade-off: that worker
-        // can no longer serve as the meta-watcher for *peers* with
-        // current I/O. That role passes to the next idle worker that
-        // does hold live registrations, or to any worker if all
-        // peers are simultaneously busy (the watcher slot is
-        // refreshed every park cycle).
+        // registration count (74189589). The `group_member_count`
+        // gate is new with per-chiplet sharding and replaces what
+        // was implicitly handled by the runtime-wide
+        // `meta_watcher_busy` CAS at W=1.
         #[cfg(target_os = "linux")]
         let (mode, _meta_guard) = {
+            // Lazy first-park group assignment. After this returns,
+            // `group_idx` is published on `WorkerState` with Release
+            // and our child epfd is registered on the group's meta
+            // epoll. Cheap on the steady-state path (one Acquire load).
+            let group_idx = self.handle.ensure_group_assigned(self.idx);
             let want_meta = self.handle.num_workers() > 1
-                && self.handle.worker_has_io_registered(self.idx);
+                && self.handle.worker_has_io_registered(self.idx)
+                && self.handle.group_member_count(group_idx) > 1;
             let guard = if want_meta {
-                self.handle.try_acquire_meta_watcher()
+                self.handle.try_acquire_meta_watcher(group_idx)
             } else {
                 None
             };
             if guard.is_some() {
-                (ParkMode::Meta, guard)
+                (ParkMode::Meta(group_idx), guard)
             } else {
                 (ParkMode::OwnChild, None)
             }
@@ -317,7 +313,9 @@ impl ShardedMioParker {
 
         #[cfg(target_os = "linux")]
         match mode {
-            ParkMode::Meta => self.park_on_meta(duration),
+            ParkMode::Meta(group_idx) => {
+                self.park_on_meta(duration, group_idx)
+            }
             ParkMode::OwnChild => self.park_on_own_child(duration),
         }
         #[cfg(not(target_os = "linux"))]
@@ -351,9 +349,10 @@ impl ShardedMioParker {
         let _ = result;
     }
 
-    /// Park on the runtime-wide meta-epoll fd. The meta-epoll monitors
-    /// ALL workers' child epoll fds (level-triggered). When any child
-    /// has events — whether our own or a peer's — the meta fires.
+    /// Park on this worker's chiplet-group meta-epoll fd. The meta-epoll
+    /// monitors every group-local worker's child epoll fd
+    /// (level-triggered). When any group-local child has events —
+    /// whether our own or an in-group peer's — the meta fires.
     ///
     /// On wake we use the kernel-returned `epoll_event[]` to selectively
     /// drain: each child fd was registered with `ev.u64 = worker_idx`,
@@ -362,14 +361,15 @@ impl ShardedMioParker {
     /// `epoll_wait(timeout=0)` syscalls on quiescent peers (which is
     /// almost everyone in steady-state idle workloads).
     ///
-    /// This is how a free worker discovers events stuck on busy workers'
-    /// child epolls (the `busy_owner_3burners` path). Without meta-epoll
-    /// parking, the free worker only checks peers once per wake from its
-    /// own child epoll — missing events that arrive on peers but not
-    /// on self.
+    /// Cross-group children are by construction not in this group's
+    /// meta epoll, so they cannot fire here. Cross-group wakes ride
+    /// the existing per-worker `external_waker` (`PARKED_OWN`) path.
+    ///
+    /// `group_idx` is the assigned group (passed in to avoid a
+    /// redundant Acquire load — caller already had it from the gate).
     #[cfg(target_os = "linux")]
-    fn park_on_meta(&mut self, duration: Option<Duration>) {
-        let meta_epfd = self.handle.meta_epfd();
+    fn park_on_meta(&mut self, duration: Option<Duration>, group_idx: u8) {
+        let meta_epfd = self.handle.meta_epfd(group_idx);
 
         // Convert duration to epoll_wait timeout in ms.
         let timeout_ms: i32 = match duration {
@@ -410,22 +410,24 @@ impl ShardedMioParker {
 
         // Build a peer-mask from the returned events, and remember
         // whether our own child fired. `worker_idx` was stamped into
-        // `ev.u64` at `register_worker` time, so the `widx <
+        // `ev.u64` at `ensure_group_assigned` time, so the `widx <
         // num_workers` bound below is enforced by sharded-mio's own
         // registration path — but we still bounds-check defensively
         // because any malformed event would otherwise shift past the
         // top of `peer_mask`. The sentinel
-        // `ShardedMioHandle::meta_waker_token()` identifies the
-        // meta-waker eventfd that the cross-worker `unpark` path
-        // writes to wake a meta-mode parker; drain it here so the
-        // next wake produces a fresh edge.
+        // `ShardedMioHandle::meta_waker_token()` identifies this
+        // group's meta-waker eventfd that the cross-worker `unpark`
+        // path writes to wake a meta-mode parker; drain it here so
+        // the next wake produces a fresh edge. Per-group meta epolls
+        // are disjoint, so this group's meta_waker can only fire
+        // here.
         let num_workers = self.handle.workers().len();
         let meta_waker_token = ShardedMioHandle::meta_waker_token();
         let mut self_fired = false;
         let mut peer_mask: u128 = 0;
         for ev in &meta_events[..n as usize] {
             if ev.u64 == meta_waker_token {
-                self.handle.drain_meta_waker();
+                self.handle.drain_meta_waker(group_idx);
                 continue;
             }
             let widx = ev.u64 as usize;
