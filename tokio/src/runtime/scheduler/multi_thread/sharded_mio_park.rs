@@ -270,10 +270,23 @@ impl ShardedMioParker {
         //
         // Risk to `busy_owner_3burners` is nil: the burner workers all
         // hold real I/O registrations (TCP probe sockets), so their
-        // `worker_has_io_registered` latch is true and the gate lets
-        // them through. The only behaviour change is that pure-sync
+        // live `registered_count` is `> 0` and the gate lets them
+        // through. The only behaviour change is that pure-sync
         // benches stop bouncing the global meta CAS line, and W=1
         // runtimes stop double-polling.
+        //
+        // The `worker_has_io_registered` predicate tracks the *live*
+        // registration count (incremented on `register_on_worker`
+        // success, decremented on `queue_deregister`), not a sticky
+        // "ever held I/O" latch. A worker that used to own I/O and
+        // has since dropped all of it falls out of the gate
+        // immediately — it stops paying the meta CAS + extra
+        // `epoll_wait(meta_epfd)` per park. Trade-off: that worker
+        // can no longer serve as the meta-watcher for *peers* with
+        // current I/O. That role passes to the next idle worker that
+        // does hold live registrations, or to any worker if all
+        // peers are simultaneously busy (the watcher slot is
+        // refreshed every park cycle).
         #[cfg(target_os = "linux")]
         let (mode, _meta_guard) = {
             let want_meta = self.handle.num_workers() > 1

@@ -284,21 +284,28 @@ pub(crate) struct WorkerState {
     /// touching the slab.
     pub(super) synced: Mutex<registration_set::Synced>,
 
-    /// One-shot latch: set to `true` the first time a `ScheduledIo`
-    /// successfully registers on this worker's child epoll. Once set,
-    /// never reset — it is a permanent "this worker has touched I/O"
-    /// flag, used to gate the meta-watcher CAS so pure-sync workloads
-    /// don't pay the global CAS contention on `meta_watcher_busy` per
-    /// park.
+    /// Live count of `ScheduledIo`s currently registered on this
+    /// worker's child epoll. Incremented on the success tail of
+    /// `register_on_worker`, decremented on the matching arm of
+    /// `queue_deregister`. Used to gate the meta-watcher CAS so
+    /// pure-sync workloads — and workers that *used to* hold I/O
+    /// but no longer do — skip the global CAS contention on
+    /// `meta_watcher_busy` per park.
     ///
-    /// Conservative by design: a worker that ever held a registration
-    /// stays gated `true` for the rest of its life, even after the
-    /// `ScheduledIo` is deregistered. Tracking exact emptiness would
-    /// require a refcount and a re-check race against in-flight
-    /// `register_on_worker` calls — not worth the complexity for the
-    /// common "one worker handles all the I/O, others are CPU-bound"
-    /// shape this gate is designed to optimise.
-    pub(crate) has_io_registered: AtomicBool,
+    /// Replaces an earlier sticky `AtomicBool` latch (set-once, never
+    /// reset). The sticky version was conservative-correct but kept
+    /// workers paying the meta-watcher CAS + extra `epoll_wait` per
+    /// park indefinitely after they finished their last I/O — wasted
+    /// work for workloads that move I/O between workers over the
+    /// runtime's lifetime.
+    ///
+    /// The gate is purely advisory: the real synchronization with
+    /// peer parkers is the `meta_watcher_busy` CAS itself. Stale
+    /// reads of this counter cannot cause incorrect behaviour, only
+    /// a wasted park-mode decision (one extra meta cycle if read
+    /// stale-non-zero, or one missed meta-cycle if read stale-zero —
+    /// the next park rechecks).
+    pub(crate) registered_count: AtomicUsize,
 }
 
 impl WorkerState {
@@ -310,7 +317,7 @@ impl WorkerState {
             external_waker: OnceLock::new(),
             registrations,
             synced: Mutex::new(synced),
-            has_io_registered: AtomicBool::new(false),
+            registered_count: AtomicUsize::new(0),
         }
     }
 }
@@ -826,25 +833,29 @@ impl ShardedMioHandle {
         }
     }
 
-    /// Has this worker ever held a successful I/O registration?
+    /// Does this worker currently hold any live I/O registrations?
     ///
-    /// Permanent latch (`AtomicBool`, set-once). `false` means the
-    /// worker has never had a `ScheduledIo` registered against its
-    /// child epoll. Used to gate the meta-watcher CAS: a worker with
-    /// no I/O of its own and no peers with I/O has nothing to drain
-    /// from the meta epoll, so we skip the global CAS contention on
-    /// pure-sync workloads. `true` means at least one registration
-    /// has landed.
+    /// Live counter (`AtomicUsize`): incremented on the success tail
+    /// of `register_on_worker`, decremented on the matching arm of
+    /// `queue_deregister`. Returns `true` when the count is `> 0`,
+    /// meaning at least one `ScheduledIo` is currently registered on
+    /// this worker's child epoll. Used to gate the meta-watcher CAS:
+    /// a worker with no current I/O and no peers with I/O has
+    /// nothing to drain from the meta epoll, so we skip the global
+    /// CAS contention on `meta_watcher_busy`.
     ///
-    /// Acquire-load pairs with the Release-store in
-    /// `register_on_worker`'s success tail, so observing `true`
+    /// Acquire-load pairs with the Release fetch_add in
+    /// `register_on_worker`'s success tail, so observing `> 0`
     /// implies the registration is fully published into the slab and
-    /// epoll interest set.
+    /// epoll interest set. Decrement uses Release for symmetry with
+    /// post-deregister cleanup; stale reads in either direction are
+    /// safe (see field doc on `WorkerState::registered_count`).
     #[inline]
     pub(crate) fn worker_has_io_registered(&self, worker_idx: usize) -> bool {
         self.workers[worker_idx]
-            .has_io_registered
+            .registered_count
             .load(Ordering::Acquire)
+            > 0
     }
 
     /// Called by the worker on park completion. Clears any notification
@@ -1015,12 +1026,15 @@ impl ShardedMioHandle {
         shared
             .sharded_mio_slab_key
             .store(ok.slab_key, Ordering::Relaxed);
-        // Permanent latch: this worker has now touched I/O, so all
-        // future parks on it must use the epoll path (events fire
-        // through the child epoll, not through `park_state`).
-        // Release-store pairs with the Acquire-load on the parker side
-        // (`ShardedMioHandle::worker_has_io_registered`).
-        slot.has_io_registered.store(true, Ordering::Release);
+        // Live count: bump so future parks on this worker take the
+        // meta-watcher path (events for our fds fire through the
+        // child epoll, drained by whichever worker is the meta
+        // watcher). Release fetch_add pairs with the Acquire-load on
+        // the parker side (`ShardedMioHandle::worker_has_io_registered`),
+        // ensuring the slab insert + kernel epoll registration are
+        // visible to any worker that observes count > 0. Matched by
+        // a Release fetch_sub in `queue_deregister`.
+        slot.registered_count.fetch_add(1, Ordering::Release);
         self.metrics.incr_fd_count();
         Ok(worker_idx)
     }
@@ -1082,6 +1096,16 @@ impl ShardedMioHandle {
                     }
                 }
             }
+            // Decrement the live registration count for this worker.
+            // Symmetric with the Release fetch_add in
+            // `register_on_worker` — we only reach this branch when
+            // `slab_key` was set there, which is the same path that
+            // bumped the counter. Release ordering matches the
+            // increment side; the gate that reads this counter
+            // (`worker_has_io_registered`) is purely advisory, so a
+            // stale Acquire-load of `> 0` after this decrement is
+            // harmless (one extra meta-watcher cycle, then re-park).
+            slot.registered_count.fetch_sub(1, Ordering::Release);
         } else {
             bump(&COUNTERS.apply_deregister_no_key);
         }
