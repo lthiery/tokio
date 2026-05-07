@@ -1,6 +1,58 @@
-# Meta-Watcher Gate — Status (abandoned, WIP committed)
+# Meta-Watcher Gate — Status
 
 Companion to `WATCHER_GATE_DESIGN.md`. Read that first.
+
+> **Status (current):** the gate **shipped**, in a shape distinct from
+> both the original design and the abandoned WIP described below. See
+> `INVESTIGATION-sharded-mio-perf.md` for the resurrection narrative.
+> Live in `sharded_mio_park.rs` as:
+>
+> ```rust
+> let want_meta = self.handle.num_workers() > 1
+>     && self.handle.worker_has_io_registered(self.idx);
+> ```
+>
+> The two-condition gate sidesteps both failure modes from the
+> original attempts (the eventfd hazard at §"The eventfd hazard"
+> below was avoided by keeping the watcher's drain on `mio::Poll`
+> rather than raw `libc::epoll_wait`; the `busy_owner_idle` gap is
+> still open per §"Why no parking optimization can close
+> `busy_owner_idle`", and the path forward there is readiness
+> stealing — see `tokio/docs/readiness-stealing-fanout.md`).
+>
+> **Refinement at `74189589` (2026-05-07):** the
+> `worker_has_io_registered` predicate switched from a sticky
+> `AtomicBool` set-once latch to a live `AtomicUsize` counter
+> (`registered_count`, increment on `register_on_worker` success,
+> decrement on `queue_deregister`). Workers that used to own I/O and
+> have since dropped all of it now fall out of the gate immediately
+> instead of paying the meta CAS + extra `epoll_wait(meta_epfd)` per
+> park indefinitely. Headline perf delta vs baseline at `17f8863b`
+> (5 reps, 8s measure):
+>
+> | Bench / case                                | lounas (W=4..32)                    | lourip (W=6..128)                   |
+> |---------------------------------------------|--------------------------------------|--------------------------------------|
+> | `net_tcp_echo / sharded_mio/tcp_echo_throughput` | −2.84%, −5.19%, −2.82%, −2.81%, −4.98% | −0.48%, −2.92%, −2.30%, −0.69%, −1.11% |
+> | `net_tcp_echo / sharded_mio/tcp_connect_churn`   | +0.53%, −41.83%, −31.65%, +0.80%, −6.01%  | −4.84%, −10.51%, −24.14%, +2.35%, +5.20% |
+> | `sync_notify`, `sync_mpsc`                       | within rep noise (gate already short-circuits) | within rep noise                  |
+>
+> The mild regression on `tcp_connect_churn` at high W on lourip
+> (+2.35%, +5.20% at W=64, 128) is the `fetch_add` / `fetch_sub`
+> overhead vs the sticky bool's single Release-store, dominated by
+> the W=16-32 wins (-10% to -24%). See §"Open follow-ups" for the
+> per-chiplet watcher sharding idea that should remove that
+> high-W tail entirely.
+
+---
+
+## History (abandoned WIP, kept for the eventfd-hazard write-up)
+
+The remainder of this document records the original two-session
+abandoned attempt. It is **not** describing the current code — see
+the box above for what shipped. The `eventfd hazard` section
+(§"The eventfd hazard") and the `busy_owner_idle` analysis
+(§"Why no parking optimization can close `busy_owner_idle`") remain
+correct and continue to constrain future work; the rest is history.
 
 This document records what was attempted, what failed, and why the
 `busy_owner_idle` gap cannot be closed by a parking optimization.
@@ -164,3 +216,92 @@ net_sharded_mio_bench                   5/5
 rt_sharded_mio                          7/7
 rt_sharded_mio_fanout                   2/2
 ```
+
+---
+
+## Open follow-ups
+
+### Shard the watcher / steal-drain per chiplet (8 threads)
+
+The current shipped gate has a **single, runtime-wide**
+`meta_watcher_busy: AtomicBool` and a single `meta_epfd` fanning in
+every worker's child epoll. That global CAS line and shared epoll fd
+become a bottleneck at high worker counts:
+
+- **lourip** (EPYC 7H12, 64C/128T, 8 CCDs × 2 CCX × 4C = 16 CCXs of
+  8 threads each on Zen 2) shows a mild `tcp_connect_churn`
+  regression at W=64 (+2.35%) and W=128 (+5.20%) after the live-
+  counter refinement. The throughput case still wins, but the
+  connect-churn path — heavy on `register_on_worker` /
+  `queue_deregister` cycles — pays for cross-CCX cache traffic on
+  `meta_watcher_busy` and the `registered_count` fields.
+- The gate's behavioural premise is "one of the workers blocks in
+  `epoll_wait(meta_epfd)` and fans events out to peers." That
+  premise is correct globally but **wasteful** when peers are far
+  apart on the topology — a Linux `epoll_wait` return on a CCX-3
+  watcher delivering an event to a CCX-12 peer crosses two CCDs
+  worth of fabric.
+
+**Proposed structure:** partition workers into chiplet-local groups
+of 8 threads (1 CCX on Zen 2; on Zen 4 / Zen 5 with 8C CCXs, 1 CCX
+== 16T but 8T groupings still align with L3 boundaries on Zen 2 / 3
+hardware we run today). Each group owns:
+
+- Its own `meta_watcher_busy: AtomicBool`.
+- Its own `meta_epfd` containing only that group's worker child
+  epolls.
+- Its own `registered_count` aggregation if we want a fast
+  group-level "any I/O active here?" gate.
+
+Cross-group fanout becomes opt-in: the group meta-watcher fans
+events to its 8 group-local peers via `unpark` / waker; events on
+fds owned by another group are **not** seen by this group's
+watcher (they landed on the other group's `meta_epfd`). This is
+analogous to per-CCX run-queues in CPU schedulers — locality
+trumps load-balancing for the common case.
+
+Sketch of the data model:
+
+```text
+ShardedMioHandle
+├── workers: [WorkerState; N]               // unchanged
+├── chiplet_groups: [ChipletGroup; G]       // new; G = ceil(N / 8)
+│   └── ChipletGroup { meta_epfd, meta_watcher_busy, member_idxs: [u32; <=8] }
+└── (no more global meta_epfd / meta_watcher_busy)
+```
+
+Open design questions before this lands:
+
+1. **Topology source.** `sched_getaffinity` + `/sys/devices/system/cpu`
+   per-cpu `topology/{cluster_id, package_cpus, core_cpus}` reads
+   give us core→CCX mapping. Read once at runtime build, store the
+   group assignment alongside `WorkerState`.
+2. **Pinning policy.** Do workers stay on their starting CPU
+   (existing tokio behaviour: no pinning by default), or do we
+   pin to chiplet-local CPUs at scheduler init? If unpinned, the
+   group assignment is best-effort; the kernel may move a worker
+   to another CCX between scheduling decisions, in which case the
+   group routing is just a heuristic and not a correctness
+   constraint.
+3. **Cross-group I/O.** When a peer registers a `Waker` on a
+   `ScheduledIo` owned by a worker in a different group, the
+   existing `record_sharded_mio_stake` substrate (already in the
+   tree, currently unused per `WATCHER_GATE_DESIGN.md` §3) is the
+   natural place to record cross-group interest and route the
+   wake. Same atom (`interested_workers: AtomicU64`) suffices —
+   just consumed at group boundaries instead of globally.
+4. **Bench gate.** Re-run the same `net_tcp_echo` sweep matrix
+   (lounas W=4..32, lourip W=6..128) and check whether the
+   `tcp_connect_churn` regression at lourip W=64/128 closes
+   without giving up the W=16-32 wins. Targets:
+   - lourip W=64/128 `sharded_mio/tcp_connect_churn`: at parity
+     with sticky-bool baseline (no regression).
+   - lourip W=16-32 `sharded_mio/tcp_connect_churn`: keep the
+     -10% to -24% win.
+   - lounas W=6/8 `sharded_mio/tcp_connect_churn`: keep the -32%
+     to -42% win (these are well within a single CCX on a 15-core
+     host so per-chiplet partitioning is a no-op for lounas).
+
+Status: not started. Substrate (`interested_workers`,
+`record_sharded_mio_stake`) is in tree from the original
+design's spike. The chiplet partitioning is the missing piece.
