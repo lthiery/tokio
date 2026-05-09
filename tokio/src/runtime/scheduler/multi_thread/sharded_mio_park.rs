@@ -81,19 +81,9 @@ fn xgroup_drain_enabled() -> bool {
     })
 }
 
-/// Refinement on tier-A: skip the cross-group drain walk when our own
-/// group's `peer_mask` indicates the group is busy enough that
-/// dispatching cross-group readiness would pre-empt useful in-group
-/// work. Threshold: `peer_mask.count_ones() > group_member_count / 2`.
-///
-/// Motivation: at small group sizes (e.g. lounas's 4-CCD layout, 4
-/// workers per group) the cross-group walk pays ~all-but-self atomics
-/// per park. When the in-group is already busy enough to keep the
-/// scheduler fed, those atomics are pure overhead — better to return
-/// to the scheduler and let the next park batch the cross-group help.
-///
-/// Set `TOKIO_CHIPLET_XGROUP_DRAIN_GATED=1` to enable. No-op unless
-/// `TOKIO_CHIPLET_XGROUP_DRAIN=1` is also set.
+/// Refines `xgroup_drain_enabled`: skip the walk when more than half
+/// of in-group peers fired this park. Set
+/// `TOKIO_CHIPLET_XGROUP_DRAIN_GATED=1` to enable.
 #[cfg(target_os = "linux")]
 fn xgroup_drain_gated_enabled() -> bool {
     use std::sync::OnceLock;
@@ -515,22 +505,7 @@ impl ShardedMioParker {
         //    Gated by `TOKIO_CHIPLET_XGROUP_DRAIN=1` for clean A/B,
         //    cached once via `OnceLock` to keep the hot park path
         //    free of `std::env::var` allocations.
-        // Refinement: when the in-group is already busy (more than
-        // half its members fired this park), skip the cross-group
-        // walk. The scheduler is about to be fed plenty of in-group
-        // work; spending extra atomics walking other groups would just
-        // delay returning to it. Closes the lounas W=4-6 residual
-        // observed in the cross-host sweep without affecting lourip
-        // (where 16-member groups rarely exceed half-busy under the
-        // benchmarked workloads).
-        let skip_xgroup_busy = xgroup_drain_gated_enabled() && {
-            let group_size =
-                self.handle.group_member_count(group_idx) as u32;
-            group_size >= 2
-                && peer_mask.count_ones() > group_size / 2
-        };
-
-        if xgroup_drain_enabled() && !skip_xgroup_busy {
+        if xgroup_drain_enabled() && !self.in_group_too_busy_for_xgroup(group_idx, peer_mask) {
             const N_OTHER_GROUP_PEERS: usize = 64;
             let workers = self.handle.workers();
             let num_workers = workers.len();
@@ -559,6 +534,20 @@ impl ShardedMioParker {
                 }
             }
         }
+    }
+
+    /// `xgroup_drain_gated_enabled()` refinement: returns true when
+    /// the in-group `peer_mask` indicates more than half of the
+    /// group's members fired this park, so the cross-group walk
+    /// should be skipped to avoid pre-empting in-group dispatch.
+    /// No-op (returns false) unless the gated knob is set.
+    #[cfg(target_os = "linux")]
+    fn in_group_too_busy_for_xgroup(&self, group_idx: u8, peer_mask: u128) -> bool {
+        if !xgroup_drain_gated_enabled() {
+            return false;
+        }
+        let group_size = self.handle.group_member_count(group_idx) as u32;
+        peer_mask.count_ones() > group_size / 2
     }
 
     /// Non-blocking steal scan over a mask of peer workers. Each set
