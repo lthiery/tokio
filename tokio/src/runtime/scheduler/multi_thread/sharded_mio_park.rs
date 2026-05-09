@@ -69,29 +69,29 @@ pub(crate) fn current_worker_index() -> Option<usize> {
 /// `park_on_meta`. Cached once at first park to keep
 /// `std::env::var` (which allocates) off the hot park path.
 ///
-/// Set `TOKIO_CHIPLET_XGROUP_DRAIN=1` to enable.
+/// Default-on; set `TOKIO_CHIPLET_XGROUP_DRAIN=0` to disable.
 #[cfg(target_os = "linux")]
 fn xgroup_drain_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("TOKIO_CHIPLET_XGROUP_DRAIN")
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false)
+            .map(|s| s.trim() != "0")
+            .unwrap_or(true)
     })
 }
 
 /// Refines `xgroup_drain_enabled`: skip the walk when more than half
-/// of in-group peers fired this park. Set
-/// `TOKIO_CHIPLET_XGROUP_DRAIN_GATED=1` to enable.
+/// of in-group peers fired this park. Default-on; set
+/// `TOKIO_CHIPLET_XGROUP_DRAIN_GATED=0` to disable.
 #[cfg(target_os = "linux")]
 fn xgroup_drain_gated_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("TOKIO_CHIPLET_XGROUP_DRAIN_GATED")
-            .map(|s| s.trim() == "1")
-            .unwrap_or(false)
+            .map(|s| s.trim() != "0")
+            .unwrap_or(true)
     })
 }
 
@@ -502,8 +502,8 @@ impl ShardedMioParker {
         //    microsecond) versus a >10µs wake cost — strictly
         //    profitable when any cross-group readiness exists.
         //
-        //    Gated by `TOKIO_CHIPLET_XGROUP_DRAIN=1` for clean A/B,
-        //    cached once via `OnceLock` to keep the hot park path
+        //    Default-on; `TOKIO_CHIPLET_XGROUP_DRAIN=0` disables.
+        //    Cached once via `OnceLock` to keep the hot park path
         //    free of `std::env::var` allocations.
         if xgroup_drain_enabled() && !self.in_group_too_busy_for_xgroup(group_idx, peer_mask) {
             const N_OTHER_GROUP_PEERS: usize = 64;
