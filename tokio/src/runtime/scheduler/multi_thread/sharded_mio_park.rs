@@ -65,6 +65,22 @@ pub(crate) fn current_worker_index() -> Option<usize> {
     CURRENT_WORKER.with(Cell::get)
 }
 
+/// Hierarchical chiplet tier-A: cross-group fallback drain in
+/// `park_on_meta`. Cached once at first park to keep
+/// `std::env::var` (which allocates) off the hot park path.
+///
+/// Set `TOKIO_CHIPLET_XGROUP_DRAIN=1` to enable.
+#[cfg(target_os = "linux")]
+fn xgroup_drain_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TOKIO_CHIPLET_XGROUP_DRAIN")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
 fn set_current_worker(idx: usize) {
     CURRENT_WORKER.with(|c| c.set(Some(idx)));
 }
@@ -450,6 +466,59 @@ impl ShardedMioParker {
         //    `epoll_wait`) on every quiescent peer.
         if peer_mask != 0 {
             self.steal_from_peers_masked(peer_mask);
+        }
+
+        // 3. Cross-group fallback drain (chiplet hierarchical-tier-A).
+        //    We just paid the wake cost (epoll_wait + futex +
+        //    ctxswitch). Amortize it by attempting non-blocking
+        //    drains on peers in *other* chiplet groups before
+        //    returning to the scheduler. `try_steal_drain` is
+        //    CAS-guarded against concurrent owner/stealer access
+        //    (see `steal_from_peers_masked` doc comment), so each
+        //    out-of-group attempt costs at most one atomic on a
+        //    miss. A hit dispatches readiness that another group's
+        //    quiescent meta-watcher would otherwise have had to
+        //    wake to handle — reducing the *aggregate* wake rate
+        //    across all groups.
+        //
+        //    Bound: scan up to N_OTHER_GROUP_PEERS workers, walking
+        //    in (self.idx + 1) round-robin, skipping in-group peers
+        //    (we already covered them above) and our own slot.
+        //    For W=64 this is ~48 atomics worst case (under one
+        //    microsecond) versus a >10µs wake cost — strictly
+        //    profitable when any cross-group readiness exists.
+        //
+        //    Gated by `TOKIO_CHIPLET_XGROUP_DRAIN=1` for clean A/B,
+        //    cached once via `OnceLock` to keep the hot park path
+        //    free of `std::env::var` allocations.
+        if xgroup_drain_enabled() {
+            const N_OTHER_GROUP_PEERS: usize = 64;
+            let workers = self.handle.workers();
+            let num_workers = workers.len();
+            if num_workers > 1 {
+                let mut scanned = 0usize;
+                let mut probe = (self.idx + 1) % num_workers;
+                while scanned < N_OTHER_GROUP_PEERS && scanned < num_workers {
+                    if probe != self.idx {
+                        if let Some(slot) = workers.get(probe) {
+                            // Skip in-group peers; we already
+                            // handled those via peer_mask.
+                            let g = slot
+                                .group_idx
+                                .load(std::sync::atomic::Ordering::Acquire);
+                            if g != group_idx && g != u8::MAX {
+                                if let Some(registry) =
+                                    slot.shared_registry.get()
+                                {
+                                    registry.try_steal_drain();
+                                }
+                            }
+                        }
+                    }
+                    probe = (probe + 1) % num_workers;
+                    scanned += 1;
+                }
+            }
         }
     }
 
