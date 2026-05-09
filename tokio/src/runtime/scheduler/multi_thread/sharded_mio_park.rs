@@ -81,20 +81,6 @@ fn xgroup_drain_enabled() -> bool {
     })
 }
 
-/// Refines `xgroup_drain_enabled`: skip the walk when more than half
-/// of in-group peers fired this park. Default-on; set
-/// `TOKIO_CHIPLET_XGROUP_DRAIN_GATED=0` to disable.
-#[cfg(target_os = "linux")]
-fn xgroup_drain_gated_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("TOKIO_CHIPLET_XGROUP_DRAIN_GATED")
-            .map(|s| s.trim() != "0")
-            .unwrap_or(true)
-    })
-}
-
 fn set_current_worker(idx: usize) {
     CURRENT_WORKER.with(|c| c.set(Some(idx)));
 }
@@ -536,16 +522,11 @@ impl ShardedMioParker {
         }
     }
 
-    /// `xgroup_drain_gated_enabled()` refinement: returns true when
-    /// the in-group `peer_mask` indicates more than half of the
-    /// group's members fired this park, so the cross-group walk
-    /// should be skipped to avoid pre-empting in-group dispatch.
-    /// No-op (returns false) unless the gated knob is set.
+    /// Returns true when the in-group `peer_mask` indicates more than
+    /// half of the group's members fired this park, so the cross-group
+    /// walk should be skipped to avoid pre-empting in-group dispatch.
     #[cfg(target_os = "linux")]
     fn in_group_too_busy_for_xgroup(&self, group_idx: u8, peer_mask: u128) -> bool {
-        if !xgroup_drain_gated_enabled() {
-            return false;
-        }
         let group_size = self.handle.group_member_count(group_idx) as u32;
         peer_mask.count_ones() > group_size / 2
     }
