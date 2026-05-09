@@ -81,6 +81,30 @@ fn xgroup_drain_enabled() -> bool {
     })
 }
 
+/// Refinement on tier-A: skip the cross-group drain walk when our own
+/// group's `peer_mask` indicates the group is busy enough that
+/// dispatching cross-group readiness would pre-empt useful in-group
+/// work. Threshold: `peer_mask.count_ones() > group_member_count / 2`.
+///
+/// Motivation: at small group sizes (e.g. lounas's 4-CCD layout, 4
+/// workers per group) the cross-group walk pays ~all-but-self atomics
+/// per park. When the in-group is already busy enough to keep the
+/// scheduler fed, those atomics are pure overhead — better to return
+/// to the scheduler and let the next park batch the cross-group help.
+///
+/// Set `TOKIO_CHIPLET_XGROUP_DRAIN_GATED=1` to enable. No-op unless
+/// `TOKIO_CHIPLET_XGROUP_DRAIN=1` is also set.
+#[cfg(target_os = "linux")]
+fn xgroup_drain_gated_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TOKIO_CHIPLET_XGROUP_DRAIN_GATED")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
 fn set_current_worker(idx: usize) {
     CURRENT_WORKER.with(|c| c.set(Some(idx)));
 }
@@ -491,7 +515,22 @@ impl ShardedMioParker {
         //    Gated by `TOKIO_CHIPLET_XGROUP_DRAIN=1` for clean A/B,
         //    cached once via `OnceLock` to keep the hot park path
         //    free of `std::env::var` allocations.
-        if xgroup_drain_enabled() {
+        // Refinement: when the in-group is already busy (more than
+        // half its members fired this park), skip the cross-group
+        // walk. The scheduler is about to be fed plenty of in-group
+        // work; spending extra atomics walking other groups would just
+        // delay returning to it. Closes the lounas W=4-6 residual
+        // observed in the cross-host sweep without affecting lourip
+        // (where 16-member groups rarely exceed half-busy under the
+        // benchmarked workloads).
+        let skip_xgroup_busy = xgroup_drain_gated_enabled() && {
+            let group_size =
+                self.handle.group_member_count(group_idx) as u32;
+            group_size >= 2
+                && peer_mask.count_ones() > group_size / 2
+        };
+
+        if xgroup_drain_enabled() && !skip_xgroup_busy {
             const N_OTHER_GROUP_PEERS: usize = 64;
             let workers = self.handle.workers();
             let num_workers = workers.len();
