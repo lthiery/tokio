@@ -474,6 +474,45 @@ impl<S: 'static> Notified<S> {
     pub(crate) fn task_id(&self) -> crate::task::Id {
         self.0.id()
     }
+
+    /// # Safety
+    ///
+    /// Must be called before the task is pushed to a queue. The queue's
+    /// synchronization provides happens-before to the subsequent read.
+    #[cfg(tokio_unstable)]
+    pub(crate) unsafe fn set_enqueued_at(&self, val: u64) {
+        unsafe { self.header().set_enqueued_at(val) }
+    }
+
+    /// # Safety
+    ///
+    /// Must be called after the task is popped from a queue. The queue's
+    /// synchronization provides happens-before from the preceding write.
+    #[cfg(tokio_unstable)]
+    pub(crate) unsafe fn get_enqueued_at(&self) -> u64 {
+        unsafe { self.header().get_enqueued_at() }
+    }
+
+    /// Computes the scheduling latency in nanoseconds for this task, if an
+    /// enqueue timestamp was recorded.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as [`get_enqueued_at`]: must be called after the
+    /// task is popped from a queue.
+    #[cfg(tokio_unstable)]
+    pub(crate) unsafe fn scheduling_latency_ns(
+        &self,
+        base: std::time::Instant,
+    ) -> Option<u64> {
+        let stored = unsafe { self.get_enqueued_at() };
+        if stored == 0 {
+            return None;
+        }
+        let enqueued_at = stored - 1;
+        let now = crate::runtime::metrics::duration_as_u64(base.elapsed());
+        Some(now.saturating_sub(enqueued_at))
+    }
 }
 
 impl<S: 'static> Notified<S> {

@@ -53,6 +53,10 @@ pub(crate) struct MetricsBatch {
     #[cfg(tokio_unstable)]
     /// If `Some`, tracks poll times in nanoseconds
     poll_timer: Option<PollTimer>,
+
+    #[cfg(tokio_unstable)]
+    /// If `Some`, tracks scheduling time (queue wait latency) in nanoseconds
+    scheduling_time_counts: Option<HistogramBatch>,
 }
 
 cfg_unstable_metrics! {
@@ -95,6 +99,10 @@ impl MetricsBatch {
                             poll_started_at: now,
                         })
                 });
+                let scheduling_time_counts = worker_metrics
+                    .scheduling_time_histogram
+                    .as_ref()
+                    .map(HistogramBatch::from_histogram);
                 MetricsBatch {
                     park_count: 0,
                     park_unpark_count: 0,
@@ -108,6 +116,7 @@ impl MetricsBatch {
                     busy_duration_total: 0,
                     processing_scheduled_tasks_started_at: maybe_now,
                     poll_timer,
+                    scheduling_time_counts,
                 }
             }
         }
@@ -154,6 +163,11 @@ impl MetricsBatch {
                 if let Some(poll_timer) = &self.poll_timer {
                     let dst = worker.poll_count_histogram.as_ref().unwrap();
                     poll_timer.poll_counts.submit(dst);
+                }
+
+                if let Some(scheduling_counts) = &self.scheduling_time_counts {
+                    let dst = worker.scheduling_time_histogram.as_ref().unwrap();
+                    scheduling_counts.submit(dst);
                 }
             }
         }
@@ -231,6 +245,14 @@ impl MetricsBatch {
                     let elapsed = duration_as_u64(poll_timer.poll_started_at.elapsed());
                     poll_timer.poll_counts.measure(elapsed, 1);
                 }
+            }
+        }
+    }
+
+    cfg_unstable_metrics! {
+        pub(crate) fn record_scheduling_time(&mut self, elapsed_ns: u64) {
+            if let Some(scheduling_counts) = &mut self.scheduling_time_counts {
+                scheduling_counts.measure(elapsed_ns, 1);
             }
         }
     }

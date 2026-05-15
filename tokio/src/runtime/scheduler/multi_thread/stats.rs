@@ -123,6 +123,11 @@ impl Stats {
         self.batch.end_poll();
     }
 
+    #[cfg(tokio_unstable)]
+    pub(crate) fn record_scheduling_time(&mut self, elapsed_ns: u64) {
+        self.batch.record_scheduling_time(elapsed_ns);
+    }
+
     pub(crate) fn incr_steal_count(&mut self, by: u16) {
         self.batch.incr_steal_count(by);
     }

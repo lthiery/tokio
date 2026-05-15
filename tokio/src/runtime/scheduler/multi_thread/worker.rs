@@ -75,6 +75,8 @@ use std::cell::RefCell;
 use std::task::Waker;
 use std::thread;
 use std::time::Duration;
+#[cfg(tokio_unstable)]
+use std::time::Instant;
 
 mod metrics;
 
@@ -202,6 +204,11 @@ pub(crate) struct Shared {
 
     pub(super) worker_metrics: Box<[WorkerMetrics]>,
 
+    /// Base instant for computing scheduling time timestamps. `None` when
+    /// the scheduling time histogram is not enabled.
+    #[cfg(tokio_unstable)]
+    scheduling_time_base: Option<Instant>,
+
     /// Only held to trigger some code on drop. This is used to get internal
     /// runtime metrics that can be useful when doing performance
     /// investigations. This does nothing (empty struct, no drop impl) unless
@@ -313,6 +320,14 @@ pub(super) fn create(
     let (inject, inject_synced) = inject::Shared::new();
 
     let remotes_len = remotes.len();
+
+    #[cfg(tokio_unstable)]
+    let scheduling_time_base = if config.metrics_scheduling_time_histogram.is_some() {
+        Some(Instant::now())
+    } else {
+        None
+    };
+
     let handle = Arc::new(Handle {
         name,
         task_hooks: TaskHooks::from_config(&config),
@@ -332,6 +347,8 @@ pub(super) fn create(
             config,
             scheduler_metrics: SchedulerMetrics::new(),
             worker_metrics: worker_metrics.into_boxed_slice(),
+            #[cfg(tokio_unstable)]
+            scheduling_time_base,
             _counters: Counters,
         },
         driver: driver_handle,
@@ -631,6 +648,16 @@ impl Context {
         #[cfg(tokio_unstable)]
         let task_meta = task.task_meta();
 
+        #[cfg(tokio_unstable)]
+        if let Some(base) = self.worker.handle.shared.scheduling_time_base {
+            // Safety: called after the task was popped from a queue. The
+            // queue pop provides Acquire ordering that pairs with the
+            // Release on push, ensuring the enqueued_at write is visible.
+            if let Some(elapsed) = unsafe { task.scheduling_latency_ns(base) } {
+                core.stats.record_scheduling_time(elapsed);
+            }
+        }
+
         let task = self.worker.handle.shared.owned.assert_owner(task);
 
         // Make sure the worker is not in the **searching** state. This enables
@@ -717,7 +744,9 @@ impl Context {
                     core.stats.end_poll();
 
                     // Not enough budget left to run the LIFO task, push it to
-                    // the back of the queue and return.
+                    // the back of the queue and return. Keep the original
+                    // enqueued_at timestamp so scheduling latency includes the
+                    // time already spent in the LIFO slot.
                     core.run_queue.push_back_or_overflow(
                         task,
                         &*self.worker.handle,
@@ -743,6 +772,16 @@ impl Context {
                 if lifo_polls >= MAX_LIFO_POLLS_PER_TICK {
                     core.lifo_enabled = false;
                     super::counters::inc_lifo_capped();
+                }
+
+                // Record scheduling time for the LIFO task
+                #[cfg(tokio_unstable)]
+                if let Some(base) = self.worker.handle.shared.scheduling_time_base {
+                    // Safety: the LIFO slot is only accessed by the owning
+                    // worker thread — set before store, read after take.
+                    if let Some(elapsed) = unsafe { task.scheduling_latency_ns(base) } {
+                        core.stats.record_scheduling_time(elapsed);
+                    }
                 }
 
                 // Run the LIFO task, then loop
@@ -1325,6 +1364,9 @@ impl Worker {
 
 impl Handle {
     pub(super) fn schedule_task(&self, task: Notified, is_yield: bool) {
+        #[cfg(tokio_unstable)]
+        self.stamp_enqueue_time(&task);
+
         with_current(|maybe_cx| {
             if let Some(cx) = maybe_cx {
                 // Make sure the task is part of the **current** scheduler.
@@ -1347,6 +1389,17 @@ impl Handle {
     pub(super) fn schedule_option_task_without_yield(&self, task: Option<Notified>) {
         if let Some(task) = task {
             self.schedule_task(task, false);
+        }
+    }
+
+    #[cfg(tokio_unstable)]
+    fn stamp_enqueue_time(&self, task: &Notified) {
+        if let Some(base) = self.shared.scheduling_time_base {
+            let nanos = crate::runtime::metrics::duration_as_u64(base.elapsed());
+            // Safety: called before the task is pushed to any queue. The
+            // queue push provides Release ordering that pairs with the
+            // Acquire on pop, ensuring the write is visible to the reader.
+            unsafe { task.set_enqueued_at(nanos.saturating_add(1)) };
         }
     }
 

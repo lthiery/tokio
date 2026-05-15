@@ -13,6 +13,8 @@ pub use runtime::RuntimeMetrics;
 
 mod batch;
 pub(crate) use batch::MetricsBatch;
+#[cfg(tokio_unstable)]
+pub(crate) use batch::duration_as_u64;
 
 mod worker;
 pub(crate) use worker::WorkerMetrics;

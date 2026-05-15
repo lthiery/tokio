@@ -20,6 +20,8 @@ use std::task::Poll::{Pending, Ready};
 use std::task::Waker;
 use std::thread::ThreadId;
 use std::time::Duration;
+#[cfg(tokio_unstable)]
+use std::time::Instant;
 use std::{fmt, thread};
 
 /// Executes tasks on the current thread
@@ -100,6 +102,10 @@ struct Shared {
 
     /// This scheduler only has one worker.
     worker_metrics: WorkerMetrics,
+
+    /// Base instant for computing scheduling time timestamps.
+    #[cfg(tokio_unstable)]
+    scheduling_time_base: Option<Instant>,
 }
 
 /// Thread-local context.
@@ -145,6 +151,13 @@ impl CurrentThread {
             .global_queue_interval
             .unwrap_or(DEFAULT_GLOBAL_QUEUE_INTERVAL);
 
+        #[cfg(tokio_unstable)]
+        let scheduling_time_base = if config.metrics_scheduling_time_histogram.is_some() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+
         let handle = Arc::new(Handle {
             name,
             task_hooks: TaskHooks {
@@ -159,6 +172,8 @@ impl CurrentThread {
                 inject: Inject::new(),
                 owned: OwnedTasks::new(1),
                 woken: AtomicBool::new(false),
+                #[cfg(tokio_unstable)]
+                scheduling_time_base,
                 config,
                 scheduler_metrics: SchedulerMetrics::new(),
                 worker_metrics,
@@ -342,6 +357,14 @@ impl Core {
     }
 
     fn push_task(&mut self, handle: &Handle, task: Notified) {
+        #[cfg(tokio_unstable)]
+        if let Some(base) = handle.shared.scheduling_time_base {
+            let nanos = crate::runtime::metrics::duration_as_u64(base.elapsed());
+            // Safety: called before push_back. Single-threaded scheduler
+            // ensures no concurrent access.
+            unsafe { task.set_enqueued_at(nanos.saturating_add(1)) };
+        }
+
         self.tasks.push_back(task);
         self.metrics.inc_local_schedule_count();
         handle
@@ -680,6 +703,14 @@ impl Schedule for Arc<Handle> {
                 // Track that a task was scheduled from **outside** of the runtime.
                 self.shared.scheduler_metrics.inc_remote_schedule_count();
 
+                #[cfg(tokio_unstable)]
+                if let Some(base) = self.shared.scheduling_time_base {
+                    let nanos = crate::runtime::metrics::duration_as_u64(base.elapsed());
+                    // Safety: called before inject.push. The inject queue's
+                    // internal mutex provides happens-before to the reader.
+                    unsafe { task.set_enqueued_at(nanos.saturating_add(1)) };
+                }
+
                 // Schedule the task
                 self.shared.inject.push(task);
                 self.driver.unpark();
@@ -812,6 +843,16 @@ impl CoreGuard<'_> {
                             continue 'outer;
                         }
                     };
+
+                    #[cfg(tokio_unstable)]
+                    if let Some(base) = handle.shared.scheduling_time_base {
+                        // Safety: called after next_task() popped the task.
+                        // Single-threaded scheduler ensures no concurrent access;
+                        // for inject queue tasks the mutex provides happens-before.
+                        if let Some(elapsed) = unsafe { task.scheduling_latency_ns(base) } {
+                            core.metrics.record_scheduling_time(elapsed);
+                        }
+                    }
 
                     let task = context.handle.shared.owned.assert_owner(task);
 

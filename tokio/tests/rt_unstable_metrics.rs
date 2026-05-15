@@ -839,6 +839,113 @@ fn threaded() -> Runtime {
         .unwrap()
 }
 
+#[test]
+fn scheduling_time_histogram_disabled_by_default() {
+    for rt in [current_thread(), threaded()] {
+        let metrics = rt.metrics();
+        assert!(!metrics.scheduling_time_histogram_enabled());
+        assert!(!metrics.poll_time_histogram_enabled());
+    }
+}
+
+#[test]
+fn scheduling_time_histogram_spawned_tasks() {
+    const N: u64 = 50;
+
+    let rts = [
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .enable_metrics_scheduling_time_histogram()
+            .metrics_scheduling_time_histogram_configuration(HistogramConfiguration::log(
+                LogHistogram::default(),
+            ))
+            .build()
+            .unwrap(),
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .enable_metrics_scheduling_time_histogram()
+            .metrics_scheduling_time_histogram_configuration(HistogramConfiguration::log(
+                LogHistogram::default(),
+            ))
+            .build()
+            .unwrap(),
+    ];
+
+    for rt in rts {
+        let metrics = rt.metrics();
+        assert!(metrics.scheduling_time_histogram_enabled());
+
+        rt.block_on(async {
+            let handles: Vec<_> = (0..N).map(|_| tokio::spawn(async {})).collect();
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+        drop(rt);
+
+        let num_buckets = metrics.scheduling_time_histogram_num_buckets();
+        let total: u64 = (0..metrics.num_workers())
+            .flat_map(|w| (0..num_buckets).map(move |b| (w, b)))
+            .map(|(w, b)| metrics.scheduling_time_histogram_bucket_count(w, b))
+            .sum();
+        assert_eq!(N, total);
+    }
+}
+
+#[test]
+fn scheduling_time_histogram_counts_each_poll() {
+    const N: u64 = 10;
+
+    let rts = [
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .enable_metrics_scheduling_time_histogram()
+            .metrics_scheduling_time_histogram_configuration(HistogramConfiguration::log(
+                LogHistogram::default(),
+            ))
+            .build()
+            .unwrap(),
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .enable_metrics_scheduling_time_histogram()
+            .metrics_scheduling_time_histogram_configuration(HistogramConfiguration::log(
+                LogHistogram::default(),
+            ))
+            .build()
+            .unwrap(),
+    ];
+
+    for rt in rts {
+        let metrics = rt.metrics();
+
+        rt.block_on(async {
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    tokio::spawn(async {
+                        tokio::task::yield_now().await;
+                        tokio::task::yield_now().await;
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+        drop(rt);
+
+        // Each task is polled 3 times (initial + 2 yields), and each poll
+        // records one scheduling-time sample.
+        let num_buckets = metrics.scheduling_time_histogram_num_buckets();
+        let total: u64 = (0..metrics.num_workers())
+            .flat_map(|w| (0..num_buckets).map(move |b| (w, b)))
+            .map(|(w, b)| metrics.scheduling_time_histogram_bucket_count(w, b))
+            .sum();
+        assert_eq!(3 * N, total);
+    }
+}
+
 fn threaded_no_lifo() -> Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

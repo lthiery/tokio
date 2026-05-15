@@ -138,6 +138,12 @@ pub struct Builder {
     /// Configures the task poll count histogram
     pub(super) metrics_poll_count_histogram: HistogramBuilder,
 
+    /// When true, enables scheduling time histogram instrumentation.
+    pub(super) metrics_scheduling_time_histogram_enable: bool,
+
+    /// Configures the scheduling time histogram
+    pub(super) metrics_scheduling_time_histogram: HistogramBuilder,
+
     #[cfg(tokio_unstable)]
     pub(super) unhandled_panic: UnhandledPanic,
 
@@ -334,6 +340,10 @@ impl Builder {
             metrics_poll_count_histogram_enable: false,
 
             metrics_poll_count_histogram: HistogramBuilder::default(),
+
+            metrics_scheduling_time_histogram_enable: false,
+
+            metrics_scheduling_time_histogram: HistogramBuilder::default(),
 
             disable_lifo_slot: false,
 
@@ -1631,6 +1641,44 @@ impl Builder {
             self.metrics_poll_count_histogram.legacy_mut(|b|b.num_buckets = buckets);
             self
         }
+
+        /// Enables tracking the distribution of task scheduling times using a
+        /// histogram.
+        ///
+        /// Scheduling time is the duration between when a task becomes ready
+        /// (enqueued into a run queue) and when it is picked up by a worker
+        /// thread to be polled. This measures queue wait time / scheduling
+        /// latency.
+        ///
+        /// This metric is independent of the poll time histogram and can be
+        /// enabled separately. The time scales may differ significantly:
+        /// scheduling times are typically microseconds while poll times can be
+        /// milliseconds.
+        ///
+        /// # Default
+        ///
+        /// By default, uses a linear histogram (10 buckets, 100μs resolution).
+        /// Use [`metrics_scheduling_time_histogram_configuration()`] to
+        /// customize — a logarithmic histogram is recommended for scheduling
+        /// times since they can span several orders of magnitude.
+        ///
+        /// [`metrics_scheduling_time_histogram_configuration()`]: Builder::metrics_scheduling_time_histogram_configuration
+        pub fn enable_metrics_scheduling_time_histogram(&mut self) -> &mut Self {
+            self.metrics_scheduling_time_histogram_enable = true;
+            self
+        }
+
+        /// Configure the histogram for tracking scheduling times.
+        ///
+        /// This method only sets histogram parameters. The histogram is not
+        /// active unless [`enable_metrics_scheduling_time_histogram()`] is
+        /// also called.
+        ///
+        /// [`enable_metrics_scheduling_time_histogram()`]: Builder::enable_metrics_scheduling_time_histogram
+        pub fn metrics_scheduling_time_histogram_configuration(&mut self, configuration: HistogramConfiguration) -> &mut Self {
+            self.metrics_scheduling_time_histogram.histogram_type = configuration.inner;
+            self
+        }
     }
 
     fn build_current_thread_runtime(&mut self) -> io::Result<Runtime> {
@@ -1709,6 +1757,7 @@ impl Builder {
                 enable_eager_driver_handoff: false,
                 seed_generator: seed_generator_1,
                 metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
+                metrics_scheduling_time_histogram: self.metrics_scheduling_time_histogram_builder(),
             },
             local_tid,
             self.name.clone(),
@@ -1724,6 +1773,14 @@ impl Builder {
     fn metrics_poll_count_histogram_builder(&self) -> Option<HistogramBuilder> {
         if self.metrics_poll_count_histogram_enable {
             Some(self.metrics_poll_count_histogram.clone())
+        } else {
+            None
+        }
+    }
+
+    fn metrics_scheduling_time_histogram_builder(&self) -> Option<HistogramBuilder> {
+        if self.metrics_scheduling_time_histogram_enable {
+            Some(self.metrics_scheduling_time_histogram.clone())
         } else {
             None
         }
@@ -1892,6 +1949,7 @@ cfg_rt_multi_thread! {
                     enable_eager_driver_handoff: self.enable_eager_driver_handoff,
                     seed_generator: seed_generator_1,
                     metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
+                    metrics_scheduling_time_histogram: self.metrics_scheduling_time_histogram_builder(),
                 },
                 self.timer_flavor,
                 self.name.clone(),

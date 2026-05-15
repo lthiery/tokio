@@ -191,6 +191,11 @@ pub(crate) struct Header {
     /// The tracing ID for this instrumented task.
     #[cfg(all(tokio_unstable, feature = "tracing"))]
     pub(super) tracing_id: Option<tracing::Id>,
+
+    /// Timestamp (nanos since scheduler base instant) when this task was last
+    /// enqueued into a run queue. Used to measure scheduling latency.
+    #[cfg(tokio_unstable)]
+    pub(crate) enqueued_at: UnsafeCell<u64>,
 }
 
 unsafe impl Send for Header {}
@@ -247,6 +252,8 @@ impl<T: Future, S: Schedule> Cell<T, S> {
                 owner_id: UnsafeCell::new(None),
                 #[cfg(all(tokio_unstable, feature = "tracing"))]
                 tracing_id,
+                #[cfg(tokio_unstable)]
+                enqueued_at: UnsafeCell::new(0),
             }
         }
 
@@ -534,6 +541,41 @@ impl Header {
     pub(super) unsafe fn get_tracing_id(me: &NonNull<Header>) -> Option<&tracing::Id> {
         me.as_ref().tracing_id.as_ref()
     }
+
+    /// # Safety
+    ///
+    /// The caller must ensure no concurrent access to `enqueued_at`. The write
+    /// must happen before the task is pushed onto a run queue, so that the
+    /// queue's synchronization establishes happens-before to the matching
+    /// `get_enqueued_at` after the corresponding pop. The producer of that
+    /// happens-before edge depends on which scheduler/queue the task takes:
+    ///
+    /// - **Current-thread runtime, local queue:** the queue is a plain
+    ///   `VecDeque` owned by the single scheduler thread. Producer and
+    ///   consumer are the same thread, so no atomic synchronization is needed.
+    /// - **Multi-thread runtime, worker-local queue:** a lock-free MPSC ring
+    ///   buffer (see `scheduler/multi_thread/queue.rs`). The push uses a
+    ///   `Release` store of `tail`; the owning worker's pop and any thief's
+    ///   steal use `Acquire` loads of `tail`, which synchronize-with the
+    ///   producer's write of `enqueued_at`.
+    /// - **Inject queue (both schedulers):** guarded by a `Mutex`. Lock
+    ///   release on push synchronizes-with lock acquire on pop.
+    #[cfg(tokio_unstable)]
+    pub(crate) unsafe fn set_enqueued_at(&self, val: u64) {
+        self.enqueued_at.with_mut(|ptr| *ptr = val);
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure no concurrent access to `enqueued_at`. The read
+    /// must happen after the task has been popped from the run queue it was
+    /// pushed onto in `set_enqueued_at`; the queue's synchronization (see that
+    /// function's docs for per-queue details) provides happens-before from
+    /// the preceding write.
+    #[cfg(tokio_unstable)]
+    pub(crate) unsafe fn get_enqueued_at(&self) -> u64 {
+        self.enqueued_at.with(|ptr| *ptr)
+    }
 }
 
 impl Trailer {
@@ -567,5 +609,16 @@ impl Trailer {
 #[test]
 #[cfg(not(loom))]
 fn header_lte_cache_line() {
-    assert!(std::mem::size_of::<Header>() <= 8 * std::mem::size_of::<*const ()>());
+    #[cfg(not(tokio_unstable))]
+    const LIMIT: usize = 4 * std::mem::size_of::<*const ()>();
+
+    #[cfg(tokio_unstable)]
+    const LIMIT: usize = 8 * std::mem::size_of::<*const ()>();
+
+    assert!(
+        std::mem::size_of::<Header>() <= LIMIT,
+        "Header size {} exceeds limit {}",
+        std::mem::size_of::<Header>(),
+        LIMIT,
+    );
 }

@@ -1027,6 +1027,197 @@ impl RuntimeMetrics {
                 .load(Relaxed);
             Duration::from_nanos(nanos)
         }
+
+        /// Returns `true` if the runtime is tracking the distribution of task
+        /// scheduling times.
+        ///
+        /// Task scheduling times are not instrumented by default as doing so
+        /// requires calling [`Instant::now()`] at each task enqueue and dequeue.
+        /// The feature is enabled by calling
+        /// [`enable_metrics_scheduling_time_histogram()`] when building the
+        /// runtime.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use tokio::runtime::{self, Handle};
+        ///
+        /// fn main() {
+        ///     runtime::Builder::new_current_thread()
+        ///         .enable_metrics_scheduling_time_histogram()
+        ///         .build()
+        ///         .unwrap()
+        ///         .block_on(async {
+        ///             let metrics = Handle::current().metrics();
+        ///             let enabled = metrics.scheduling_time_histogram_enabled();
+        ///
+        ///             println!("Tracking task scheduling time distribution: {:?}", enabled);
+        ///         });
+        /// }
+        /// ```
+        ///
+        /// [`enable_metrics_scheduling_time_histogram()`]: crate::runtime::Builder::enable_metrics_scheduling_time_histogram
+        /// [`Instant::now()`]: std::time::Instant::now
+        pub fn scheduling_time_histogram_enabled(&self) -> bool {
+            self.handle
+                .inner
+                .worker_metrics(0)
+                .scheduling_time_histogram
+                .is_some()
+        }
+
+        /// Returns the number of histogram buckets tracking the distribution of
+        /// task scheduling times.
+        ///
+        /// This value is configured by calling
+        /// [`metrics_scheduling_time_histogram_configuration()`] when building the runtime.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use tokio::runtime::{self, Handle};
+        ///
+        /// fn main() {
+        ///     runtime::Builder::new_current_thread()
+        ///         .enable_metrics_scheduling_time_histogram()
+        ///         .build()
+        ///         .unwrap()
+        ///         .block_on(async {
+        ///             let metrics = Handle::current().metrics();
+        ///             let buckets = metrics.scheduling_time_histogram_num_buckets();
+        ///
+        ///             println!("Histogram buckets: {:?}", buckets);
+        ///         });
+        /// }
+        /// ```
+        ///
+        /// [`metrics_scheduling_time_histogram_configuration()`]:
+        ///     crate::runtime::Builder::metrics_scheduling_time_histogram_configuration
+        pub fn scheduling_time_histogram_num_buckets(&self) -> usize {
+            self.handle
+                .inner
+                .worker_metrics(0)
+                .scheduling_time_histogram
+                .as_ref()
+                .map(|histogram| histogram.num_buckets())
+                .unwrap_or_default()
+        }
+
+        /// Returns the range of task scheduling times tracked by the given bucket.
+        ///
+        /// This value is configured by calling
+        /// [`metrics_scheduling_time_histogram_configuration()`] when building the runtime.
+        ///
+        /// # Panics
+        ///
+        /// The method panics if `bucket` represents an invalid bucket index, i.e.
+        /// is greater than or equal to `scheduling_time_histogram_num_buckets()`.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use tokio::runtime::{self, Handle};
+        ///
+        /// fn main() {
+        ///     runtime::Builder::new_current_thread()
+        ///         .enable_metrics_scheduling_time_histogram()
+        ///         .build()
+        ///         .unwrap()
+        ///         .block_on(async {
+        ///             let metrics = Handle::current().metrics();
+        ///             let buckets = metrics.scheduling_time_histogram_num_buckets();
+        ///
+        ///             for i in 0..buckets {
+        ///                 let range = metrics.scheduling_time_histogram_bucket_range(i);
+        ///                 println!("Histogram bucket {} range: {:?}", i, range);
+        ///             }
+        ///         });
+        /// }
+        /// ```
+        ///
+        /// [`metrics_scheduling_time_histogram_configuration()`]:
+        ///     crate::runtime::Builder::metrics_scheduling_time_histogram_configuration
+        #[track_caller]
+        pub fn scheduling_time_histogram_bucket_range(&self, bucket: usize) -> Range<Duration> {
+            self.handle
+                .inner
+                .worker_metrics(0)
+                .scheduling_time_histogram
+                .as_ref()
+                .map(|histogram| {
+                    let range = histogram.bucket_range(bucket);
+                    std::ops::Range {
+                        start: Duration::from_nanos(range.start),
+                        end: Duration::from_nanos(range.end),
+                    }
+                })
+                .unwrap_or_default()
+        }
+
+        /// Returns the number of tasks dequeued by the given worker whose
+        /// scheduling latency fell within the given bucket's range.
+        ///
+        /// Each worker maintains its own histogram and the counts for each bucket
+        /// starts at zero when the runtime is created. Each time a worker dequeues
+        /// a task, it tracks the scheduling latency and increments the associated
+        /// bucket by 1.
+        ///
+        /// Each bucket is a monotonically increasing counter. It is never
+        /// decremented or reset to zero.
+        ///
+        /// # Arguments
+        ///
+        /// `worker` is the index of the worker being queried. The given value must
+        /// be between 0 and `num_workers()`. The index uniquely identifies a single
+        /// worker and will continue to identify the worker throughout the lifetime
+        /// of the runtime instance.
+        ///
+        /// `bucket` is the index of the bucket being queried. The bucket is scoped
+        /// to the worker. The range represented by the bucket can be queried by
+        /// calling [`scheduling_time_histogram_bucket_range()`]. Each worker
+        /// maintains identical bucket ranges.
+        ///
+        /// # Panics
+        ///
+        /// The method panics when `worker` represents an invalid worker, i.e. is
+        /// greater than or equal to `num_workers()` or if `bucket` represents an
+        /// invalid bucket.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// use tokio::runtime::{self, Handle};
+        ///
+        /// fn main() {
+        ///     runtime::Builder::new_current_thread()
+        ///         .enable_metrics_scheduling_time_histogram()
+        ///         .build()
+        ///         .unwrap()
+        ///         .block_on(async {
+        ///             let metrics = Handle::current().metrics();
+        ///             let buckets = metrics.scheduling_time_histogram_num_buckets();
+        ///
+        ///             for worker in 0..metrics.num_workers() {
+        ///                 for i in 0..buckets {
+        ///                     let count = metrics.scheduling_time_histogram_bucket_count(worker, i);
+        ///                     println!("Scheduling count {}", count);
+        ///                 }
+        ///             }
+        ///         });
+        /// }
+        /// ```
+        ///
+        /// [`scheduling_time_histogram_bucket_range()`]: crate::runtime::RuntimeMetrics::scheduling_time_histogram_bucket_range
+        #[track_caller]
+        pub fn scheduling_time_histogram_bucket_count(&self, worker: usize, bucket: usize) -> u64 {
+            self.handle
+                .inner
+                .worker_metrics(worker)
+                .scheduling_time_histogram
+                .as_ref()
+                .map(|histogram| histogram.get(bucket))
+                .unwrap_or_default()
+        }
     }
 
     feature! {
