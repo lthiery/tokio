@@ -57,8 +57,9 @@ pub(crate) struct Handle {
     /// the runtime selected a non-traditional flavor — currently
     /// `IoFlavor::UringPerWorker` (built from
     /// [`IoDriver::from_uring`][fu]) or `IoFlavor::ShardedMio` (built
-    /// from [`IoDriver::from_sharded_mio`][fs]) — and `None` for
-    /// `IoFlavor::Traditional`.
+    /// from [`IoDriver::from_sharded_mio`][fs], `LEGACY_MIO_VTABLE`
+    /// from [`IoDriver::from_legacy_mio`][fl]) — and `None` only for
+    /// io-disabled runtimes.
     ///
     /// Kept on the scheduler handle (rather than on `driver::Handle`)
     /// so that `Registration::ensure_registered` can reach it on first
@@ -69,10 +70,18 @@ pub(crate) struct Handle {
     ///
     /// [fu]: crate::runtime::io::io_driver::IoDriver::from_uring
     /// [fs]: crate::runtime::io::io_driver::IoDriver::from_sharded_mio
-    #[cfg(all(
-        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-        feature = "rt-multi-thread",
-        target_os = "linux",
+    /// [fl]: crate::runtime::io::io_driver::IoDriver::from_legacy_mio
+    #[cfg(any(
+        feature = "net",
+        all(unix, feature = "process"),
+        all(unix, feature = "signal"),
+        all(
+            tokio_unstable,
+            feature = "io-uring",
+            feature = "rt",
+            feature = "fs",
+            target_os = "linux"
+        )
     ))]
     pub(crate) io_driver: Option<crate::runtime::io::io_driver::IoDriver>,
 

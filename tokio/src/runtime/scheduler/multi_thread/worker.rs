@@ -386,6 +386,47 @@ pub(super) fn create(
     let (inject, inject_synced) = inject::Shared::new();
 
     let remotes_len = remotes.len();
+
+    // Backend-agnostic `IoDriver` (manual vtable) shared with the
+    // scheduler handle. Computed before `Arc::new(Handle { .. })` to
+    // avoid moving `driver_handle` before the legacy-mio arm reads
+    // its `io` field.
+    #[cfg(any(
+        feature = "net",
+        all(unix, feature = "process"),
+        all(unix, feature = "signal"),
+        all(
+            tokio_unstable,
+            feature = "io-uring",
+            feature = "rt",
+            feature = "fs",
+            target_os = "linux"
+        )
+    ))]
+    let io_driver = match io_flavor {
+        IoFlavor::Traditional => driver_handle
+            .io
+            .clone_arc()
+            .map(crate::runtime::io::io_driver::IoDriver::from_legacy_mio),
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        IoFlavor::UringPerWorker => uring_handle.as_ref().map(|h| {
+            crate::runtime::io::io_driver::IoDriver::from_uring(std::sync::Arc::clone(h))
+        }),
+        #[cfg(all(
+            feature = "io-sharded-mio",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        IoFlavor::ShardedMio => sharded_mio_handle.as_ref().map(|h| {
+            crate::runtime::io::io_driver::IoDriver::from_sharded_mio(std::sync::Arc::clone(h))
+        }),
+    };
+
     let handle = Arc::new(Handle {
         name,
         task_hooks: TaskHooks::from_config(&config),
@@ -412,31 +453,19 @@ pub(super) fn create(
         seed_generator,
         timer_flavor,
         io_flavor,
-        #[cfg(all(
-        any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-        io_driver: match io_flavor {
-            IoFlavor::Traditional => None,
-            #[cfg(all(
+        #[cfg(any(
+            feature = "net",
+            all(unix, feature = "process"),
+            all(unix, feature = "signal"),
+            all(
                 tokio_unstable,
-                feature = "io-uring-reactor",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
-            IoFlavor::UringPerWorker => uring_handle.as_ref().map(|h| {
-                crate::runtime::io::io_driver::IoDriver::from_uring(std::sync::Arc::clone(h))
-            }),
-            #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-            IoFlavor::ShardedMio => sharded_mio_handle.as_ref().map(|h| {
-                crate::runtime::io::io_driver::IoDriver::from_sharded_mio(std::sync::Arc::clone(h))
-            }),
-        },
+                feature = "io-uring",
+                feature = "rt",
+                feature = "fs",
+                target_os = "linux"
+            )
+        ))]
+        io_driver,
         #[cfg(feature = "rt-alt-timer")]
         is_shutdown: AtomicBool::new(false),
     });
