@@ -54,6 +54,26 @@ pub(crate) struct Handle {
 
     /// If this is a `LocalRuntime`, flags the owning thread ID.
     pub(crate) local_tid: Option<ThreadId>,
+
+    /// Backend-agnostic I/O driver. Current_thread runtimes are
+    /// always `IoFlavor::Traditional` (no per-worker backends), so
+    /// this carries `LEGACY_MIO_VTABLE` whenever io is enabled, and
+    /// `None` only for io-disabled runtimes. Lets the `Registration`
+    /// lazy first-poll path route through the same vtable for both
+    /// scheduler flavors. See `tokio/docs/io-driver-vtable.md`.
+    #[cfg(any(
+        feature = "net",
+        all(unix, feature = "process"),
+        all(unix, feature = "signal"),
+        all(
+            tokio_unstable,
+            feature = "io-uring",
+            feature = "rt",
+            feature = "fs",
+            target_os = "linux"
+        )
+    ))]
+    pub(crate) io_driver: Option<crate::runtime::io::io_driver::IoDriver>,
 }
 
 /// Data required for executing the scheduler. The struct is passed around to
@@ -145,6 +165,26 @@ impl CurrentThread {
             .global_queue_interval
             .unwrap_or(DEFAULT_GLOBAL_QUEUE_INTERVAL);
 
+        // Built before `Arc::new(Handle { .. })` because the
+        // legacy-mio arm reads `driver_handle.io` before
+        // `driver_handle` is moved into the `driver:` field.
+        #[cfg(any(
+            feature = "net",
+            all(unix, feature = "process"),
+            all(unix, feature = "signal"),
+            all(
+                tokio_unstable,
+                feature = "io-uring",
+                feature = "rt",
+                feature = "fs",
+                target_os = "linux"
+            )
+        ))]
+        let io_driver = driver_handle
+            .io
+            .clone_arc()
+            .map(crate::runtime::io::io_driver::IoDriver::from_legacy_mio);
+
         let handle = Arc::new(Handle {
             name,
             task_hooks: TaskHooks {
@@ -167,6 +207,19 @@ impl CurrentThread {
             blocking_spawner,
             seed_generator,
             local_tid,
+            #[cfg(any(
+                feature = "net",
+                all(unix, feature = "process"),
+                all(unix, feature = "signal"),
+                all(
+                    tokio_unstable,
+                    feature = "io-uring",
+                    feature = "rt",
+                    feature = "fs",
+                    target_os = "linux"
+                )
+            ))]
+            io_driver,
         });
 
         let core = AtomicCell::new(Some(Box::new(Core {

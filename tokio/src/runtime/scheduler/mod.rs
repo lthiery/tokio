@@ -67,16 +67,15 @@ impl Handle {
     }
 
     /// The shared per-worker `io_uring` reactor handle, if the runtime was
-    /// Backend-agnostic I/O driver. Returns `Some` on every io-enabled
-    /// multi-thread runtime regardless of the selected `IoFlavor`:
-    /// `IoFlavor::Traditional` carries `LEGACY_MIO_VTABLE`,
-    /// `enable_uring_reactor()` carries `URING_VTABLE`, and
-    /// `enable_sharded_mio()` carries `SHARDED_MIO_VTABLE`. Returns
-    /// `None` only for io-disabled runtimes and current-thread
-    /// runtimes (current-thread does not own a vtable yet). Used by
-    /// [`crate::runtime::io::Registration`] to route fd registration
-    /// and deregistration through a single vtable call regardless of
-    /// which backend is selected.
+    /// Backend-agnostic I/O driver. Returns `Some` on every
+    /// io-enabled runtime regardless of scheduler flavor:
+    /// multi-thread + `IoFlavor::Traditional` and current-thread
+    /// carry `LEGACY_MIO_VTABLE`, `enable_uring_reactor()` carries
+    /// `URING_VTABLE`, and `enable_sharded_mio()` carries
+    /// `SHARDED_MIO_VTABLE`. Returns `None` only for io-disabled
+    /// runtimes. Used by [`crate::runtime::io::Registration`] to
+    /// route fd registration and deregistration through a single
+    /// vtable call regardless of which backend is selected.
     #[cfg(any(
         feature = "net",
         all(unix, feature = "process"),
@@ -94,7 +93,7 @@ impl Handle {
     ) -> Option<&crate::runtime::io::io_driver::IoDriver> {
         match self {
             #[cfg(feature = "rt")]
-            Handle::CurrentThread(_) => None,
+            Handle::CurrentThread(h) => h.io_driver.as_ref(),
             #[cfg(feature = "rt-multi-thread")]
             Handle::MultiThread(h) => h.io_driver.as_ref(),
             #[cfg(not(feature = "rt"))]
