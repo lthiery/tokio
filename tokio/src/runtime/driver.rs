@@ -153,7 +153,7 @@ cfg_io_driver! {
 
     #[derive(Debug)]
     pub(crate) enum IoHandle {
-        Enabled(crate::runtime::io::Handle),
+        Enabled(crate::loom::sync::Arc<crate::runtime::io::Handle>),
         Disabled(UnparkThread),
     }
 
@@ -163,6 +163,7 @@ cfg_io_driver! {
 
         let ret = if enabled {
             let (io_driver, io_handle) = crate::runtime::io::Driver::new(nevents)?;
+            let io_handle = crate::loom::sync::Arc::new(io_handle);
 
             let (signal_driver, signal_handle) = create_signal_driver(io_driver, &io_handle)?;
             let process_driver = create_process_driver(signal_driver);
@@ -211,6 +212,17 @@ cfg_io_driver! {
         pub(crate) fn as_ref(&self) -> Option<&crate::runtime::io::Handle> {
             match self {
                 IoHandle::Enabled(v) => Some(v),
+                IoHandle::Disabled(..) => None,
+            }
+        }
+
+        /// Returns a fresh `Arc<runtime::io::Handle>` when io is enabled.
+        /// Used by the scheduler builder to populate the unified
+        /// `io_driver: Option<IoDriver>` slot for the legacy mio backend
+        /// (step 3 of the io-driver-vtable refactor).
+        pub(crate) fn clone_arc(&self) -> Option<crate::loom::sync::Arc<crate::runtime::io::Handle>> {
+            match self {
+                IoHandle::Enabled(v) => Some(crate::loom::sync::Arc::clone(v)),
                 IoHandle::Disabled(..) => None,
             }
         }
