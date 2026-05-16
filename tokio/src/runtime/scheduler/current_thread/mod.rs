@@ -61,16 +61,19 @@ pub(crate) struct Handle {
     /// `None` only for io-disabled runtimes. Lets the `Registration`
     /// lazy first-poll path route through the same vtable for both
     /// scheduler flavors. See `tokio/docs/io-driver-vtable.md`.
-    #[cfg(any(
-        feature = "net",
-        all(unix, feature = "process"),
-        all(unix, feature = "signal"),
-        all(
-            tokio_unstable,
-            feature = "io-uring",
-            feature = "rt",
-            feature = "fs",
-            target_os = "linux"
+    #[cfg(all(
+        target_family = "unix",
+        any(
+            feature = "net",
+            all(unix, feature = "process"),
+            all(unix, feature = "signal"),
+            all(
+                tokio_unstable,
+                feature = "io-uring",
+                feature = "rt",
+                feature = "fs",
+                target_os = "linux"
+            )
         )
     ))]
     pub(crate) io_driver: Option<crate::runtime::io::io_driver::IoDriver>,
@@ -168,16 +171,19 @@ impl CurrentThread {
         // Built before `Arc::new(Handle { .. })` because the
         // legacy-mio arm reads `driver_handle.io` before
         // `driver_handle` is moved into the `driver:` field.
-        #[cfg(any(
-            feature = "net",
-            all(unix, feature = "process"),
-            all(unix, feature = "signal"),
-            all(
-                tokio_unstable,
-                feature = "io-uring",
-                feature = "rt",
-                feature = "fs",
-                target_os = "linux"
+        #[cfg(all(
+            target_family = "unix",
+            any(
+                feature = "net",
+                all(unix, feature = "process"),
+                all(unix, feature = "signal"),
+                all(
+                    tokio_unstable,
+                    feature = "io-uring",
+                    feature = "rt",
+                    feature = "fs",
+                    target_os = "linux"
+                )
             )
         ))]
         let io_driver = driver_handle
@@ -207,16 +213,19 @@ impl CurrentThread {
             blocking_spawner,
             seed_generator,
             local_tid,
-            #[cfg(any(
-                feature = "net",
-                all(unix, feature = "process"),
-                all(unix, feature = "signal"),
-                all(
-                    tokio_unstable,
-                    feature = "io-uring",
-                    feature = "rt",
-                    feature = "fs",
-                    target_os = "linux"
+            #[cfg(all(
+                target_family = "unix",
+                any(
+                    feature = "net",
+                    all(unix, feature = "process"),
+                    all(unix, feature = "signal"),
+                    all(
+                        tokio_unstable,
+                        feature = "io-uring",
+                        feature = "rt",
+                        feature = "fs",
+                        target_os = "linux"
+                    )
                 )
             ))]
             io_driver,

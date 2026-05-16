@@ -85,11 +85,7 @@ impl Source for Pidfd {
     }
 }
 
-#[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+#[cfg(target_family = "unix")]
 impl crate::runtime::io::registration::RegistrationSource for Pidfd {
     fn registration_raw_fd(&self) -> RawFd {
         self.as_raw_fd()

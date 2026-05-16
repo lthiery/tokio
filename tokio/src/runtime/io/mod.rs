@@ -44,7 +44,13 @@ cfg_io_sharded_mio! {
 // Backend-agnostic IoDriver (manual vtable). Populated by every io
 // backend after step 3: legacy mio (`LEGACY_MIO_VTABLE`), per-worker
 // uring (`URING_VTABLE`), per-worker sharded-mio (`SHARDED_MIO_VTABLE`).
+//
+// Gated to `unix` because the legacy-mio vtable's `register_local`
+// shim constructs a `mio::unix::SourceFd` from the captured `RawFd`,
+// which is unix-only. Non-unix targets keep the eager `add_source`
+// path in `Registration::new_with_interest`.
 cfg_io_driver! {
+    #[cfg(target_family = "unix")]
     pub(crate) mod io_driver;
 }
 
@@ -53,6 +59,7 @@ cfg_io_driver! {
 // stderr dump activates only when `TOKIO_LAZY_DEBUG=1` is set in the
 // environment.
 cfg_io_driver! {
+    #[cfg(target_family = "unix")]
     pub(crate) mod lazy_debug;
 }
 

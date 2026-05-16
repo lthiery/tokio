@@ -390,17 +390,21 @@ pub(super) fn create(
     // Backend-agnostic `IoDriver` (manual vtable) shared with the
     // scheduler handle. Computed before `Arc::new(Handle { .. })` to
     // avoid moving `driver_handle` before the legacy-mio arm reads
-    // its `io` field.
-    #[cfg(any(
-        feature = "net",
-        all(unix, feature = "process"),
-        all(unix, feature = "signal"),
-        all(
-            tokio_unstable,
-            feature = "io-uring",
-            feature = "rt",
-            feature = "fs",
-            target_os = "linux"
+    // its `io` field. Unix-only because the legacy-mio vtable's
+    // `register_local` shim uses `mio::unix::SourceFd`.
+    #[cfg(all(
+        target_family = "unix",
+        any(
+            feature = "net",
+            all(unix, feature = "process"),
+            all(unix, feature = "signal"),
+            all(
+                tokio_unstable,
+                feature = "io-uring",
+                feature = "rt",
+                feature = "fs",
+                target_os = "linux"
+            )
         )
     ))]
     let io_driver = match io_flavor {
@@ -453,16 +457,19 @@ pub(super) fn create(
         seed_generator,
         timer_flavor,
         io_flavor,
-        #[cfg(any(
-            feature = "net",
-            all(unix, feature = "process"),
-            all(unix, feature = "signal"),
-            all(
-                tokio_unstable,
-                feature = "io-uring",
-                feature = "rt",
-                feature = "fs",
-                target_os = "linux"
+        #[cfg(all(
+            target_family = "unix",
+            any(
+                feature = "net",
+                all(unix, feature = "process"),
+                all(unix, feature = "signal"),
+                all(
+                    tokio_unstable,
+                    feature = "io-uring",
+                    feature = "rt",
+                    feature = "fs",
+                    target_os = "linux"
+                )
             )
         ))]
         io_driver,

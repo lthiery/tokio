@@ -29,13 +29,9 @@ use std::task::{ready, Context, Poll};
 /// [`AsRawFd`]: std::os::fd::AsRawFd
 pub(crate) trait RegistrationSource: Source {
     /// Return the raw fd to register with the vtable-routed reactor.
-    /// Only called on Linux with `io-uring-reactor` or `io-sharded-mio`
-    /// enabled; other builds dead-code-eliminate it.
-    #[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+    /// Required on unix; non-unix builds keep the eager `add_source`
+    /// path in `Registration::new_with_interest` and never call this.
+    #[cfg(target_family = "unix")]
     fn registration_raw_fd(&self) -> std::os::fd::RawFd;
 }
 
@@ -45,11 +41,7 @@ pub(crate) trait RegistrationSource: Source {
 // add an `AsRawFd` impl for `SourceFd<'_>` in the future. Instead, we
 // enumerate the concrete types Tokio actually wraps with `PollEvented` /
 // `Registration`.
-#[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+#[cfg(target_family = "unix")]
 mod registration_source_impls {
     use super::RegistrationSource;
     use std::os::fd::{AsRawFd, RawFd};
@@ -88,13 +80,10 @@ mod registration_source_impls {
     }
 }
 
-// Builds without the vtable-routed backends: no fd accessor, just a
-// rename of `Source`.
-#[cfg(not(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-)))]
+// Non-unix builds: no fd accessor, just a blanket rename of `Source`.
+// `Registration::new_with_interest` stays on the eager `add_source`
+// path on these targets (Windows etc.).
+#[cfg(not(target_family = "unix"))]
 impl<T: Source> RegistrationSource for T {}
 
 cfg_io_driver! {
@@ -127,30 +116,30 @@ cfg_io_driver! {
     /// stream. The write readiness event stream is only for `Ready::writable()`
     /// events.
     ///
-    /// ## Lazy first-poll registration (vtable backends only)
+    /// ## Lazy first-poll registration (unix targets)
     ///
-    /// On the legacy mio driver path, `new_with_interest`
-    /// eagerly calls `add_source` so the kernel-side state is live by
-    /// the time the constructor returns. On the vtable-routed backends
-    /// (`io-uring-reactor` / `io-sharded-mio`) the constructor does
-    /// **no** runtime lookup at all: it stashes `(fd, interest)` and
-    /// the actual driver work — `Handle::current()`, allocation of
-    /// `ScheduledIo`, and `register_local` — happens on the first
-    /// `poll_ready` / `try_io` / `readiness` call, on whichever worker
-    /// is polling. This is what allows `TcpStream::from_std` (and
-    /// peers) to be constructed from any thread, with or without a
-    /// runtime in scope, on vtable-routed builds. See
-    /// `io-driver-vtable.md` for rationale.
+    /// On unix, `new_with_interest` does **no** runtime lookup at
+    /// all: it stashes `(fd, interest)` and the actual driver work
+    /// — `Handle::current()`, allocation of `ScheduledIo`, and
+    /// `register_local` — happens on the first `poll_ready` /
+    /// `try_io` / `readiness` call, on whichever worker is polling.
+    /// This is what allows `TcpStream::from_std` (and peers) to be
+    /// constructed from any thread, with or without a runtime in
+    /// scope. The panic-on-no-runtime is deferred to the first poll.
+    ///
+    /// On non-unix targets (Windows etc.) the legacy `add_source`
+    /// path is still eager, since `mio::unix::SourceFd` is not
+    /// available there. See `io-driver-vtable.md` for the design.
     ///
     /// [`new_with_interest`]: method@Self::new_with_interest
     /// [`poll_read_ready`]: method@Self::poll_read_ready`
     /// [`poll_write_ready`]: method@Self::poll_write_ready`
     #[derive(Debug)]
     pub(crate) struct Registration {
-        /// Handle to the associated runtime. Populated eagerly at
-        /// construction on the legacy mio path; on the vtable-routed
-        /// backends this OnceLock is populated lazily by
-        /// `ensure_registered` on the first poll, alongside `shared`.
+        /// Handle to the associated runtime. On unix this OnceLock
+        /// is populated lazily by `ensure_registered` on the first
+        /// poll, alongside `shared`. On non-unix targets it's
+        /// populated eagerly by `new_with_interest`.
         ///
         /// We cache it (rather than calling `Handle::current()` again
         /// at deregister time) because `Drop` can run outside a
@@ -164,59 +153,47 @@ cfg_io_driver! {
 
         /// Reference to state stored by the driver.
         ///
-        /// On the legacy mio path this is populated at construction.
-        /// On the vtable-routed backends it is populated lazily on the
-        /// first poll once `register_local` succeeds; before that, the
-        /// `OnceLock` is empty and the registration's poll/try_io
-        /// methods route through `ensure_registered` first.
+        /// On unix this is populated lazily on the first poll once
+        /// `register_local` succeeds; before that, the `OnceLock`
+        /// is empty and the registration's poll/try_io methods route
+        /// through `ensure_registered` first. On non-unix targets
+        /// this is populated eagerly by `new_with_interest`.
         shared: std::sync::OnceLock<Arc<ScheduledIo>>,
 
-        // ---- Vtable-routed backend fields ----
+        // ---- Unix-only lazy-path fields ----
         //
-        // These fields are only present on builds with a vtable-routed
-        // backend enabled. The legacy mio path doesn't carry them
-        // (registration is eager and the backend handle is the
-        // eagerly-stored scheduler handle).
+        // These fields are only present on unix targets where the
+        // vtable's `register_local` (which takes a `RawFd`) is
+        // reachable. Non-unix targets keep the eager `add_source`
+        // path and don't need them.
 
-        /// Raw fd captured at construction. The vtable-routed backends
-        /// don't keep the original `Source` borrow around, so the fd
-        /// is recorded directly so first-poll register and Drop-time
-        /// deregister can fabricate a `mio::unix::SourceFd` over the
-        /// same fd.
-        #[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+        /// Raw fd captured at construction. The lazy path doesn't
+        /// keep the original `Source` borrow around, so the fd is
+        /// recorded directly so first-poll register and race-loser
+        /// deregister can fabricate a `mio::unix::SourceFd` over
+        /// the same fd.
+        #[cfg(target_family = "unix")]
         fd: std::os::fd::RawFd,
 
         /// Interest captured at construction; used by first-poll
         /// register.
-        #[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+        #[cfg(target_family = "unix")]
         interest: Interest,
 
         /// Cached error kind from a failed first-poll register.
         /// Subsequent polls surface the same error rather than
-        /// retrying registration. Empty on the legacy mio path
-        /// (errors there are surfaced eagerly from `new_with_interest`).
-        #[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+        /// retrying registration. Unused on non-unix (errors there
+        /// are surfaced eagerly from `new_with_interest`).
+        #[cfg(target_family = "unix")]
         first_poll_error: std::sync::OnceLock<io::ErrorKind>,
     }
 
-    /// Storage for the scheduler handle. Unified across builds as a
-    /// `OnceLock`: the legacy mio eager constructor populates it
-    /// at construction time, the vtable-routed lazy first-poll path
-    /// populates it on first poll. Either way, by the time
-    /// `Drop` runs, the slot is `Some` iff the registration was
-    /// ever attached to a runtime.
+    /// Storage for the scheduler handle. Unified across targets as
+    /// a `OnceLock`: the unix lazy first-poll path populates it on
+    /// first poll, the non-unix eager constructor populates it at
+    /// construction time. Either way, by the time `Drop` runs, the
+    /// slot is `Some` iff the registration was ever attached to a
+    /// runtime.
     type HandleSlot = std::sync::OnceLock<scheduler::Handle>;
 }
 
@@ -233,36 +210,32 @@ impl Registration {
     ///
     /// # Return
     ///
-    /// - `Ok` if the registration was scheduled successfully. On the
-    ///   legacy mio path this means the kernel-side `epoll_ctl_add`
-    ///   already ran. On the vtable-routed backends this only stashes
-    ///   `(fd, interest)` — the actual driver work happens on the
-    ///   first poll.
-    /// - `Err` if an error was encountered during registration. On the
-    ///   vtable-routed backends, registration errors are deferred to
-    ///   the first poll along with the registration itself, so this
-    ///   constructor never returns `Err` on those paths.
+    /// - `Ok` if the registration was scheduled successfully. On
+    ///   unix this only stashes `(fd, interest)` — the actual
+    ///   driver work happens on the first poll. On non-unix this
+    ///   means the kernel-side registration already ran.
+    /// - `Err` if an error was encountered during registration. On
+    ///   unix, registration errors are deferred to the first poll
+    ///   along with the registration itself, so this constructor
+    ///   never returns `Err` on unix targets.
     ///
     /// # Panics
     ///
-    /// On the legacy mio path, panics if no Tokio runtime is set in
-    /// thread-local storage. On the vtable-routed backends
-    /// (`io-uring-reactor` / `io-sharded-mio`), this constructor does
-    /// **not** consult any runtime; the panic-on-no-runtime moves to
-    /// the first poll of the registration.
+    /// On unix targets, this constructor does **not** consult any
+    /// runtime; if no Tokio runtime is set in thread-local storage,
+    /// the panic is deferred to the first poll. This is true for
+    /// every backend (legacy mio, sharded-mio, io-uring). On non-unix
+    /// targets the legacy `add_source` path is still eager, so the
+    /// panic remains at construction.
     #[track_caller]
     pub(crate) fn new_with_interest(
         io: &mut impl RegistrationSource,
         interest: Interest,
     ) -> io::Result<Registration> {
-        // Vtable-routed backends are fully lazy: no runtime lookup,
-        // no allocation, no driver-side work. Just stash the inputs
-        // first poll will need.
-        #[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+        // Unix: fully lazy. No runtime lookup, no allocation, no
+        // driver-side work — just stash `(fd, interest)`; the first
+        // poll's `ensure_registered` does the rest.
+        #[cfg(target_family = "unix")]
         {
             let fd = io.registration_raw_fd();
             return Ok(Registration {
@@ -274,14 +247,12 @@ impl Registration {
             });
         }
 
-        // Legacy mio path: eager `add_source`. Internalises the
-        // `Handle::current()` lookup that callers used to do
-        // themselves and pass in.
-        #[cfg(not(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-)))]
+        // Non-unix (Windows etc.): eager `add_source`. The vtable's
+        // `register_local` shim relies on `mio::unix::SourceFd`,
+        // which doesn't exist off-unix, so the legacy path stays as
+        // the only option here. Internalises the `Handle::current()`
+        // lookup callers used to do themselves.
+        #[cfg(not(target_family = "unix"))]
         {
             let handle = scheduler::Handle::current();
             let shared = handle.driver().io().add_source(io, interest)?;
@@ -297,21 +268,18 @@ impl Registration {
         }
     }
 
-    /// Ensure `self.shared` is populated. On the legacy mio path this
-    /// is a cheap `OnceLock::get` (always populated at construction).
-    /// On the vtable-routed backends, the first call drives the
-    /// driver-side registration via `register_local`.
+    /// Ensure `self.shared` is populated. On unix this drives the
+    /// vtable's `allocate_scheduled_io` + `register_local` on the
+    /// first call; subsequent calls hit the cached `OnceLock`. On
+    /// non-unix the `OnceLock` is always populated by the eager
+    /// `new_with_interest` constructor, so this is a cheap get.
     ///
-    /// Must be called from inside a poll context: this is where the
-    /// vtable-routed backends do their `Handle::current()` lookup, so
-    /// calling `ensure_registered` on a registration whose home
-    /// runtime has gone away will surface that as an error (or, if
-    /// no runtime is in TLS at all, panic via `Handle::current`).
-    #[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+    /// Must be called from inside a poll context: on unix this is
+    /// where the `Handle::current()` lookup happens, so calling
+    /// `ensure_registered` on a registration whose home runtime has
+    /// gone away will surface that as an error (or, if no runtime
+    /// is in TLS at all, panic via `Handle::current`).
+    #[cfg(target_family = "unix")]
     fn ensure_registered(&self) -> io::Result<&Arc<ScheduledIo>> {
         use crate::runtime::io::lazy_debug::{bump, COUNTERS};
         bump(&COUNTERS.rin_calls);
@@ -382,13 +350,10 @@ impl Registration {
         Ok(self.shared.get().expect("shared populated above"))
     }
 
-    /// Legacy-only variant: on builds without any vtable backend the
-    /// registration is always eager, so `shared` is always populated.
-    #[cfg(not(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-)))]
+    /// Non-unix variant: registration is always eager
+    /// (`new_with_interest` populated `shared`), so this is a cheap
+    /// get.
+    #[cfg(not(target_family = "unix"))]
     fn ensure_registered(&self) -> io::Result<&Arc<ScheduledIo>> {
         Ok(self.shared.get().expect("eager registration populated"))
     }

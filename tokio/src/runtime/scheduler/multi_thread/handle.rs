@@ -71,16 +71,19 @@ pub(crate) struct Handle {
     /// [fu]: crate::runtime::io::io_driver::IoDriver::from_uring
     /// [fs]: crate::runtime::io::io_driver::IoDriver::from_sharded_mio
     /// [fl]: crate::runtime::io::io_driver::IoDriver::from_legacy_mio
-    #[cfg(any(
-        feature = "net",
-        all(unix, feature = "process"),
-        all(unix, feature = "signal"),
-        all(
-            tokio_unstable,
-            feature = "io-uring",
-            feature = "rt",
-            feature = "fs",
-            target_os = "linux"
+    #[cfg(all(
+        target_family = "unix",
+        any(
+            feature = "net",
+            all(unix, feature = "process"),
+            all(unix, feature = "signal"),
+            all(
+                tokio_unstable,
+                feature = "io-uring",
+                feature = "rt",
+                feature = "fs",
+                target_os = "linux"
+            )
         )
     ))]
     pub(crate) io_driver: Option<crate::runtime::io::io_driver::IoDriver>,
