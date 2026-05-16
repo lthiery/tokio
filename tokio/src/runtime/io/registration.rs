@@ -2,15 +2,6 @@
 
 use crate::io::interest::Interest;
 use crate::runtime::io::{Direction, ReadyEvent, ScheduledIo};
-// `Handle` (the io-driver handle, distinct from `scheduler::Handle`) is only
-// referenced by the legacy-only `handle()` helper. Importing it
-// unconditionally produces an unused-import warning under the vtable cfg.
-#[cfg(not(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-)))]
-use crate::runtime::io::Handle;
 use crate::runtime::scheduler;
 
 use mio::event::Source;
@@ -220,23 +211,12 @@ cfg_io_driver! {
         first_poll_error: std::sync::OnceLock<io::ErrorKind>,
     }
 
-    /// Storage for the scheduler handle. On the legacy mio path the
-    /// handle is captured eagerly at construction (so the handle is
-    /// always available); on the vtable-routed backends it's populated
-    /// lazily by `ensure_registered`. Encoded as a single field so
-    /// `Registration` doesn't need to cfg-divide its layout.
-    #[cfg(not(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-)))]
-    type HandleSlot = scheduler::Handle;
-
-    #[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+    /// Storage for the scheduler handle. Unified across builds as a
+    /// `OnceLock`: the legacy mio eager constructor populates it
+    /// at construction time, the vtable-routed lazy first-poll path
+    /// populates it on first poll. Either way, by the time
+    /// `Drop` runs, the slot is `Some` iff the registration was
+    /// ever attached to a runtime.
     type HandleSlot = std::sync::OnceLock<scheduler::Handle>;
 }
 
@@ -305,10 +285,15 @@ impl Registration {
         {
             let handle = scheduler::Handle::current();
             let shared = handle.driver().io().add_source(io, interest)?;
-            let once = std::sync::OnceLock::new();
+            let shared_once = std::sync::OnceLock::new();
+            let handle_once = std::sync::OnceLock::new();
             // `set` cannot fail on a fresh `OnceLock`.
-            let _ = once.set(shared);
-            Ok(Registration { handle, shared: once })
+            let _ = shared_once.set(shared);
+            let _ = handle_once.set(handle);
+            Ok(Registration {
+                handle: handle_once,
+                shared: shared_once,
+            })
         }
     }
 
@@ -362,65 +347,35 @@ impl Registration {
 
         bump(&COUNTERS.rin_register_call);
 
-        // Dispatch on whether the runtime selected a vtable-routed
-        // backend. `io_driver()` returns `Some` for the experimental
-        // `IoFlavor::UringPerWorker` / `IoFlavor::ShardedMio`
-        // configurations, and `None` for the default `Traditional`
-        // mio path. The latter still needs lazy first-poll
-        // registration here (the eager path was removed in
-        // `new_with_interest`), so fall through to `add_source` —
-        // the same routine the legacy build calls eagerly at
-        // construction.
-        let arc = match handle.io_driver() {
-            Some(driver) => {
-                let arc = driver.allocate_scheduled_io();
-                if let Err(e) = driver.register_local(&arc, self.fd, self.interest) {
-                    bump(&COUNTERS.rin_register_err);
-                    let kind = e.kind();
-                    let _ = self.first_poll_error.set(kind);
-                    return Err(e);
-                }
-                arc
-            }
-            None => {
-                // Traditional/Legacy fallback: vtable feature was
-                // compiled in, but the runtime selected the shared
-                // mio reactor. Reconstruct a `SourceFd` over the
-                // captured fd so we can call the same `add_source`
-                // path the eager-registration build uses.
-                let mut source = mio::unix::SourceFd(&self.fd);
-                match handle.driver().io().add_source(&mut source, self.interest) {
-                    Ok(arc) => arc,
-                    Err(e) => {
-                        bump(&COUNTERS.rin_register_err);
-                        let kind = e.kind();
-                        let _ = self.first_poll_error.set(kind);
-                        return Err(e);
-                    }
-                }
-            }
-        };
+        // Every io-enabled runtime now exposes an `IoDriver`:
+        // multi_thread + `IoFlavor::Traditional` and current_thread
+        // both carry `LEGACY_MIO_VTABLE`, the per-worker flavors carry
+        // `URING_VTABLE` / `SHARDED_MIO_VTABLE`. If `io_driver()`
+        // returns `None`, the runtime was built with io disabled —
+        // that path panics on the way in (mirrors the pre-vtable
+        // panic from `driver().io()`).
+        let driver = handle
+            .io_driver()
+            .expect("io driver present when io is enabled");
+        let arc = driver.allocate_scheduled_io();
+        if let Err(e) = driver.register_local(&arc, self.fd, self.interest) {
+            bump(&COUNTERS.rin_register_err);
+            let kind = e.kind();
+            let _ = self.first_poll_error.set(kind);
+            return Err(e);
+        }
 
         // Multiple poll callers can race here; whichever wins owns the
         // canonical Arc, the others discard their freshly-registered
         // alternate. The losers deregister their redundant
         // `ScheduledIo` to avoid a registered-but-unowned slot
-        // lingering in the reactor.
+        // lingering in the reactor. Same vtable as the register
+        // call above — ignore any error, at worst the kernel keeps
+        // a stale interest entry until the fd is closed.
         if let Err(_other) = self.shared.set(Arc::clone(&arc)) {
             bump(&COUNTERS.rin_race_loser);
             let mut source = mio::unix::SourceFd(&self.fd);
-            // Route deregistration through the same backend that
-            // performed the redundant register, ignoring any error
-            // — at worst the kernel keeps a stale interest entry
-            // until the fd is closed.
-            match handle.io_driver() {
-                Some(driver) => {
-                    let _ = driver.deregister(&arc, &mut source);
-                }
-                None => {
-                    let _ = handle.driver().io().deregister_source(&arc, &mut source);
-                }
-            }
+            let _ = driver.deregister(&arc, &mut source);
         }
 
         bump(&COUNTERS.rin_success);
@@ -455,44 +410,19 @@ impl Registration {
     ///
     /// `Err` is returned if an error is encountered.
     pub(crate) fn deregister(&mut self, io: &mut impl RegistrationSource) -> io::Result<()> {
-        // Vtable-routed feature build: read the cached scheduler
-        // handle from the OnceLock populated by the first poll's
-        // `ensure_registered`. If the registration was never polled,
-        // `shared` and `handle` are both empty — there's nothing in
-        // the reactor to remove, so just succeed. The
-        // construction-time runtime detection is gone: a registration
-        // that is never polled is a no-op at deregister time,
-        // regardless of whether the current thread has a runtime.
-        #[cfg(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-        {
-            if let (Some(handle), Some(shared)) = (self.handle.get(), self.shared.get()) {
-                // Dispatch on the same axis as `ensure_registered`:
-                // vtable backend if `io_driver()` is `Some`, legacy
-                // mio reactor otherwise.
-                return match handle.io_driver() {
-                    Some(driver) => driver.deregister(shared, io),
-                    None => handle.driver().io().deregister_source(shared, io),
-                };
-            }
-            return Ok(());
+        // The legacy mio eager constructor populates both `handle`
+        // and `shared` at construction time; the vtable-routed
+        // lazy path populates them on first poll. Either way, if
+        // both slots are `None` here, the registration was never
+        // attached to a runtime — nothing in the reactor to remove,
+        // just succeed.
+        if let (Some(handle), Some(shared)) = (self.handle.get(), self.shared.get()) {
+            let driver = handle
+                .io_driver()
+                .expect("io driver present when io is enabled");
+            return driver.deregister(shared, io);
         }
-
-        #[cfg(not(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-)))]
-        {
-            let shared = self
-                .shared
-                .get()
-                .expect("legacy mio path always populates shared");
-            self.handle().deregister_source(shared, io)
-        }
+        Ok(())
     }
 
     pub(crate) fn clear_readiness(&self, event: ReadyEvent) {
@@ -648,14 +578,6 @@ impl Registration {
         }
     }
 
-    #[cfg(not(all(
-    any(feature = "io-uring-reactor", feature = "io-sharded-mio"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-)))]
-    fn handle(&self) -> &Handle {
-        self.handle.driver().io()
-    }
 }
 
 impl Drop for Registration {
