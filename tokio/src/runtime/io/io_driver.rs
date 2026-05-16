@@ -28,13 +28,13 @@
 #![allow(dead_code)]
 
 use crate::io::interest::Interest;
+use crate::loom::sync::Arc;
 use crate::runtime::io::ScheduledIo;
 use crate::runtime::io::registration::RegistrationSource;
 
 use std::io;
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
-use std::sync::Arc;
 
 /// Backend-agnostic io-driver value.
 ///
@@ -287,18 +287,30 @@ cfg_io_uring_reactor! {
 
     unsafe fn uring_clone_data(data: NonNull<()>) -> NonNull<()> {
         // SAFETY: `data` was produced by `Arc::into_raw` for an
-        // `Arc<UringHandle>`. Bumping the strong count keeps that Arc
-        // alive; the returned pointer aliases the same allocation.
-        unsafe { Arc::<UringHandle>::increment_strong_count(data.as_ptr() as *const UringHandle); }
-        data
+        // `Arc<UringHandle>` whose strong count is held alive by the
+        // `IoDriver` invoking the clone. Reconstitute the borrow with
+        // `from_raw`, clone it (bumping the count), then `forget` the
+        // borrow to leave the original `IoDriver`'s strong reference
+        // intact. The new strong reference is handed back as raw bytes.
+        //
+        // Idiom (rather than `Arc::increment_strong_count`) keeps this
+        // module compilable under `cfg(loom)`, where loom's `Arc` shim
+        // does not expose the static increment/decrement helpers.
+        let arc = unsafe { Arc::<UringHandle>::from_raw(data.as_ptr() as *const UringHandle) };
+        let bumped = Arc::clone(&arc);
+        std::mem::forget(arc);
+        let raw = Arc::into_raw(bumped) as *mut ();
+        // SAFETY: `Arc::into_raw` is documented to return a non-null
+        // pointer for a live Arc.
+        unsafe { NonNull::new_unchecked(raw) }
     }
 
     unsafe fn uring_drop_data(data: NonNull<()>) {
-        // SAFETY: `data` was produced by `Arc::into_raw` for an
-        // `Arc<UringHandle>`. `decrement_strong_count` reconstructs the
-        // owning Arc and drops it, freeing the allocation if this was
-        // the last reference.
-        unsafe { Arc::<UringHandle>::decrement_strong_count(data.as_ptr() as *const UringHandle); }
+        // SAFETY: see `uring_clone_data`. Reconstituting and dropping
+        // releases exactly one strong reference, freeing the inner
+        // allocation if this was the last one. Loom-safe.
+        let arc = unsafe { Arc::<UringHandle>::from_raw(data.as_ptr() as *const UringHandle) };
+        drop(arc);
     }
 
     impl IoDriver {
@@ -323,14 +335,18 @@ cfg_io_uring_reactor! {
         pub(crate) fn as_uring_arc(&self) -> Option<Arc<UringHandle>> {
             if self.vtable_is(&URING_VTABLE) {
                 // SAFETY: vtable identity proves `data` came from
-                // `Arc::into_raw(_: Arc<UringHandle>)`. We bump the count
-                // and reconstruct an Arc that we hand out; the original
-                // Arc inside `self` remains valid.
+                // `Arc::into_raw(_: Arc<UringHandle>)`. Reconstitute the
+                // borrow, clone it to produce a fresh strong reference
+                // for the caller, and `forget` the reconstituted borrow
+                // so the original `IoDriver`'s reference stays valid.
+                // (Loom-safe idiom; see `uring_clone_data`.)
                 unsafe {
-                    Arc::<UringHandle>::increment_strong_count(
+                    let arc = Arc::<UringHandle>::from_raw(
                         self.data.as_ptr() as *const UringHandle,
                     );
-                    Some(Arc::from_raw(self.data.as_ptr() as *const UringHandle))
+                    let bumped = Arc::clone(&arc);
+                    std::mem::forget(arc);
+                    Some(bumped)
                 }
             } else {
                 None
@@ -420,27 +436,25 @@ cfg_io_sharded_mio! {
     }
 
     unsafe fn sharded_mio_clone_data(data: NonNull<()>) -> NonNull<()> {
-        // SAFETY: `data` was produced by `Arc::into_raw` for an
-        // `Arc<ShardedMioHandle>`. Bumping the strong count keeps that
-        // Arc alive; the returned pointer aliases the same allocation.
-        unsafe {
-            Arc::<ShardedMioHandle>::increment_strong_count(
-                data.as_ptr() as *const ShardedMioHandle,
-            );
-        }
-        data
+        // SAFETY: see `uring_clone_data` — same reconstitute/clone/forget
+        // idiom, just monomorphized on `ShardedMioHandle`.
+        let arc = unsafe {
+            Arc::<ShardedMioHandle>::from_raw(data.as_ptr() as *const ShardedMioHandle)
+        };
+        let bumped = Arc::clone(&arc);
+        std::mem::forget(arc);
+        let raw = Arc::into_raw(bumped) as *mut ();
+        // SAFETY: `Arc::into_raw` is documented to return a non-null
+        // pointer for a live Arc.
+        unsafe { NonNull::new_unchecked(raw) }
     }
 
     unsafe fn sharded_mio_drop_data(data: NonNull<()>) {
-        // SAFETY: `data` was produced by `Arc::into_raw` for an
-        // `Arc<ShardedMioHandle>`. `decrement_strong_count`
-        // reconstructs the owning Arc and drops it, freeing the
-        // allocation if this was the last reference.
-        unsafe {
-            Arc::<ShardedMioHandle>::decrement_strong_count(
-                data.as_ptr() as *const ShardedMioHandle,
-            );
-        }
+        // SAFETY: see `uring_drop_data`.
+        let arc = unsafe {
+            Arc::<ShardedMioHandle>::from_raw(data.as_ptr() as *const ShardedMioHandle)
+        };
+        drop(arc);
     }
 
     impl IoDriver {
@@ -465,16 +479,15 @@ cfg_io_sharded_mio! {
         pub(crate) fn as_sharded_mio_arc(&self) -> Option<Arc<ShardedMioHandle>> {
             if self.vtable_is(&SHARDED_MIO_VTABLE) {
                 // SAFETY: vtable identity proves `data` came from
-                // `Arc::into_raw(_: Arc<ShardedMioHandle>)`. We bump
-                // the count and reconstruct an Arc that we hand out;
-                // the original Arc inside `self` remains valid.
+                // `Arc::into_raw(_: Arc<ShardedMioHandle>)`. Reconstitute
+                // / clone / forget idiom; see `as_uring_arc`.
                 unsafe {
-                    Arc::<ShardedMioHandle>::increment_strong_count(
+                    let arc = Arc::<ShardedMioHandle>::from_raw(
                         self.data.as_ptr() as *const ShardedMioHandle,
                     );
-                    Some(Arc::from_raw(
-                        self.data.as_ptr() as *const ShardedMioHandle,
-                    ))
+                    let bumped = Arc::clone(&arc);
+                    std::mem::forget(arc);
+                    Some(bumped)
                 }
             } else {
                 None
