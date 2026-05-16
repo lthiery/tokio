@@ -289,12 +289,53 @@ impl Handle {
         Ok(scheduled_io)
     }
 
+    /// Lazy-style sibling of [`Self::add_source`] used by the vtable
+    /// path: the caller has already produced an `Arc<ScheduledIo>`
+    /// (via the vtable's infallible `allocate_scheduled_io` shim) and
+    /// asks the handle to link it into the registration set and
+    /// register `source`/`interest` with the kernel poller.
+    ///
+    /// On registry failure, the just-linked `ScheduledIo` is unlinked
+    /// before returning the error — mirroring `add_source`'s
+    /// allocate-then-unlink-on-failure shape.
+    pub(super) fn register_existing<S>(
+        &self,
+        shared: &Arc<ScheduledIo>,
+        source: &mut S,
+        interest: Interest,
+    ) -> io::Result<()>
+    where
+        S: mio::event::Source + ?Sized,
+    {
+        self.registrations
+            .allocate_existing(&mut self.synced.lock(), shared)?;
+        let token = shared.token();
+
+        if let Err(e) = self.registry.register(source, token, interest.to_mio()) {
+            // SAFETY: `shared` was just linked into `registrations` by
+            // `allocate_existing` above. Unlink it before returning the
+            // OS error to the caller; matches `add_source`'s
+            // allocate-then-unlink-on-failure shape.
+            unsafe {
+                self.registrations
+                    .remove(&mut self.synced.lock(), shared)
+            };
+            return Err(e);
+        }
+
+        self.metrics.incr_fd_count();
+        Ok(())
+    }
+
     /// Deregisters an I/O resource from the reactor.
-    pub(super) fn deregister_source(
+    pub(super) fn deregister_source<S>(
         &self,
         registration: &Arc<ScheduledIo>,
-        source: &mut impl Source,
-    ) -> io::Result<()> {
+        source: &mut S,
+    ) -> io::Result<()>
+    where
+        S: Source + ?Sized,
+    {
         // Deregister the source with the OS poller **first**
         // Cleanup ALWAYS happens
         let os_result = self.registry.deregister(source);

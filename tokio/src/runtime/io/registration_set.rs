@@ -71,16 +71,12 @@ impl RegistrationSet {
 
     /// Track an externally-allocated `Arc<ScheduledIo>` in this set.
     ///
-    /// Used by the vtable-routed backends (sharded-mio + uring), which
-    /// allocate the `ScheduledIo` lazily on first poll (rather than at
-    /// construction time, like the legacy mio driver) and then need to
-    /// register it with the per-shard / shared set so shutdown and
-    /// pending-release accounting remains uniform.
-    #[cfg(all(
-    any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
+    /// Used by every vtable-routed backend (legacy mio, sharded-mio,
+    /// uring) — the `Arc<ScheduledIo>` is produced by the vtable's
+    /// `allocate_scheduled_io` shim (an infallible `Arc::new`) and
+    /// linked into the set at `register_local` time. Keeping the
+    /// shutdown check on the linking step (rather than on the
+    /// `Arc::new`) lets the vtable signature stay infallible.
     pub(super) fn allocate_existing(
         &self,
         synced: &mut Synced,

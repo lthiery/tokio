@@ -41,24 +41,20 @@ cfg_io_sharded_mio! {
     pub(crate) mod sharded_mio_driver;
 }
 
-// Backend-agnostic IoDriver (manual vtable). Available whenever any
-// per-worker (sharded) backend is in play. Currently only the uring
-// vtable is populated; sharded-mio vtable is added in step 2.
-#[cfg(any(
-    all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-    all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
-))]
-pub(crate) mod io_driver;
+// Backend-agnostic IoDriver (manual vtable). Populated by every io
+// backend after step 3: legacy mio (`LEGACY_MIO_VTABLE`), per-worker
+// uring (`URING_VTABLE`), per-worker sharded-mio (`SHARDED_MIO_VTABLE`).
+cfg_io_driver! {
+    pub(crate) mod io_driver;
+}
 
 // Process-wide counters for the lazy-on-first-poll registration path.
 // Available under the same cfg as `io_driver`. Always incremented;
 // stderr dump activates only when `TOKIO_LAZY_DEBUG=1` is set in the
 // environment.
-#[cfg(any(
-    all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-    all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
-))]
-pub(crate) mod lazy_debug;
+cfg_io_driver! {
+    pub(crate) mod lazy_debug;
+}
 
 use crate::util::ptr_expose::PtrExposeDomain;
 static EXPOSE_IO: PtrExposeDomain<ScheduledIo> = PtrExposeDomain::new();
