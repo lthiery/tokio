@@ -1,8 +1,10 @@
 # IoDriver vtable: unified io-driver abstraction
 
-**Status:** steps 1 and 2 implemented on `worktree-io-driver-vtable`.
-Step 3 (legacy shared-mio backend behind the same vtable) is the next
-piece of work and remains as designed below.
+**Status:** steps 1, 2 and 3 implemented on `worktree-io-driver-vtable`.
+The legacy shared-mio backend now goes through the same `IoDriver`
+vtable as uring and sharded-mio; `registration.rs`'s last cfg cascade
+is collapsed and the eager `add_source` branch is gone on unix.
+Step 4 (third-party `IoDriver` injection) remains as designed below.
 **Branch:** `worktree-io-driver-vtable` (off `uring-reactor`).
 **Predecessor docs:** see `plan-history/uring-reactor-design.md` for the existing
 per-worker uring backend, and the sharded-mio worktree (`tokio-sharded-mio`,
@@ -16,7 +18,13 @@ branch `sharded-mio`) for the analog mio backend that motivated this refactor.
 | 2a — sharded-mio backend imported | ✅ done | `480b83da` |
 | 2b — `SHARDED_MIO_VTABLE` + `from_sharded_mio` | ✅ done | `a87b69ef` |
 | 2c — collapse `registration.rs` cfg cascade | ✅ done | `fa27c1a1` |
-| 3 — legacy shared-mio behind the vtable | not yet started | — |
+| 3.0 — loom-clean vtable Arc lifecycle | ✅ done | `e7acbfde` |
+| 3.1 — wrap `IoHandle::Enabled` in `Arc<runtime::io::Handle>` | ✅ done | `83b487fa` |
+| 3.2 — `LEGACY_MIO_VTABLE` + `IoDriver::from_legacy_mio` | ✅ done | `9c08f323` |
+| 3.3 — route `IoFlavor::Traditional` through the vtable | ✅ done | `f711ee24` |
+| 3.4 — `current_thread::Handle` also fills `io_driver` | ✅ done | `3ddcae35` |
+| 3.5 — collapse `Registration` fallback branches | ✅ done | `01863c4d` |
+| 3.6 — drop eager `new_with_interest` branch on unix | ✅ done | `556fd700` |
 | 4 — third-party `IoDriver` injection (`from_impl<T>`) | designed, not implemented | — |
 | 5 — upstream-shaped diff | presentation only | — |
 
@@ -57,6 +65,50 @@ in `tests/rt_sharded_mio.rs`.
   from_sharded_mio(...) … }`, and the local `Arc<ShardedMioHandle>`
   inside `worker::create()` (still used to construct each
   `ShardedMioParker`) lives only as a stack variable.
+
+### Divergences from the original step-3 design
+
+- **`worker_idx` is always-`0` for legacy mio (matches design), but
+  `num_workers` is reported as `1`, not `runtime.workers`.** The plan
+  in §"Step 3" said "Round-robin `worker_idx` becomes always-`0`",
+  which the shim honors (legacy mio is single-shard). What the plan
+  didn't say is that `num_workers()` returns `1` too, which means
+  callers iterating `0..num_workers()` to broadcast a `unpark_worker`
+  end up unparking the lone shared mio waker exactly once — correct,
+  and cheaper than calling N times. Sharded-mio and uring still
+  return their real worker count.
+- **`Arc<runtime::io::Handle>` wrapper instead of erasing the legacy
+  driver's allocator.** The plan loosely sketched "wrap the existing
+  `tokio::runtime::io::Handle` as a `LegacyMioHandle`". As shipped,
+  there is no new `LegacyMioHandle` struct — `Arc<runtime::io::Handle>`
+  *is* the backend value, with `LEGACY_MIO_VTABLE` shims directly
+  closing over it. The vtable shims call straight into
+  `Handle::add_source` / `Handle::deregister_source` (renamed from
+  the previously-private helpers), which keeps the legacy
+  `RegistrationSet` / `epoll_ctl` machinery in place untouched.
+  Rationale: zero churn to the existing `mio::Poll` driver, only the
+  call-in surface changes.
+- **Eager `add_source` path retained on non-unix.** The plan said
+  "the old direct path is deleted". On unix that's what happened.
+  On non-unix (Windows etc.) the vtable's `register_local` shim relies
+  on `mio::unix::SourceFd`, which doesn't exist there, so
+  `Registration::new_with_interest` keeps its eager `add_source`
+  branch as the only path. The cfg gate on the lazy machinery
+  (`Registration::{fd, interest, first_poll_error}`, the
+  `RegistrationSource::registration_raw_fd` method, the legacy
+  `ensure_registered` variant) is therefore `target_family = "unix"`,
+  not "always-on".
+- **Semver-adjacent behavior change leaks out of `tokio_unstable`.**
+  Step 2's "Truly-lazy `Registration`" section described
+  construction-from-anywhere as scoped to vtable-feature builds. With
+  step 3 routing `IoFlavor::Traditional` through the same lazy path,
+  the behavior change now applies to **every** unix tokio build:
+  `TcpStream::from_std`, `UdpSocket::from_std`,
+  `UnixStream::from_std`, `AsyncFd::new`, etc. now defer the
+  "panics if not in a runtime" check to the first poll. This is the
+  fix we wanted (`from_std` from any thread), but it's broader than
+  the original step-2 framing. Non-unix builds keep the
+  construction-time panic.
 
 ## Motivation
 
@@ -262,23 +314,38 @@ Done in three sub-commits:
 - Lib unit tests `runtime::io::io_driver::tests`: 5/5 across all four
   feature combos (sharded-only / uring-only / both / neither).
 
-### Step 3 — port the legacy shared-mio driver to fill the vtable
+### Step 3 — port the legacy shared-mio driver to fill the vtable ✅ shipped
 
 - Wrap the existing `tokio::runtime::io::Handle` (shared `mio::Poll`,
-  one driver, one Registry) as a `LegacyMioHandle` with the same
-  four-method surface.
-- Round-robin `worker_idx` becomes always-`0` (single shard); `unpark_worker`
-  pokes the single mio waker.
+  one driver, one Registry) as the backend value behind
+  `LEGACY_MIO_VTABLE`. There is no new `LegacyMioHandle` wrapper
+  type — `Arc<runtime::io::Handle>` *is* the backend value, with the
+  seven vtable shims (`allocate_scheduled_io`, `register_local`,
+  `deregister`, `unpark_worker`, `num_workers`, `clone_data`,
+  `drop_data`) closing over it.
+- `worker_idx` is always-`0` (single shard); `unpark_worker` pokes
+  the single mio waker via `Handle::unpark`. `num_workers` returns
+  `1` so callers iterating `0..num_workers()` to broadcast wakeups
+  do so exactly once.
 - All three backends now go through `IoDriver`. The `IoFlavor` enum
-  becomes a *runtime-only* selector in `Builder`; the rest of the runtime
-  is flavor-agnostic.
+  is now a *runtime-only* selector in `Builder`; the rest of the
+  runtime is flavor-agnostic on unix.
 
 **Acceptance:**
-- Stock tokio test suite (`cargo test`) passes on default features.
-- `IoFlavor::Traditional` uses the new vtable path; the old direct path
-  is deleted.
-- No cfg gates remain in `registration.rs`, `worker.rs`, or `park.rs`
-  for io-driver dispatch.
+- Stock tokio test suite (`cargo test --features full --lib`) passes
+  on default features: 138 / 138.
+- Integration suite spot-check passes:
+  `rt_threaded` (29), `rt_basic` (11), `tcp_stream` (8),
+  `tcp_into_split` (3), `udp` (29), `process_kill_on_drop` (1),
+  `process_smoke` (1).
+- `IoFlavor::Traditional` uses the new vtable path on unix; the
+  legacy direct branch in `Registration` is removed on unix and
+  preserved only on non-unix (Windows etc.) where
+  `mio::unix::SourceFd` isn't available.
+- `registration.rs` no longer fans cfg over
+  `any(feature = "io-uring-reactor", feature = "io-sharded-mio")`;
+  the remaining gate is `target_family = "unix"`. `worker.rs` and
+  `park.rs` carry no io-driver-flavor cfg gates.
 
 ### Step 4 — third-party `IoDriver` injection (the real motivation for the vtable)
 
@@ -655,15 +722,20 @@ The follow-up (this section) finished the job:
   `shared` was never populated (no first poll happened), Drop is a
   no-op.
 
-User-visible consequence on vtable builds:
+User-visible consequence:
 `TcpStream::from_std` (and every other `from_std` / `bind` / `connect`
 wrapper that calls `PollEvented::new` underneath) can be called from
 any thread, with or without a runtime in scope. The construction-time
 "panics if not in a runtime" check moves to the first
 `.readable()` / `.read()` / `.write()` etc. call. `from_std`
-docstrings call this out explicitly. **This is a semver-adjacent
-behavior change scoped to `tokio_unstable` + the experimental
-features**; legacy mio builds keep their construction-time panic.
+docstrings call this out explicitly. **Step 3 broadened this from
+"vtable-feature builds only" to "every unix build"**: now that
+`IoFlavor::Traditional` is also routed through the vtable, the
+legacy mio path benefits from the same construction-from-anywhere
+behavior, and the lazy-cfg gate is `target_family = "unix"` rather
+than the original `cfg_io_driver!`-style fan. Non-unix (Windows etc.)
+builds keep the construction-time panic; the eager `add_source`
+branch in `Registration::new_with_interest` is preserved off-unix.
 
 Why the **`scheduler::Handle`** is cached in the OnceLock (and not
 the narrower `IoDriver`): a vtable-feature build can still be paired
