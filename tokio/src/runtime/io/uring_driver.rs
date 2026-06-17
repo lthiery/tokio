@@ -149,6 +149,29 @@ pub(crate) struct UringHandle {
     /// Bumped once per `add_source` call.
     next_worker: AtomicUsize,
 
+    /// Upper bound on how many distinct worker rings receive fd
+    /// registrations. `fallback_worker` round-robins over `0..ring_cap`
+    /// rather than `0..workers.len()`, so at most `ring_cap` rings ever
+    /// carry `POLL_ADD_MULTI` SQEs and thus ever get woken by I/O readiness.
+    ///
+    /// Always in `1..=workers.len()`. Defaults to `workers.len()` (every
+    /// ring eligible — historical behavior) and is overridable per-runtime
+    /// via `TOKIO_URING_RING_CAP` (see [`Self::read_ring_cap_env`]).
+    ///
+    /// Rationale: the `net_tcp_echo` high-W cliff is wake-from-idle
+    /// amplification under worker oversubscription — a fixed, latency-bound
+    /// connection set scattered round-robin across many cold rings means
+    /// nearly every round-trip wakes a fresh deep-idle worker (~15× the
+    /// wakeups/round-trip at W64 vs W16 on a 64-core host, with
+    /// `io_uring_enter` volume flat). Bounding the active ring set keeps
+    /// those rings warm and many-fds-deep (so one wake drains many CQEs —
+    /// the amortization the sharded-mio cross-group drain achieves on the
+    /// epoll side) while leaving surplus workers parked. Topology-agnostic:
+    /// wake cost on this hardware has no locality gradient, so the lever is
+    /// wake *count*, not where the wake lands. See
+    /// `.claude/STAGE-A-FINDINGS-uring-wake-cliff.md`.
+    ring_cap: usize,
+
     /// Shared registration set (fd → ScheduledIo). Identical to the mio
     /// driver's usage; the Arc-pinned `ScheduledIo` instances are also
     /// referenced from each per-worker reactor's slab while a registration
@@ -198,13 +221,37 @@ impl UringHandle {
         // Barrier must have at least 1 participant; a handle with zero
         // workers is degenerate but we keep it constructible for tests.
         let barrier_count = num_workers.max(1);
+        let ring_cap = Self::read_ring_cap_env(num_workers);
         Self {
             workers: workers.into_boxed_slice(),
             next_worker: AtomicUsize::new(0),
+            ring_cap,
             registrations,
             synced: Mutex::new(synced),
             metrics: IoDriverMetrics::default(),
             start_barrier: std::sync::Barrier::new(barrier_count),
+        }
+    }
+
+    /// Resolve the active-ring-set cap from `TOKIO_URING_RING_CAP`, clamped
+    /// to `1..=num_workers`. Read exactly once per runtime at construction
+    /// (the cap is fixed for the runtime's life).
+    ///
+    /// - unset, empty, `0`, or unparseable → `num_workers` (historical
+    ///   behavior: every ring eligible — this is the A/B control).
+    /// - `N` ≥ 1 → `min(N, num_workers)`.
+    ///
+    /// A degenerate `num_workers == 0` handle (test-only) yields `1` so the
+    /// modulus in [`Self::fallback_worker`] never divides by zero.
+    fn read_ring_cap_env(num_workers: usize) -> usize {
+        let ceiling = num_workers.max(1);
+        match std::env::var("TOKIO_URING_RING_CAP") {
+            Ok(s) => match s.trim().parse::<usize>() {
+                Ok(n) if n >= 1 => n.min(ceiling),
+                // 0 or junk → off (full set).
+                _ => ceiling,
+            },
+            Err(_) => ceiling,
         }
     }
 
@@ -442,7 +489,11 @@ impl UringHandle {
     /// workers.
     ///
     fn fallback_worker(&self) -> usize {
-        self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len()
+        // Round-robin over the *active ring set* (`0..ring_cap`) rather than
+        // all workers, so at most `ring_cap` rings ever carry registrations.
+        // `ring_cap` is clamped to `1..=workers.len()` at construction, so
+        // this is always a valid index and never divides by zero.
+        self.next_worker.fetch_add(1, Ordering::Relaxed) % self.ring_cap
     }
 
     /// Queue a `POLL_REMOVE` for `io` on the worker it was registered with.
