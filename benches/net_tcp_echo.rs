@@ -18,16 +18,44 @@ use tokio::runtime::{Builder, Runtime};
 const NUM_WORKERS: usize = 4;
 const NUM_CONNS: usize = 32;
 const MSGS_PER_CONN: usize = 64;
+const MSG_BYTES: usize = 1;
 
 /// Override `NUM_WORKERS` at runtime via `TOKIO_BENCH_WORKERS=N`.
 /// Used during the lazy-register hang investigation to compare 1-worker
 /// vs multi-worker behavior of the synchronous fastpath.
 fn workers() -> usize {
-    std::env::var("TOKIO_BENCH_WORKERS")
+    env_usize("TOKIO_BENCH_WORKERS", NUM_WORKERS)
+}
+
+/// Concurrent connections per criterion iteration. Override via
+/// `TOKIO_BENCH_CONNS=N`. Default 32. Raising this is how the
+/// RING_CAP high-concurrency probe forces enough offered concurrency
+/// to keep all cores busy (so a low ring cap can actually throttle).
+fn conns() -> usize {
+    env_usize("TOKIO_BENCH_CONNS", NUM_CONNS)
+}
+
+/// Round-trips per connection. Override via `TOKIO_BENCH_MSGS=N`.
+/// Default 64. Raise to make connections long-lived (sustained
+/// throughput, minimal connect/close churn).
+fn msgs_per_conn() -> usize {
+    env_usize("TOKIO_BENCH_MSGS", MSGS_PER_CONN)
+}
+
+/// Payload bytes per message. Override via `TOKIO_BENCH_MSG_BYTES=N`.
+/// Default 1 (the historical latency-bound ping-pong). Raise to move
+/// real data so post-wake userspace work has a cache-coherency cost —
+/// the regime where topology-blind ring placement could matter.
+fn msg_bytes() -> usize {
+    env_usize("TOKIO_BENCH_MSG_BYTES", MSG_BYTES).max(1)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(NUM_WORKERS)
+        .unwrap_or(default)
 }
 
 fn rt_traditional() -> Runtime {
@@ -55,18 +83,21 @@ fn rt_uring() -> Runtime {
 }
 
 fn run_tcp_echo(rt: &Runtime, b: &mut Bencher) {
+    let num_conns = conns();
+    let msgs = msgs_per_conn();
+    let bytes = msg_bytes();
     b.iter_custom(|iters| {
         rt.block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
             let server = tokio::spawn(async move {
-                let total = NUM_CONNS * iters as usize;
+                let total = num_conns * iters as usize;
                 for _ in 0..total {
                     let (mut sock, _) = listener.accept().await.unwrap();
                     tokio::spawn(async move {
-                        let mut buf = [0u8; 1];
-                        for _ in 0..MSGS_PER_CONN {
+                        let mut buf = vec![0u8; bytes];
+                        for _ in 0..msgs {
                             if sock.read_exact(&mut buf).await.is_err() {
                                 return;
                             }
@@ -80,13 +111,13 @@ fn run_tcp_echo(rt: &Runtime, b: &mut Bencher) {
 
             let start = Instant::now();
             for _ in 0..iters {
-                let mut handles = Vec::with_capacity(NUM_CONNS);
-                for _ in 0..NUM_CONNS {
+                let mut handles = Vec::with_capacity(num_conns);
+                for _ in 0..num_conns {
                     handles.push(tokio::spawn(async move {
                         let mut s = TcpStream::connect(addr).await.unwrap();
                         s.set_nodelay(true).unwrap();
-                        let mut buf = [0u8; 1];
-                        for i in 0..MSGS_PER_CONN {
+                        let mut buf = vec![0u8; bytes];
+                        for i in 0..msgs {
                             buf[0] = (i & 0xff) as u8;
                             s.write_all(&buf).await.unwrap();
                             s.read_exact(&mut buf).await.unwrap();
