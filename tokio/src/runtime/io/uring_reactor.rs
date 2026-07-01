@@ -121,6 +121,17 @@ const CQ_ENTRIES: u32 = 4096;
 /// in-process runtimes, etc.).
 static RING_SETUP_PERMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// `TOKIO_URING_DEFER_TASKRUN=0` → build rings WITHOUT
+/// `SINGLE_ISSUER`/`DEFER_TASKRUN`. Read once per process and cached so
+/// every ring in the process gets the same flags — a mid-run env change
+/// must not produce a mixed fleet.
+fn defer_taskrun_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("TOKIO_URING_DEFER_TASKRUN").is_ok_and(|v| v.trim() == "0")
+    })
+}
+
 /// Staged multishot-recv CQE, handed from the CQ drain loop to the
 /// post-loop dispatcher where `Arc<BufferRing>` cloning and inbox
 /// pushes happen outside the CQ-iterator borrow.
@@ -396,9 +407,17 @@ impl Reactor {
             let _permit = RING_SETUP_PERMIT
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            IoUring::builder()
-                .setup_single_issuer()
-                .setup_defer_taskrun()
+            let mut builder = IoUring::builder();
+            // `TOKIO_URING_DEFER_TASKRUN=0` drops SINGLE_ISSUER +
+            // DEFER_TASKRUN (COOP_TASKRUN stays). A/B knob for the
+            // uring-global design: DEFER_TASKRUN ties CQE posting to the
+            // owner's own `io_uring_enter`, which serializes completion
+            // processing onto one worker when fds are concentrated
+            // (TOKIO_URING_RING_CAP=1). Default on (historical behavior).
+            if !defer_taskrun_disabled() {
+                builder.setup_single_issuer().setup_defer_taskrun();
+            }
+            builder
                 .setup_coop_taskrun()
                 .setup_cqsize(CQ_ENTRIES)
                 .build(SQ_ENTRIES)?
