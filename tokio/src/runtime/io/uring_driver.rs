@@ -184,6 +184,23 @@ pub(crate) struct GlobalRing {
     /// wake mechanism.
     ring_waker: ExternalWaker,
 
+    /// `true` while some worker is blocked (or about to block) in
+    /// `submit_and_wait` on the shared ring. Set by the holder AFTER its
+    /// slot CAS to `PARKED` and BEFORE it drains `pending_ops`; cleared
+    /// after the kernel enter returns. [`Self::push_op`] skips the
+    /// eventfd syscall when this is `false` — the op will be drained at
+    /// the next holder's park-entry instead.
+    ///
+    /// Why the ordering makes the skip safe: `push_op` pushes under the
+    /// queue mutex and THEN loads this flag. If the load reads `false`,
+    /// the holder's `take_pending` (which happens after its `true`
+    /// store) has either not run yet — it will see the op — or ran
+    /// before our push, in which case the `true` store happened-before
+    /// our load (mutex release/acquire chains them) and we'd have read
+    /// `true`, a contradiction. Either way no op is stranded. A stale
+    /// `true` (holder just woke) costs one spurious eventfd CQE.
+    ring_parked: std::sync::atomic::AtomicBool,
+
     /// Per-worker park slots, indexed by worker id.
     slots: Box<[GlobalParkSlot]>,
 }
@@ -215,18 +232,23 @@ impl GlobalRing {
             reactor: TryLock::new(reactor),
             pending_ops: Mutex::new(Vec::new()),
             ring_waker,
+            ring_parked: std::sync::atomic::AtomicBool::new(false),
             slots: slots.into_boxed_slice(),
         })
     }
 
-    /// Queue a register/deregister op and kick the ring. The eventfd
-    /// write is unconditional: if a holder is blocked in
-    /// `submit_and_wait` it wakes and drains the queue; if nobody holds
-    /// the ring the CQE waits in the CQ for the next holder (the eventfd
-    /// counter coalesces, so a burst of pushes costs one drain).
+    /// Queue a register/deregister op and kick the ring — but only when
+    /// some worker is actually blocked in `submit_and_wait`. When nobody
+    /// is, the op waits for the next park-entry drain, which every path
+    /// into the ring performs before blocking; the eventfd write (a
+    /// syscall per op — measured +8..15% on `tcp_register_dereg` when
+    /// unconditional) buys nothing there. See `ring_parked` for the
+    /// ordering that makes the skip safe.
     pub(crate) fn push_op(&self, op: PendingOp) {
         self.pending_ops.lock().push(op);
-        let _ = self.ring_waker.wake();
+        if self.ring_parked.load(Ordering::SeqCst) {
+            let _ = self.ring_waker.wake();
+        }
     }
 
     fn take_ops(&self) -> Vec<PendingOp> {
@@ -293,6 +315,13 @@ impl GlobalRing {
             Err(actual) => panic!("inconsistent park state; actual = {actual}"),
         }
 
+        // Publish "the ring has a blocked driver" BEFORE draining the
+        // queue: `push_op`'s skip-the-wake fast path is only sound if a
+        // pusher that our drain misses is guaranteed to observe this
+        // store (mutex release/acquire on `pending_ops` chains the two —
+        // see `ring_parked`'s field docs).
+        self.ring_parked.store(true, Ordering::SeqCst);
+
         // Apply queued ops from all threads. May inline-reap; the
         // reactor's `inline_reaped` flag then degrades the park below to
         // a non-blocking pass (the reap can consume our own eventfd wake
@@ -308,6 +337,19 @@ impl GlobalRing {
         // Park errors are spurious wakes; liveness comes from the next
         // unpark, exactly as in per-worker mode.
         let _ = result;
+
+        self.ring_parked.store(false, Ordering::SeqCst);
+
+        // Ops pushed while we were blocked (whose eventfd CQE we just
+        // consumed) — drain them now rather than leaving them for the
+        // next park: the pusher's wake was consumed, and with the
+        // skip-the-wake fast path nobody re-kicks the ring for ops
+        // already in the queue.
+        let tail = self.take_ops();
+        if !tail.is_empty() {
+            apply_pending_ops(reactor, tail);
+            let _ = reactor.park_timeout(Duration::ZERO);
+        }
 
         match slot.state.swap(EMPTY, Ordering::SeqCst) {
             NOTIFIED => {} // got a notification
