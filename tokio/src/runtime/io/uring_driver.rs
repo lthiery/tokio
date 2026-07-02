@@ -44,17 +44,25 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::io::interest::Interest;
-use crate::loom::sync::Mutex;
+use crate::loom::sync::{Condvar, Mutex};
 use crate::runtime::io::registration_set;
 use crate::runtime::io::uring_arm_table::ArmTable;
-use crate::runtime::io::uring_reactor::{ExternalWaker, Reactor};
+use crate::runtime::io::uring_reactor::{uring_global_enabled, ExternalWaker, Reactor};
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
+use crate::util::TryLock;
+
+use std::time::Duration;
 
 /// Park-state atomic values. Shape mirrors the mio parker's transitions so
 /// integration stays familiar.
 pub(crate) const EMPTY: usize = 0;
 pub(crate) const PARKED: usize = 1;
 pub(crate) const NOTIFIED: usize = 2;
+/// Global-ring mode only: parked on the per-worker condvar because another
+/// worker holds the shared ring. Mirrors the stock parker's
+/// `PARKED_CONDVAR`; in global mode [`PARKED`] plays the stock
+/// `PARKED_DRIVER` role.
+pub(crate) const PARKED_CONDVAR: usize = 3;
 
 /// An operation that needs to be submitted on a specific worker's ring.
 ///
@@ -137,6 +145,287 @@ impl WorkerState {
     }
 }
 
+/// Per-worker park slot for global-ring mode. The stock parker's `Inner`
+/// state machine, minus the driver reference (the shared ring lives on
+/// [`GlobalRing`], not per worker).
+struct GlobalParkSlot {
+    /// `EMPTY | PARKED | NOTIFIED | PARKED_CONDVAR`, stock SeqCst
+    /// discipline throughout.
+    state: AtomicUsize,
+    mutex: Mutex<()>,
+    condvar: Condvar,
+}
+
+/// Phase-1 global-ring mode (`TOKIO_URING_GLOBAL=1`): ONE ring for the
+/// whole runtime, driven by whichever worker parks first — the stock mio
+/// `Parker` discipline with the uring [`Reactor`] in the driver seat.
+/// Design + kill-criterion: `.claude/DESIGN-uring-global-phase1.md`.
+///
+/// Rotation is legal only because this mode forces
+/// `SINGLE_ISSUER`/`DEFER_TASKRUN` off (see
+/// [`uring_global_enabled`]'s interaction with the defer knob): any
+/// thread may drive the ring, one at a time, serialized by the
+/// [`TryLock`].
+pub(crate) struct GlobalRing {
+    /// The one shared reactor. Whoever `try_lock`s it parks on the ring
+    /// and drains completions; everyone else condvar-parks.
+    reactor: TryLock<Reactor>,
+
+    /// Single pending-op queue — the global-mode analog of the per-worker
+    /// `WorkerState::pending_ops`. Applied by the ring holder at
+    /// park-entry; the `17eb1a7b` backpressure (zombie reap +
+    /// `inline_reaped` park degradation) rides along unchanged.
+    pending_ops: Mutex<Vec<PendingOp>>,
+
+    /// Wakes whatever thread is blocked in `submit_and_wait` on the
+    /// shared ring. Cloned from the reactor at construction. MSG_RING is
+    /// useless in this mode — there is only one ring, and a sender would
+    /// need a second ring to submit from — so the eventfd is the sole
+    /// wake mechanism.
+    ring_waker: ExternalWaker,
+
+    /// Per-worker park slots, indexed by worker id.
+    slots: Box<[GlobalParkSlot]>,
+}
+
+impl std::fmt::Debug for GlobalRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GlobalRing")
+            .field("num_workers", &self.slots.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GlobalRing {
+    /// Build the shared reactor eagerly. Runs on the runtime-builder
+    /// thread — legal because global mode never sets `SINGLE_ISSUER`, so
+    /// the ring is not bound to its constructing thread.
+    fn new(num_workers: usize) -> io::Result<Self> {
+        let reactor = Reactor::new()?;
+        let ring_waker = reactor.external_waker();
+        let mut slots = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            slots.push(GlobalParkSlot {
+                state: AtomicUsize::new(EMPTY),
+                mutex: Mutex::new(()),
+                condvar: Condvar::new(),
+            });
+        }
+        Ok(Self {
+            reactor: TryLock::new(reactor),
+            pending_ops: Mutex::new(Vec::new()),
+            ring_waker,
+            slots: slots.into_boxed_slice(),
+        })
+    }
+
+    /// Queue a register/deregister op and kick the ring. The eventfd
+    /// write is unconditional: if a holder is blocked in
+    /// `submit_and_wait` it wakes and drains the queue; if nobody holds
+    /// the ring the CQE waits in the CQ for the next holder (the eventfd
+    /// counter coalesces, so a burst of pushes costs one drain).
+    pub(crate) fn push_op(&self, op: PendingOp) {
+        self.pending_ops.lock().push(op);
+        let _ = self.ring_waker.wake();
+    }
+
+    fn take_ops(&self) -> Vec<PendingOp> {
+        std::mem::take(&mut *self.pending_ops.lock())
+    }
+
+    /// Park worker `idx`. Stock `Inner::park` flow: consume a pending
+    /// notification, else race for the ring, else condvar.
+    ///
+    /// `driver_duration` is the ring-holder timeout (caller has already
+    /// min'd in the legacy timer deadline); `condvar_duration` is the raw
+    /// scheduler timeout. They differ because timers are the ring
+    /// holder's job — condvar parkers must not spin on timer deadlines.
+    pub(crate) fn park_worker(
+        &self,
+        idx: usize,
+        driver_duration: Option<Duration>,
+        condvar_duration: Option<Duration>,
+    ) {
+        let slot = &self.slots[idx];
+        if slot
+            .state
+            .compare_exchange(NOTIFIED, EMPTY, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+
+        if let Some(mut reactor) = self.reactor.try_lock() {
+            self.park_driver(idx, &mut reactor, driver_duration);
+        } else {
+            self.park_condvar(idx, condvar_duration);
+        }
+    }
+
+    fn park_driver(&self, idx: usize, reactor: &mut Reactor, duration: Option<Duration>) {
+        let slot = &self.slots[idx];
+
+        if duration.as_ref().is_some_and(Duration::is_zero) {
+            // Zero-duration "park" is a maintenance poll: apply queued
+            // ops and drain without blocking, no park-state transition.
+            apply_pending_ops(reactor, self.take_ops());
+            let _ = reactor.park_timeout(Duration::ZERO);
+            return;
+        }
+
+        match slot
+            .state
+            .compare_exchange(EMPTY, PARKED, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => {}
+            Err(NOTIFIED) => {
+                // Same consume-the-notification re-read as the stock
+                // parker (synchronizes with a racing second unpark).
+                let old = slot.state.swap(EMPTY, Ordering::SeqCst);
+                debug_assert_eq!(old, NOTIFIED, "park state changed unexpectedly");
+                // Don't block, but don't strand queued ops either: they
+                // may include registrations whose eventfd kick already
+                // fired (and whose CQE we're about to consume).
+                apply_pending_ops(reactor, self.take_ops());
+                let _ = reactor.park_timeout(Duration::ZERO);
+                return;
+            }
+            Err(actual) => panic!("inconsistent park state; actual = {actual}"),
+        }
+
+        // Apply queued ops from all threads. May inline-reap; the
+        // reactor's `inline_reaped` flag then degrades the park below to
+        // a non-blocking pass (the reap can consume our own eventfd wake
+        // CQE while `state == PARKED`, and unparkers who saw PARKED have
+        // already stopped re-delivering — same invariant as per-worker
+        // mode).
+        apply_pending_ops(reactor, self.take_ops());
+
+        let result = match duration {
+            Some(dur) => reactor.park_timeout(dur),
+            None => reactor.park(),
+        };
+        // Park errors are spurious wakes; liveness comes from the next
+        // unpark, exactly as in per-worker mode.
+        let _ = result;
+
+        match slot.state.swap(EMPTY, Ordering::SeqCst) {
+            NOTIFIED => {} // got a notification
+            PARKED => {}   // no notification
+            n => panic!("inconsistent park_driver state: {n}"),
+        }
+    }
+
+    fn park_condvar(&self, idx: usize, duration: Option<Duration>) {
+        let slot = &self.slots[idx];
+        let mut m = slot.mutex.lock();
+
+        match slot
+            .state
+            .compare_exchange(EMPTY, PARKED_CONDVAR, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => {}
+            Err(NOTIFIED) => {
+                let old = slot.state.swap(EMPTY, Ordering::SeqCst);
+                debug_assert_eq!(old, NOTIFIED, "park state changed unexpectedly");
+                return;
+            }
+            Err(actual) => panic!("inconsistent park state; actual = {actual}"),
+        }
+
+        let timeout_at = duration.map(|d| {
+            std::time::Instant::now()
+                .checked_add(d)
+                .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(1))
+        });
+
+        loop {
+            let is_timeout;
+            (m, is_timeout) = match timeout_at {
+                Some(timeout_at) => {
+                    let dur = timeout_at.saturating_duration_since(std::time::Instant::now());
+                    if !dur.is_zero() {
+                        let (m, res) = slot.condvar.wait_timeout(m, dur).unwrap();
+                        (m, res.timed_out())
+                    } else {
+                        (m, true)
+                    }
+                }
+                None => (slot.condvar.wait(m).unwrap(), false),
+            };
+
+            if is_timeout {
+                match slot.state.swap(EMPTY, Ordering::SeqCst) {
+                    PARKED_CONDVAR => return, // timed out, no notification
+                    NOTIFIED => return,       // notification raced the timeout
+                    actual => panic!("inconsistent park_condvar state: {actual}"),
+                }
+            } else if slot
+                .state
+                .compare_exchange(NOTIFIED, EMPTY, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return;
+            }
+            // Spurious wakeup — back to sleep.
+        }
+    }
+
+    /// Unpark worker `idx`. Stock `Inner::unpark`: the swap (not CAS) is
+    /// the release that `park` synchronizes with.
+    pub(crate) fn unpark(&self, idx: usize) -> bool {
+        let slot = &self.slots[idx];
+        match slot.state.swap(NOTIFIED, Ordering::SeqCst) {
+            EMPTY | NOTIFIED => false,
+            PARKED_CONDVAR => {
+                // Lock/drop the mutex before notifying — closes the
+                // window between the parker's state store and its
+                // condvar wait (stock `unpark_condvar` rationale).
+                drop(slot.mutex.lock());
+                slot.condvar.notify_one();
+                true
+            }
+            PARKED => {
+                // Parked driving the shared ring: eventfd CQE unblocks
+                // its `submit_and_wait`.
+                let _ = self.ring_waker.wake();
+                true
+            }
+            actual => panic!("inconsistent state in unpark; actual = {actual}"),
+        }
+    }
+}
+
+/// Translate a batch of [`PendingOp`]s into SQEs on `reactor`'s ring.
+///
+/// Shared by the per-worker parker (each worker drains its own queue)
+/// and global-ring mode (the current holder drains the one queue). SQEs
+/// are staged, not submitted — they flush with the next
+/// `submit_and_wait` or explicit non-blocking submit. (Not quite
+/// unconditionally: `Reactor::register`/`deregister` reap completions
+/// in-line when enough reclaimable slots have piled up, so a long batch
+/// cannot run slab occupancy through the ArmTable ceiling.)
+///
+/// Individual errors are dropped here because the reactor already
+/// surfaces them: a failed register marks its `ScheduledIo` shutdown
+/// (waiters observe "IO driver has terminated"), and a failed deregister
+/// is at worst a missed cancel that the terminal-CQE path cleans up.
+pub(crate) fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) {
+    for op in pending {
+        let _ = match op {
+            PendingOp::Register { fd, interest, io } => reactor.register(fd, interest, &io),
+            // Slab identity is read HERE, at drain time — any Register for
+            // this `io` queued ahead of us on the same FIFO has already
+            // been applied, so the key/gen are the live ones (a push-time
+            // snapshot would still read u32::MAX and leak the armed poll).
+            PendingOp::Deregister { io } => {
+                let (slab_key, slab_gen) = io.uring_slab_identity();
+                reactor.deregister(slab_key, slab_gen)
+            }
+        };
+    }
+}
+
 /// Shared I/O handle for the uring-reactor backend.
 ///
 /// The Handle-side analog of the mio driver's [`Handle`]. Holds per-worker
@@ -149,6 +438,13 @@ pub(crate) struct UringHandle {
     /// Per-worker state, indexed by worker id. Length equals the runtime's
     /// worker count and does not change after construction.
     workers: Box<[WorkerState]>,
+
+    /// `Some` iff `TOKIO_URING_GLOBAL=1`: the Phase-1 shared-ring mode.
+    /// When set, the per-worker machinery above is bypassed entirely —
+    /// no per-worker reactors are built, registrations funnel into the
+    /// [`GlobalRing`]'s single queue, and unparks route through its
+    /// stock-parker state machine.
+    global: Option<Arc<GlobalRing>>,
 
     /// Round-robin counter for assigning newly registered fds to workers.
     /// Bumped once per `add_source` call.
@@ -227,8 +523,21 @@ impl UringHandle {
         // workers is degenerate but we keep it constructible for tests.
         let barrier_count = num_workers.max(1);
         let ring_cap = Self::read_ring_cap_env(num_workers);
+        // Global-ring mode builds its one reactor eagerly, here on the
+        // runtime-builder thread (legal: no SINGLE_ISSUER in this mode).
+        // Failure at this point means the kernel lacks io_uring support —
+        // the same condition the per-worker mode `expect`s on at first
+        // park, surfaced a little earlier.
+        let global = uring_global_enabled().then(|| {
+            Arc::new(GlobalRing::new(num_workers).expect(
+                "failed to construct shared io_uring Reactor for \
+                 TOKIO_URING_GLOBAL=1 (kernel must support io_uring, \
+                 Linux 6.0+)",
+            ))
+        });
         Self {
             workers: workers.into_boxed_slice(),
+            global,
             next_worker: AtomicUsize::new(0),
             ring_cap,
             registrations,
@@ -236,6 +545,11 @@ impl UringHandle {
             metrics: IoDriverMetrics::default(),
             start_barrier: std::sync::Barrier::new(barrier_count),
         }
+    }
+
+    /// The Phase-1 shared ring, iff `TOKIO_URING_GLOBAL=1`.
+    pub(crate) fn global_ring(&self) -> Option<&Arc<GlobalRing>> {
+        self.global.as_ref()
     }
 
     /// Resolve the active-ring-set cap from `TOKIO_URING_RING_CAP`, clamped
@@ -314,6 +628,9 @@ impl UringHandle {
     ///
     /// Returns `true` if a wake was delivered to the kernel (for metrics).
     pub(crate) fn unpark(&self, worker_idx: usize) -> bool {
+        if let Some(g) = self.global.as_ref() {
+            return g.unpark(worker_idx);
+        }
         let slot = &self.workers[worker_idx];
         // Swap to NOTIFIED with Release ordering so that any prior writes
         // by the caller (e.g., task queue push) are visible to the woken
@@ -404,6 +721,19 @@ impl UringHandle {
     ) -> io::Result<(Arc<ScheduledIo>, usize)> {
         let io = self.registrations.allocate(&mut self.synced.lock())?;
 
+        if let Some(g) = self.global.as_ref() {
+            // Global mode: one queue, no placement decision. Worker index
+            // 0 is a placeholder — deregister routes by mode, not index.
+            io.uring_worker.store(0, Ordering::Relaxed);
+            g.push_op(PendingOp::Register {
+                fd,
+                interest,
+                io: Arc::clone(&io),
+            });
+            self.metrics.incr_fd_count();
+            return Ok((io, 0));
+        }
+
         let worker_idx = self.fallback_worker();
 
         // Publish the assigned worker onto the ScheduledIo so callers can
@@ -457,6 +787,17 @@ impl UringHandle {
         // Arc.
         self.registrations
             .allocate_existing(&mut self.synced.lock(), shared)?;
+
+        if let Some(g) = self.global.as_ref() {
+            shared.uring_worker.store(0, Ordering::Relaxed);
+            g.push_op(PendingOp::Register {
+                fd,
+                interest,
+                io: Arc::clone(shared),
+            });
+            self.metrics.incr_fd_count();
+            return Ok(0);
+        }
 
         let worker_idx = self.fallback_worker();
 
@@ -515,6 +856,16 @@ impl UringHandle {
         io: &Arc<ScheduledIo>,
         worker_idx: usize,
     ) -> io::Result<()> {
+        if let Some(g) = self.global.as_ref() {
+            // Same FIFO as the Register (drain-time identity read applies
+            // identically), same release bookkeeping as below; the ring
+            // kick is push_op's unconditional eventfd write.
+            g.push_op(PendingOp::Deregister { io: Arc::clone(io) });
+            let _ = self.registrations.deregister(&mut self.synced.lock(), io);
+            self.metrics.dec_fd_count();
+            return Ok(());
+        }
+
         // Queue the POLL_REMOVE first so that if the caller races with
         // shutdown, the kernel-side cleanup still lands before the Arc is
         // freed. The worker drains this at its next park() call.

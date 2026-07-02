@@ -41,7 +41,7 @@
 use crate::loom::sync::Arc;
 use crate::runtime::driver;
 use crate::runtime::io::uring_driver::{
-    clear_local_reactor, install_local_reactor_raw, PendingOp, UringHandle,
+    apply_pending_ops, clear_local_reactor, install_local_reactor_raw, UringHandle,
 };
 use crate::runtime::io::uring_reactor::Reactor;
 use crate::runtime::scheduler::multi_thread::park::HadDriver;
@@ -182,6 +182,9 @@ impl UringParker {
 
     /// Park the worker until woken.
     pub(crate) fn park(&mut self, driver: &driver::Handle) -> HadDriver {
+        if self.handle.global_ring().is_some() {
+            return self.park_global(driver, None);
+        }
         let park_dur = self.compute_legacy_timer_duration(driver, None);
         self.park_internal(park_dur);
         self.process_legacy_timer_after_park(driver);
@@ -194,8 +197,36 @@ impl UringParker {
         driver: &driver::Handle,
         duration: Duration,
     ) -> HadDriver {
+        if self.handle.global_ring().is_some() {
+            return self.park_global(driver, Some(duration));
+        }
         let park_dur = self.compute_legacy_timer_duration(driver, Some(duration));
         self.park_internal(park_dur);
+        self.process_legacy_timer_after_park(driver);
+        HadDriver::Yes
+    }
+
+    /// Global-ring (`TOKIO_URING_GLOBAL=1`) park flow: race for the
+    /// shared ring, drive it if won, condvar-park otherwise — the stock
+    /// `Parker` discipline (see `GlobalRing`).
+    ///
+    /// Timer split: the ring holder parks with the legacy-timer-min'd
+    /// deadline and processes the wheel after waking (it is "the driver"
+    /// in the stock sense); condvar parkers use the raw scheduler
+    /// timeout and leave timers to the holder.
+    fn park_global(&mut self, driver: &driver::Handle, duration: Option<Duration>) -> HadDriver {
+        let g = self
+            .handle
+            .global_ring()
+            .expect("park_global called without a global ring")
+            .clone();
+        let driver_duration = self.compute_legacy_timer_duration(driver, duration);
+        g.park_worker(self.idx, driver_duration, duration);
+        // Release ScheduledIos queued for drop and advance the legacy
+        // wheel. Both are cheap no-ops when there is nothing due, so we
+        // run them regardless of whether we actually held the ring —
+        // distinguishing would buy little and cost plumbing.
+        self.handle.release_pending_registrations();
         self.process_legacy_timer_after_park(driver);
         HadDriver::Yes
     }
@@ -350,7 +381,12 @@ impl UringParker {
     /// opportunity (e.g. isolated unit tests that drive `park` directly)
     /// still initializes correctly on first use.
     pub(crate) fn eager_init_and_sync(&mut self) {
-        self.ensure_reactor_installed();
+        // Global-ring mode has no per-worker reactor to build — the one
+        // shared ring was constructed with the handle. The startup
+        // barrier still applies (same cross-worker clock-skew rationale).
+        if self.handle.global_ring().is_none() {
+            self.ensure_reactor_installed();
+        }
         self.handle.wait_for_start();
     }
 
@@ -394,42 +430,6 @@ impl UringParker {
         // `clear_current_worker` calls in `shutdown` / `Drop`.
         set_current_worker(self.idx);
         self.tls_installed = true;
-    }
-}
-
-/// Translate a batch of [`PendingOp`]s into SQEs on `reactor`'s ring.
-///
-/// The SQEs are staged but not submitted — they flush together with the
-/// next `submit_and_wait` (park) or explicit non-blocking submit. (Not
-/// quite unconditionally: `Reactor::register`/`deregister` reap
-/// completions in-line when enough reclaimable slots have piled up, so a
-/// long batch cannot run slab occupancy through the ArmTable ceiling —
-/// the `tcp_register_dereg` wedge.)
-///
-/// Individual errors are dropped here because the reactor already
-/// surfaces them: a failed register marks its `ScheduledIo` shutdown
-/// (waiters observe "IO driver has terminated" — see
-/// `Reactor::register`'s failure docs), and a failed deregister is at
-/// worst a missed cancel that the terminal-CQE path cleans up.
-fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) {
-    for op in pending {
-        let _ = match op {
-            PendingOp::Register { fd, interest, io } => reactor.register(fd, interest, &io),
-            // Slab identity is read HERE, at drain time — any Register for
-            // this `io` queued ahead of us on the same FIFO has already
-            // been applied, so the key/gen are the live ones (a push-time
-            // snapshot would still read u32::MAX and leak the armed poll).
-            // `reactor.deregister` still gen-checks against the current
-            // slab state: a genuinely stale identity is silently dropped
-            // rather than risking a mis-cancel. The Arc held inside the
-            // slab slot is released only when the kernel posts the terminal
-            // CQE for the multi-shot poll (no `IORING_CQE_F_MORE`); see
-            // `uring_reactor::Reactor::deregister`.
-            PendingOp::Deregister { io } => {
-                let (slab_key, slab_gen) = io.uring_slab_identity();
-                reactor.deregister(slab_key, slab_gen)
-            }
-        };
     }
 }
 

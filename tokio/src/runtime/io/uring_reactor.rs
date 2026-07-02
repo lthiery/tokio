@@ -155,10 +155,30 @@ static RING_SETUP_PERMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// `SINGLE_ISSUER`/`DEFER_TASKRUN`. Read once per process and cached so
 /// every ring in the process gets the same flags — a mid-run env change
 /// must not produce a mixed fleet.
+///
+/// Implied by [`uring_global_enabled`]: driver-holder rotation is
+/// illegal under `SINGLE_ISSUER` (the kernel binds the ring's submitter
+/// to one task), so the global-ring mode forces these flags off no
+/// matter what `TOKIO_URING_DEFER_TASKRUN` says.
 fn defer_taskrun_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| {
         std::env::var("TOKIO_URING_DEFER_TASKRUN").is_ok_and(|v| v.trim() == "0")
+    }) || uring_global_enabled()
+}
+
+/// `TOKIO_URING_GLOBAL=1` → Phase-1 global-ring mode: ONE shared ring
+/// for the whole runtime, driven by whichever worker parks first (the
+/// stock mio `Parker` discipline), instead of one ring per worker.
+/// Read once per process and cached, same rationale as the defer knob.
+///
+/// See `.claude/DESIGN-uring-global-phase1.md` in the repo root for the
+/// design, the task_work-pinning concern, and the pre-registered
+/// kill-criterion.
+pub(crate) fn uring_global_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TOKIO_URING_GLOBAL").is_ok_and(|v| v.trim() == "1")
     })
 }
 

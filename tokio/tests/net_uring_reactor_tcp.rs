@@ -35,6 +35,20 @@ fn build_rt(workers: usize) -> runtime::Runtime {
         .expect("uring reactor runtime builds")
 }
 
+/// The owned-buffer APIs (`uring_send`/`uring_recv`/`uring_recv_multi`)
+/// submit through the caller's per-worker `LOCAL_REACTOR`, which the
+/// global-ring mode (`TOKIO_URING_GLOBAL=1`) intentionally never
+/// installs — there, they return `Unsupported` by design (see
+/// `.claude/DESIGN-uring-global-phase1.md`). Tests exercising those
+/// APIs skip under the knob instead of failing.
+fn skip_in_global_mode() -> bool {
+    let skip = std::env::var("TOKIO_URING_GLOBAL").is_ok_and(|v| v.trim() == "1");
+    if skip {
+        eprintln!("skipping: owned-buffer uring APIs are Unsupported under TOKIO_URING_GLOBAL=1");
+    }
+    skip
+}
+
 #[test]
 fn tcp_single_worker_round_trip() {
     let rt = build_rt(1);
@@ -177,6 +191,9 @@ fn tcp_read_blocks_then_wakes() {
 
 #[test]
 fn uring_send_recv_round_trip() {
+    if skip_in_global_mode() {
+        return;
+    }
     use bytes::{Bytes, BytesMut};
     let rt = build_rt(1);
     rt.block_on(async {
@@ -217,6 +234,9 @@ fn uring_send_recv_round_trip() {
 
 #[test]
 fn uring_recv_short_read_returns_partial_buffer() {
+    if skip_in_global_mode() {
+        return;
+    }
     // Capacity 64, peer sends 3 bytes and closes — the kernel's recv
     // returns 3, the buffer is 64 bytes long, and bytes [0..3] match
     // the payload.
@@ -280,6 +300,9 @@ fn uring_send_off_worker_returns_unsupported_with_buf() {
 
 #[test]
 fn uring_recv_multi_round_trip_and_eof() {
+    if skip_in_global_mode() {
+        return;
+    }
     // Exercise the multishot recv path end-to-end:
     //   1) Client arms `uring_recv_multi` on a connected socket.
     //   2) Server `uring_send`s two messages, then closes.
@@ -330,6 +353,9 @@ fn uring_recv_multi_round_trip_and_eof() {
 
 #[test]
 fn uring_send_future_drop_is_safe() {
+    if skip_in_global_mode() {
+        return;
+    }
     // Drop the uring_send future *before* it completes. The buffer
     // must not be freed until the terminal CQE (potentially
     // `-ECANCELED` from our best-effort AsyncCancel) arrives. We
