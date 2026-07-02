@@ -433,6 +433,38 @@ fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) {
     }
 }
 
+/// Converts an unwinding uring worker thread into a loud process abort.
+///
+/// Armed on the worker's `run` stack (see `worker::run`) for the whole
+/// worker lifetime. A uring worker that dies by panic leaves a *deaf
+/// ring* behind: its registrations still point at a CQ nobody will ever
+/// drain, so sibling workers and `block_on` callers wait forever on
+/// wakes that cannot arrive. That failure mode is strictly worse than a
+/// crash — the ArmTable-exhaustion panic presented as a silent 3-hour
+/// bench hang (runs `d7800935`/`6c0fd25e`) before it was root-caused.
+/// There is no in-process recovery: ring registrations cannot be
+/// migrated off a dead worker's ring.
+///
+/// Task panics never reach this guard (the task harness catches them);
+/// only scheduler/driver invariant violations unwind through `run`.
+pub(crate) struct AbortIfPanicking {
+    pub(crate) worker: usize,
+}
+
+impl Drop for AbortIfPanicking {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!(
+                "uring worker {} died by panic; aborting the process: \
+                 a dead worker's ring cannot be drained or migrated and \
+                 the runtime would otherwise hang silently",
+                self.worker,
+            );
+            std::process::abort();
+        }
+    }
+}
+
 impl Drop for UringParker {
     fn drop(&mut self) {
         // Belt-and-braces TLS clear. If `shutdown` ran, this is a no-op; if

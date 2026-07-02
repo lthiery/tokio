@@ -278,6 +278,21 @@ impl WorkerParker {
         }
     }
 
+    /// `true` when this worker parks on an io_uring reactor. Used by
+    /// `worker::run` to decide whether to arm the panic→abort guard
+    /// (`uring_park::AbortIfPanicking`) — a compiled-in `Uring` variant is
+    /// not enough, since the same binary can also construct traditional
+    /// runtimes whose panic behavior must stay stock.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    pub(crate) fn is_uring(&self) -> bool {
+        matches!(self, WorkerParker::Uring(_))
+    }
+
     /// Called once per worker at the top of `worker::run`, before any task
     /// is polled. For the uring flavor this builds the per-worker reactor
     /// (which must happen on the worker's own thread because of

@@ -776,6 +776,25 @@ fn run(worker: Arc<Worker>) {
         None => return,
     };
 
+    // For uring-flavored runtimes, a worker that dies by unwind leaves a
+    // deaf ring behind and the runtime hangs instead of failing — abort
+    // loudly instead. Armed for the whole worker lifetime; task panics
+    // are caught by the task harness and never unwind through here. See
+    // `AbortIfPanicking`'s docs for the full rationale.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    let _abort_if_panicking = core
+        .park
+        .as_ref()
+        .is_some_and(|p| p.is_uring())
+        .then_some(crate::runtime::scheduler::multi_thread::uring_park::AbortIfPanicking {
+            worker: worker.index,
+        });
+
     // Eager per-worker startup. For the uring flavor this builds the
     // per-worker reactor (on this thread, as required by
     // `IORING_SETUP_SINGLE_ISSUER`) under a process-wide setup permit, and
