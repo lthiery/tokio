@@ -304,6 +304,19 @@ impl ScheduledIo {
         mio::Token(super::EXPOSE_IO.expose_provenance(self))
     }
 
+    /// Current `(slab_key, gen)` uring registration identity. Read at
+    /// pending-op DRAIN time by the owning worker's `Deregister` handler —
+    /// reading at queue time instead races with a still-queued `Register`
+    /// on the same FIFO and observes `u32::MAX` (see `PendingOp::Deregister`).
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(crate) fn uring_slab_identity(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering;
+        (
+            self.uring_slab_key.load(Ordering::Relaxed),
+            self.uring_gen.load(Ordering::Relaxed),
+        )
+    }
+
     /// Invoked when the IO driver is shut down; forces this `ScheduledIo` into a
     /// permanently shutdown state.
     pub(super) fn shutdown(&self) {

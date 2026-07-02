@@ -74,12 +74,17 @@ pub(crate) enum PendingOp {
         interest: Interest,
         io: Arc<ScheduledIo>,
     },
-    /// Submit a POLL_REMOVE for the slab slot identified by `(slab_key,
-    /// slab_gen)`. The snapshot is taken at the time the pending op is
-    /// queued; a stale request is detected by gen-check inside
-    /// `Reactor::deregister` and silently ignored. The slab entry's Arc is
+    /// Submit a POLL_REMOVE for `io`'s registration. The slab identity is
+    /// read from `io.uring_slab_key`/`uring_gen` at DRAIN time, not queue
+    /// time: an off-worker register + immediate dereg lands both ops in
+    /// this FIFO before the worker has processed either, so at push time
+    /// the key is still `u32::MAX` — a push-time snapshot silently no-ops
+    /// and leaks the armed POLL_ADD_MULTI (slab slot never freed; found
+    /// as the `tcp_register_dereg` ArmTable-exhaustion wedge). FIFO on the
+    /// same queue guarantees the Register was drained first, so the
+    /// drain-time read observes the real key. The slab entry's Arc is
     /// released by the reactor on the terminal CQE, not here.
-    Deregister { slab_key: u32, slab_gen: u32 },
+    Deregister { io: Arc<ScheduledIo> },
 }
 
 /// Per-worker coordination slot. One of these per worker, indexed by worker
@@ -514,16 +519,15 @@ impl UringHandle {
         // shutdown, the kernel-side cleanup still lands before the Arc is
         // freed. The worker drains this at its next park() call.
         //
-        // We snapshot the slab identity at push time. If the snapshot is
-        // already stale (e.g. the resource was never fully registered),
-        // the reactor's gen-check in `Reactor::deregister` will drop the
-        // request silently.
+        // The slab identity is read at drain time (see `PendingOp::
+        // Deregister` docs) — a push-time snapshot races with a still-
+        // queued Register on this same FIFO and leaks the registration.
         if worker_idx < self.workers.len() {
-            let slab_key = io.uring_slab_key.load(Ordering::Relaxed);
-            let slab_gen = io.uring_gen.load(Ordering::Relaxed);
             let slot = &self.workers[worker_idx];
             let mut queue = slot.pending_ops.lock();
-            queue.push(PendingOp::Deregister { slab_key, slab_gen });
+            queue.push(PendingOp::Deregister {
+                io: Arc::clone(io),
+            });
         }
 
         // Mark the registration for release; the worker-side drain of

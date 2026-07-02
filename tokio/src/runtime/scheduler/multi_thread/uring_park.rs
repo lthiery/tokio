@@ -409,14 +409,18 @@ fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) {
     for op in pending {
         let _ = match op {
             PendingOp::Register { fd, interest, io } => reactor.register(fd, interest, &io),
-            // The caller snapshotted the slab identity at queue time.
-            // `reactor.deregister` gen-checks this against the current slab
-            // state: a stale snapshot is silently dropped rather than
-            // risking a mis-cancel. The Arc held inside the slab slot is
-            // released only when the kernel posts the terminal CQE for the
-            // multi-shot poll (no `IORING_CQE_F_MORE`); see
+            // Slab identity is read HERE, at drain time — any Register for
+            // this `io` queued ahead of us on the same FIFO has already
+            // been applied, so the key/gen are the live ones (a push-time
+            // snapshot would still read u32::MAX and leak the armed poll).
+            // `reactor.deregister` still gen-checks against the current
+            // slab state: a genuinely stale identity is silently dropped
+            // rather than risking a mis-cancel. The Arc held inside the
+            // slab slot is released only when the kernel posts the terminal
+            // CQE for the multi-shot poll (no `IORING_CQE_F_MORE`); see
             // `uring_reactor::Reactor::deregister`.
-            PendingOp::Deregister { slab_key, slab_gen } => {
+            PendingOp::Deregister { io } => {
+                let (slab_key, slab_gen) = io.uring_slab_identity();
                 reactor.deregister(slab_key, slab_gen)
             }
         };
