@@ -57,7 +57,7 @@ use slab::Slab;
 use crate::io::{Interest, Ready};
 use crate::loom::sync::Arc;
 use crate::runtime::io::driver::Tick;
-use crate::runtime::io::uring_arm_table::ArmTable;
+use crate::runtime::io::uring_arm_table::{ArmTable, ARM_CHUNK, ARM_MAX_CHUNKS};
 use crate::runtime::io::ScheduledIo;
 
 use std::io;
@@ -94,6 +94,36 @@ const SQ_ENTRIES: u32 = 128;
 /// and we observe hangs in the multishot-POLL drain path — so we stay
 /// generously above the working-set size.
 const CQ_ENTRIES: u32 = 4096;
+
+/// Hard ceiling on concurrently-occupied slab slots, equal to the
+/// [`ArmTable`]'s addressable capacity (262 144). `register` fails with an
+/// error once occupancy reaches this — after attempting an in-line reap —
+/// rather than arming a poll the arm table could never disarm.
+///
+/// The ceiling is a real capacity limit only for genuinely-live
+/// registrations (262k concurrent fds on one ring); transient occupancy
+/// from register/deregister churn is kept far below it by the zombie
+/// reaping in [`Reactor::reap_if_crowded`].
+const SLOT_BUDGET: usize = ARM_CHUNK * ARM_MAX_CHUNKS;
+
+/// In-line reap trigger: once this many deregistered-but-unreaped slots
+/// ("zombies" — POLL_REMOVE submitted, terminal CQE not yet processed)
+/// have accumulated, `register`/`deregister` drain completions before
+/// proceeding.
+///
+/// Why this exists: slab slots are freed only when terminal CQEs are
+/// processed, which normally happens at park. An off-thread
+/// register/deregister flood (`tcp_register_dereg`: a `block_on` caller
+/// cycling fd registrations in a tight loop with no await point) queues
+/// ops faster than the park cadence reaps them — observed at ~262k live
+/// slots, i.e. straight through the ArmTable ceiling. mio is immune
+/// because `epoll_ctl` is synchronous; this reap is the uring path's
+/// equivalent backpressure.
+///
+/// Sized so a reap cycle's CQE burst (2 CQEs per zombie: the POLL_REMOVE
+/// ack and the terminal `-ECANCELED`) stays comfortably inside
+/// [`CQ_ENTRIES`].
+const ZOMBIE_REAP_WATER: usize = 512;
 
 /// Process-wide permit for `io_uring_setup`.
 ///
@@ -325,6 +355,25 @@ pub(crate) struct Reactor {
     /// astronomically unlikely to collide with an outstanding CQE.
     next_gen: u32,
 
+    /// Count of deregistered-but-unreaped `PollMulti` slots: incremented
+    /// when [`Self::deregister`] submits a POLL_REMOVE, decremented when
+    /// the drain processes the slot's terminal CQE. Drives the in-line
+    /// reap in [`Self::reap_if_crowded`] — see [`ZOMBIE_REAP_WATER`].
+    zombies: usize,
+
+    /// Set when [`Self::reap_if_crowded`] drained the CQ; consumed by the
+    /// next `park`/`park_timeout`, which must then NOT block. The in-line
+    /// reap runs between the parker's `begin_park` (park state already
+    /// `PARKED`) and the blocking `submit_and_wait` — a window in which an
+    /// unparker may have delivered its eventfd/MSG_RING wake CQE. If the
+    /// reap consumes that CQE, the unparker's `NOTIFIED` flag stands and
+    /// every subsequent unpark skips the syscall, so blocking now would
+    /// sleep on a wake that will never re-fire (observed as the second
+    /// `tcp_register_dereg` wedge: worker in `io_cqring_wait`, `block_on`
+    /// caller futex-parked, both forever). Degrading that one park to a
+    /// non-blocking pass costs a spurious worker-loop iteration per reap.
+    inline_reaped: bool,
+
     /// Provided-buffer ring for multishot recv. Lazily initialized on
     /// first [`Self::submit_recv_multi`] — reactors that never see a
     /// multishot recv pay no memory cost. Shared via `Arc` so
@@ -444,6 +493,8 @@ impl Reactor {
             // Start at 1; gen=0 is reserved for the never-recycled
             // well-known slots so they don't compete for the counter.
             next_gen: 1,
+            zombies: 0,
+            inline_reaped: false,
             buf_ring: None,
         })
     }
@@ -529,12 +580,31 @@ impl Reactor {
     /// the drain loop removes the slot and drops the `Arc`. There is no
     /// pointer-aliasing risk: the kernel only ever sees the encoded
     /// `user_data`, never the `ScheduledIo` address.
+    ///
+    /// # Failure
+    ///
+    /// A failed register is terminal for `scheduled_io`: no poll was
+    /// armed, so no readiness will ever arrive, and the pending-op queue
+    /// this call is drained from has no way to report the error back to
+    /// the registering task. We mark the `ScheduledIo` shutdown before
+    /// returning, so its waiters observe "IO driver has terminated"
+    /// instead of hanging forever.
     pub(crate) fn register(
         &mut self,
         fd: RawFd,
         interest: Interest,
         scheduled_io: &Arc<ScheduledIo>,
     ) -> io::Result<()> {
+        self.reap_if_crowded();
+        if self.ops.len() >= SLOT_BUDGET {
+            // Still full after the reap: genuinely at capacity.
+            scheduled_io.shutdown();
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "io_uring registration table full",
+            ));
+        }
+
         let gen = self.next_gen();
         let key = self.ops.insert(SlotEntry {
             gen,
@@ -547,8 +617,21 @@ impl Reactor {
         // Publish arm-table state *before* submitting the SQE: any CQE
         // the kernel posts against this slot will see a valid (gen,
         // DISARMED=0) entry in the table. Release-ordered inside
-        // `publish`.
-        self.arm_table.publish(key_u32, gen);
+        // `try_publish`.
+        //
+        // Publication can fail even under the budget check: control
+        // slots share the slab's key space, so an insert can land on a
+        // key past the arm table's capacity while `ops.len()` is still
+        // below it. Roll the insert back and fail the registration —
+        // an unpublishable slot could never be disarmed.
+        if !self.arm_table.try_publish(key_u32, gen) {
+            self.ops.remove(key);
+            scheduled_io.shutdown();
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "io_uring registration key exceeds arm-table capacity",
+            ));
+        }
 
         // Publish the (key, gen) onto the ScheduledIo so a later
         // deregister — local or cross-ring MSG_RING — can find this slot
@@ -569,7 +652,16 @@ impl Reactor {
         // SAFETY: `sqe`'s operands (just an fd and a poll mask) are valid;
         // the multi-shot registration carries no user-buffer references.
         // The slab slot keeps the Arc alive until the terminal CQE.
-        unsafe { self.push_sqe(sqe) }
+        if let Err(e) = unsafe { self.push_sqe(sqe) } {
+            // No SQE reached the kernel, so no CQE will ever free this
+            // slot — roll the insert back or it leaks.
+            self.ops.remove(key);
+            self.arm_table.clear(key_u32);
+            scheduled_io.uring_slab_key.store(u32::MAX, Ordering::Relaxed);
+            scheduled_io.shutdown();
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Deregister a previously-registered fd.
@@ -595,6 +687,11 @@ impl Reactor {
             // Never registered (or already deregistered). No-op.
             return Ok(());
         }
+
+        // Deregistration bursts (mass connection drops) grow the slab too:
+        // each dereg adds a control slot and turns a live slot into a
+        // zombie awaiting its terminal CQE. Reap before adding more.
+        self.reap_if_crowded();
 
         // Atomically flip DISARMED for the slot. On success we own the
         // responsibility of submitting POLL_REMOVE; on failure the slot
@@ -626,7 +723,50 @@ impl Reactor {
 
         // SAFETY: `PollRemove` references no user buffers; it is always safe.
         unsafe { self.push_sqe(sqe)? };
+        // The slot is now a zombie: disarmed, cancel in flight, freed when
+        // the drain processes its terminal CQE. Counted so
+        // `reap_if_crowded` knows how much is reclaimable.
+        self.zombies += 1;
         Ok(())
+    }
+
+    /// In-line reap: if enough reclaimable slots have accumulated (or the
+    /// slab is at its hard ceiling), flush staged SQEs and drain
+    /// completions now instead of waiting for the next park. This is the
+    /// backpressure that keeps register/deregister floods from running
+    /// slab occupancy through the [`ArmTable`] capacity — see
+    /// [`ZOMBIE_REAP_WATER`].
+    ///
+    /// Two syscalls when it fires: a plain submit (flushes any staged
+    /// POLL_REMOVEs) and a `GETEVENTS` enter. The latter matters under
+    /// `DEFER_TASKRUN`, where terminal CQEs are generated by deferred
+    /// task work that only runs on a `GETEVENTS` enter from the owning
+    /// thread — `submit()` alone never sets the flag with
+    /// `min_complete == 0`, and the CQEs would stay unposted no matter
+    /// how often we drained.
+    fn reap_if_crowded(&mut self) {
+        if self.zombies < ZOMBIE_REAP_WATER && self.ops.len() < SLOT_BUDGET {
+            return;
+        }
+        // Submit errors are not propagated: `EBUSY` here means the CQ is
+        // full, which is exactly the condition the drain below relieves.
+        let _ = self.ring.submit();
+        // `io-uring` exposes no safe wrapper for GETEVENTS with
+        // min_complete=0, so issue the enter raw. IORING_ENTER_GETEVENTS
+        // is the stable ABI constant 1.
+        //
+        // SAFETY: no argument pointer is passed (`arg = None`); all
+        // parameters are plain integers.
+        let _ = unsafe {
+            self.ring
+                .submitter()
+                .enter::<libc::sigset_t>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
+        };
+        self.drain_completions();
+        // The drain above may have consumed an unparker's wake CQE while
+        // our park state is already `PARKED` — the next park must not
+        // block. See the `inline_reaped` field docs.
+        self.inline_reaped = true;
     }
 
     /// Submit an owned-buffer `Send` op on `fd`.
@@ -867,7 +1007,13 @@ impl Reactor {
     /// Performs one `io_uring_enter(submit=pending, min_complete=1,
     /// GETEVENTS)` call. Any SQEs staged since the last submit (by
     /// `register`/`deregister`) flush as part of the same syscall.
+    ///
+    /// Degrades to a non-blocking pass if an in-line reap drained the CQ
+    /// since the last park — see the `inline_reaped` field docs.
     pub(crate) fn park(&mut self) -> io::Result<()> {
+        if self.inline_reaped {
+            return self.park_timeout(Duration::ZERO);
+        }
         self.ring.submit_and_wait(1)?;
         self.drain_completions();
         Ok(())
@@ -880,9 +1026,14 @@ impl Reactor {
     /// timeout's own CQE is treated as a [`VARIANT_CONTROL`] completion and
     /// freed in the drain.
     ///
+    /// Subject to the same `inline_reaped` degradation as [`park`]: a
+    /// timed park returning early is a spurious wake the worker loop
+    /// already tolerates (it re-evaluates timers and re-parks).
+    ///
     /// [`park`]: Reactor::park
     pub(crate) fn park_timeout(&mut self, timeout: Duration) -> io::Result<()> {
-        if timeout.is_zero() {
+        if timeout.is_zero() || self.inline_reaped {
+            self.inline_reaped = false;
             // Non-blocking drain: submit pending work without waiting.
             self.ring.submit()?;
             self.drain_completions();
@@ -1081,11 +1232,19 @@ impl Reactor {
             // happen if a Control completion fires twice — defensive).
             let _ = self.ops.try_remove(key as usize);
             if is_poll_multi {
+                // A disarmed slot reaching its terminal CQE is a zombie
+                // being reclaimed (local deregister submitted the
+                // cancel and counted it); a non-disarmed one is
+                // kernel-autonomous teardown (e.g. POLLHUP) and was
+                // never counted.
+                if self.arm_table.is_disarmed(key) {
+                    self.zombies = self.zombies.saturating_sub(1);
+                }
                 // Zero the arm-table slot so a future re-use of the
                 // same key (after a slab recycle for, say, a Control
                 // op) doesn't accidentally report DISARMED for the new
-                // op. A subsequent `publish` for a fresh PollMulti at
-                // this key resets both gen and flags.
+                // op. A subsequent `try_publish` for a fresh PollMulti
+                // at this key resets both gen and flags.
                 self.arm_table.clear(key);
             }
         }

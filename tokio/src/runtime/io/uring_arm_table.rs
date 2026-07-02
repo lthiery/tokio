@@ -146,20 +146,22 @@ impl ArmTable {
         }
     }
 
-    /// Locate (and install, if absent) the slot at `key`.
+    /// Locate (and install, if absent) the slot at `key`. Returns `None`
+    /// if `key` is beyond the table's addressable capacity — callers must
+    /// treat that as a failed publication, not a fatal error (an earlier
+    /// version asserted here; the panic killed the worker thread and the
+    /// runtime hung on its deaf ring).
     ///
     /// Called only from the owning worker on the `publish` path. The CAS
     /// handles the should-be-impossible race of two concurrent installs
     /// on the same chunk (single writer by contract, but the CAS keeps
     /// us safe if the contract is ever violated — e.g. by a test).
-    fn slot_or_install(&self, key: u32) -> &ArmSlot {
+    fn slot_or_install(&self, key: u32) -> Option<&ArmSlot> {
         let chunk_idx = (key as usize) / ARM_CHUNK;
         let slot_idx = (key as usize) % ARM_CHUNK;
-        assert!(
-            chunk_idx < ARM_MAX_CHUNKS,
-            "ArmTable key {key} exceeds capacity ({} slots)",
-            ARM_CHUNK * ARM_MAX_CHUNKS,
-        );
+        if chunk_idx >= ARM_MAX_CHUNKS {
+            return None;
+        }
         let mut ptr = self.chunks[chunk_idx].load(Ordering::Acquire);
         if ptr.is_null() {
             let new_chunk = ArmChunk::new_zeroed();
@@ -189,7 +191,7 @@ impl ArmTable {
         // lifetime of the `ArmTable`. It points at a valid `ArmChunk`
         // that we (or a prior caller) allocated.
         let chunk: &ArmChunk = unsafe { &*ptr };
-        &chunk.slots[slot_idx]
+        Some(&chunk.slots[slot_idx])
     }
 
     /// Read-only slot access. Returns `None` if the chunk has never been
@@ -216,11 +218,21 @@ impl ArmTable {
     /// value and clearing the `DISARMED` bit (in case the slot was
     /// previously occupied by a torn-down registration).
     ///
+    /// Returns `false` if `key` exceeds the table's capacity, in which
+    /// case nothing was published and the caller must fail the
+    /// registration (a slot the table can't address could never be
+    /// disarmed, so arming a poll against it would leak).
+    ///
     /// `Release` so any peer `Acquire` load in `try_disarm` sees the
     /// new gen immediately.
-    pub(crate) fn publish(&self, key: u32, gen: u32) {
-        let slot = self.slot_or_install(key);
-        slot.state.store(pack(gen), Ordering::Release);
+    pub(crate) fn try_publish(&self, key: u32, gen: u32) -> bool {
+        match self.slot_or_install(key) {
+            Some(slot) => {
+                slot.state.store(pack(gen), Ordering::Release);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Zero the slot after the kernel's terminal CQE for the slab entry
@@ -327,7 +339,7 @@ mod tests {
     #[test]
     fn publish_and_disarm_roundtrip() {
         let t = ArmTable::new();
-        t.publish(7, 42);
+        assert!(t.try_publish(7, 42));
         assert!(!t.is_disarmed(7));
         assert!(t.try_disarm(7, 42));
         assert!(t.is_disarmed(7));
@@ -339,7 +351,7 @@ mod tests {
     #[test]
     fn gen_mismatch_rejects_disarm() {
         let t = ArmTable::new();
-        t.publish(3, 100);
+        assert!(t.try_publish(3, 100));
         assert!(!t.try_disarm(3, 99), "older gen should not disarm");
         assert!(!t.is_disarmed(3));
         assert!(!t.try_disarm(3, 101), "newer gen should not disarm");
@@ -350,10 +362,10 @@ mod tests {
     #[test]
     fn republish_clears_disarm() {
         let t = ArmTable::new();
-        t.publish(1, 10);
+        assert!(t.try_publish(1, 10));
         assert!(t.try_disarm(1, 10));
         // Slab slot recycled with a new registration.
-        t.publish(1, 11);
+        assert!(t.try_publish(1, 11));
         assert!(!t.is_disarmed(1), "publish should reset DISARMED");
         assert!(!t.try_disarm(1, 10), "old gen disarm after republish must no-op");
         assert!(t.try_disarm(1, 11));
@@ -371,7 +383,7 @@ mod tests {
     #[test]
     fn clear_after_publish_makes_gen_check_fail() {
         let t = ArmTable::new();
-        t.publish(5, 200);
+        assert!(t.try_publish(5, 200));
         t.clear(5);
         assert!(!t.try_disarm(5, 200));
     }
@@ -380,7 +392,7 @@ mod tests {
     fn multi_chunk_spans() {
         let t = ArmTable::new();
         for i in 0..ARM_CHUNK * 3 {
-            t.publish(i as u32, (i as u32) + 1);
+            assert!(t.try_publish(i as u32, (i as u32) + 1));
         }
         for i in 0..ARM_CHUNK * 3 {
             assert!(t.try_disarm(i as u32, (i as u32) + 1));
@@ -393,7 +405,7 @@ mod tests {
         use std::thread;
 
         let t = Arc::new(ArmTable::new());
-        t.publish(42, 7);
+        assert!(t.try_publish(42, 7));
 
         let t2 = Arc::clone(&t);
         let h = thread::spawn(move || t2.try_disarm(42, 7));

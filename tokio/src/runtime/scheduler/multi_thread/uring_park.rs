@@ -400,11 +400,17 @@ impl UringParker {
 /// Translate a batch of [`PendingOp`]s into SQEs on `reactor`'s ring.
 ///
 /// The SQEs are staged but not submitted — they flush together with the
-/// next `submit_and_wait` (park) or explicit non-blocking submit.
+/// next `submit_and_wait` (park) or explicit non-blocking submit. (Not
+/// quite unconditionally: `Reactor::register`/`deregister` reap
+/// completions in-line when enough reclaimable slots have piled up, so a
+/// long batch cannot run slab occupancy through the ArmTable ceiling —
+/// the `tcp_register_dereg` wedge.)
 ///
-/// Individual errors are logged-and-dropped: a failed register/deregister
-/// is at worst a missed readiness notification, which callers already have
-/// to cope with via the spurious-wake rules on `poll_*_ready`.
+/// Individual errors are dropped here because the reactor already
+/// surfaces them: a failed register marks its `ScheduledIo` shutdown
+/// (waiters observe "IO driver has terminated" — see
+/// `Reactor::register`'s failure docs), and a failed deregister is at
+/// worst a missed cancel that the terminal-CQE path cleans up.
 fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) {
     for op in pending {
         let _ = match op {
