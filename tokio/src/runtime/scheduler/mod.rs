@@ -66,6 +66,27 @@ impl Handle {
         }
     }
 
+    /// The uring backend handle, when this runtime drives I/O through the
+    /// uring reactor (per-worker or `TOKIO_URING_GLOBAL=1`). Used by the
+    /// legacy time driver's insert path to wake a parker that will honor
+    /// a newly-lowered wheel minimum — the traditional `IoHandle` unpark
+    /// targets a mio driver nobody polls under this backend.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt",
+        target_os = "linux",
+    ))]
+    pub(crate) fn uring_handle(&self) -> Option<&crate::runtime::io::uring_driver::UringHandle> {
+        match self {
+            #[cfg(feature = "rt-multi-thread")]
+            Handle::MultiThread(h) => {
+                h.io_driver.as_ref().and_then(|d| d.as_uring())
+            }
+            _ => None,
+        }
+    }
+
     /// The shared per-worker `io_uring` reactor handle, if the runtime was
     /// Backend-agnostic I/O driver. Returns `Some` on every
     /// io-enabled runtime regardless of scheduler flavor:

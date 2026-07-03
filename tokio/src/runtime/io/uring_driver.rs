@@ -255,6 +255,50 @@ impl GlobalRing {
         std::mem::take(&mut *self.pending_ops.lock())
     }
 
+    /// Timer-insert wake: the legacy time driver inserted a timer that
+    /// lowers the wheel minimum (see `UringHandle::unpark_for_timer`).
+    ///
+    /// The eventfd write is unconditional, unlike `push_op`'s: the
+    /// deadline a holder parks with is computed in `park_global` BEFORE
+    /// the `TryLock` race, so gating on `ring_parked` could skip the wake
+    /// for a holder that is about to block with a stale (pre-insert)
+    /// deadline. The write is persistent — a blocked holder wakes now; a
+    /// holder between its `PARKED` CAS and the blocking enter finds the
+    /// CQE already posted and returns immediately; a future holder's
+    /// first blocking park returns immediately. In every case the woken
+    /// worker re-parks with a fresh `next_wake_tick()`. (Non-blocking
+    /// maintenance drains that consume the CQE re-arm `inline_reaped` on
+    /// the reactor — see `Reactor::park_timeout` — so the token survives
+    /// them too.)
+    pub(crate) fn timer_kick(&self) {
+        let _ = self.ring_waker.wake();
+        // If nobody is driving the ring the CQE waits for the next ring
+        // parker; wake one worker so that happens promptly even when
+        // every idle worker is condvar-parked (reachable when the ring
+        // was held by a zero-duration maintenance poll while they
+        // parked).
+        if !self.ring_parked.load(Ordering::SeqCst) {
+            self.kick_one_worker();
+        }
+    }
+
+    /// Wake one worker so that *someone* passes through a park-entry
+    /// drain soon. Prefers a condvar-parked worker (it re-parks and
+    /// races for the now-relevant ring); falls back to worker 0, whose
+    /// `NOTIFIED` flag persists across its current activity and forces
+    /// its next park to return and re-enter with fresh state.
+    fn kick_one_worker(&self) {
+        for (idx, slot) in self.slots.iter().enumerate() {
+            if slot.state.load(Ordering::SeqCst) == PARKED_CONDVAR {
+                self.unpark(idx);
+                return;
+            }
+        }
+        if !self.slots.is_empty() {
+            self.unpark(0);
+        }
+    }
+
     /// Park worker `idx`. Stock `Inner::park` flow: consume a pending
     /// notification, else race for the ring, else condvar.
     ///
@@ -663,6 +707,44 @@ impl UringHandle {
         if slot.external_waker.set(external_waker).is_err() {
             debug_assert!(false, "worker {worker_idx} published external_waker twice");
         }
+    }
+
+    /// Wake a parker so a newly-inserted timer that lowered the wheel
+    /// minimum is honored. Called by the legacy time driver's insert path
+    /// (`time::Handle::reregister`) via the mode-aware routing in
+    /// `time::Handle::unpark_for_insert`.
+    ///
+    /// The traditional runtime unparks the thread driving the shared mio
+    /// driver; the uring backend has no such thread (the mio driver
+    /// object built by `enable_io()` is never polled), so the wake must
+    /// instead reach a parker that re-reads `next_wake_tick()` before
+    /// blocking — which every uring park does (see
+    /// `UringParker::compute_legacy_timer_duration`). One woken worker is
+    /// therefore sufficient in either mode.
+    pub(crate) fn unpark_for_timer(&self) {
+        if let Some(g) = self.global.as_ref() {
+            g.timer_kick();
+            return;
+        }
+        if self.workers.is_empty() {
+            return;
+        }
+        // Per-worker mode: prefer a worker actually blocked in
+        // `io_uring_enter` — it wakes now and re-parks with the new
+        // deadline folded in.
+        for idx in 0..self.workers.len() {
+            if self.workers[idx].park_state.load(Ordering::SeqCst) == PARKED {
+                self.unpark(idx);
+                return;
+            }
+        }
+        // Nobody observed parked. A worker concurrently *transitioning*
+        // into park computed its deadline before this insert and could
+        // still block with it, so leave a persistent wake on worker 0:
+        // the NOTIFIED flag (or the eventfd CQE, if it wins the PARKED
+        // CAS first) guarantees worker 0's next park returns immediately
+        // and re-enters with the wheel minimum re-read.
+        self.unpark(0);
     }
 
     /// Mark `worker_idx` as notified and — if the worker was parked —

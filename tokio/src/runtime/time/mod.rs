@@ -23,7 +23,7 @@ use super::time_alt;
 
 use crate::loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::loom::sync::Mutex;
-use crate::runtime::driver::{self, IoHandle, IoStack};
+use crate::runtime::driver::{self, IoStack};
 use crate::time::error::Error;
 use crate::time::{Clock, Duration};
 use crate::util::WakeList;
@@ -495,6 +495,32 @@ impl Handle {
         }
     }
 
+    /// Wake a parker that will honor a timer insert that just lowered the
+    /// wheel minimum.
+    ///
+    /// The traditional runtime routes this to the legacy `IoHandle`: the
+    /// thread currently driving the shared mio driver wakes, re-reads
+    /// `next_wake`, and re-parks with the new deadline. The uring
+    /// backends never poll that mio driver (it exists only because
+    /// `enable_uring_reactor()` implies `enable_io()`), so the legacy
+    /// unpark would land on a parker nobody parks on and the wake would
+    /// vanish — on a quiet runtime the timer then never fires. Route to
+    /// the uring handle instead; every uring park re-reads the wheel
+    /// minimum before blocking, so one woken worker suffices.
+    fn unpark_for_insert(scheduler: &crate::runtime::scheduler::Handle) {
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt",
+            target_os = "linux",
+        ))]
+        if let Some(uring) = scheduler.uring_handle() {
+            uring.unpark_for_timer();
+            return;
+        }
+        scheduler.driver().io.unpark();
+    }
+
     /// Removes and re-adds an entry to the driver.
     ///
     /// SAFETY: The timer must be either unregistered, or registered with this
@@ -503,7 +529,7 @@ impl Handle {
     /// the `TimerEntry`)
     pub(self) unsafe fn reregister(
         &self,
-        unpark: &IoHandle,
+        scheduler: &crate::runtime::scheduler::Handle,
         new_tick: u64,
         entry: NonNull<TimerShared>,
     ) {
@@ -546,7 +572,7 @@ impl Handle {
                             self.inner
                                 .next_wake_atomic()
                                 .store(when, Ordering::Release);
-                            unpark.unpark();
+                            Self::unpark_for_insert(scheduler);
                         }
 
                         None

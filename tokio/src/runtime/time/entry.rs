@@ -590,7 +590,7 @@ impl TimerEntry {
         if reregister {
             unsafe {
                 self.driver()
-                    .reregister(&self.driver.driver().io, tick, inner.into());
+                    .reregister(&self.driver, tick, inner.into());
             }
         }
     }

@@ -1073,7 +1073,11 @@ impl Reactor {
     /// since the last park — see the `inline_reaped` field docs.
     pub(crate) fn park(&mut self) -> io::Result<()> {
         if self.inline_reaped {
-            return self.park_timeout(Duration::ZERO);
+            // Degraded blocking park: our early return sends the caller
+            // back through its park loop, where it recomputes timers and
+            // queue state before blocking again — the flag's job is done.
+            self.inline_reaped = false;
+            return self.nonblocking_pass().map(drop);
         }
         self.ring.submit_and_wait(1)?;
         self.drain_completions();
@@ -1093,12 +1097,25 @@ impl Reactor {
     ///
     /// [`park`]: Reactor::park
     pub(crate) fn park_timeout(&mut self, timeout: Duration) -> io::Result<()> {
-        if timeout.is_zero() || self.inline_reaped {
-            self.inline_reaped = false;
-            // Non-blocking drain: submit pending work without waiting.
-            self.ring.submit()?;
-            self.drain_completions();
+        if timeout.is_zero() {
+            // Maintenance pass, NOT a degraded blocking park: the caller
+            // is busy and will not recompute-and-block on return, so a
+            // pending `inline_reaped` degradation must survive this call
+            // for the next blocking parker. Symmetrically, if we consume
+            // an external-wake CQE here we must ARM the flag: in global
+            // mode that CQE can be a timer-kick persistence token whose
+            // recipient (the next ring holder) hasn't parked yet — the
+            // degradation forces it back out to recompute its deadline.
+            let saw_external_wake = self.nonblocking_pass()?;
+            if saw_external_wake {
+                self.inline_reaped = true;
+            }
             return Ok(());
+        }
+        if self.inline_reaped {
+            // Degraded blocking park — same as in `park`.
+            self.inline_reaped = false;
+            return self.nonblocking_pass().map(drop);
         }
 
         let ts = types::Timespec::new()
@@ -1121,9 +1138,20 @@ impl Reactor {
         Ok(())
     }
 
+    /// Non-blocking submit + CQ drain. Returns whether an external-wake
+    /// (eventfd) CQE was consumed — callers on non-blocking paths use
+    /// this to keep the `inline_reaped` degradation armed (see
+    /// [`Self::park_timeout`]).
+    fn nonblocking_pass(&mut self) -> io::Result<bool> {
+        self.ring.submit()?;
+        Ok(self.drain_completions())
+    }
+
     /// Drain the completion queue, dispatching readiness to [`ScheduledIo`]s
     /// and freeing slab slots as their terminal CQEs arrive.
-    fn drain_completions(&mut self) {
+    ///
+    /// Returns `true` if an external-wake (eventfd) CQE was consumed.
+    fn drain_completions(&mut self) -> bool {
         // Collect the eventfd fd up front so we can drain it without
         // borrowing `self` mutably while iterating the CQ.
         let external_fd = self.external_wake_fd.as_raw_fd();
@@ -1452,6 +1480,7 @@ impl Reactor {
         if saw_external_wake {
             drain_eventfd(external_fd);
         }
+        saw_external_wake
     }
 
     // ===== private helpers =====
