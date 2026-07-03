@@ -167,6 +167,18 @@ fn defer_taskrun_disabled() -> bool {
     }) || uring_global_enabled()
 }
 
+/// `TOKIO_URING_COOP_TASKRUN=0` → build rings WITHOUT `COOP_TASKRUN`,
+/// so completion task_work IPIs its target instead of waiting for the
+/// target's next kernel entry. Read once per process and cached, same
+/// mixed-fleet rationale as the defer knob. Probe knob for the W1/W2
+/// echo anomaly — see the builder comment in [`Reactor::new`].
+fn coop_taskrun_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("TOKIO_URING_COOP_TASKRUN").is_ok_and(|v| v.trim() == "0")
+    })
+}
+
 /// `TOKIO_URING_GLOBAL=1` → Phase-1 global-ring mode: ONE shared ring
 /// for the whole runtime, driven by whichever worker parks first (the
 /// stock mio `Parker` discipline), instead of one ring per worker.
@@ -486,8 +498,19 @@ impl Reactor {
             if !defer_taskrun_disabled() {
                 builder.setup_single_issuer().setup_defer_taskrun();
             }
+            // `TOKIO_URING_COOP_TASKRUN=0` drops COOP_TASKRUN: completion
+            // task_work is queued with TWA_SIGNAL (IPI) instead of
+            // TWA_SIGNAL_NO_IPI, so CQEs post immediately instead of at
+            // the target task's next kernel entry. Probe knob for the
+            // W1/W2 echo median anomaly: perf_window showed both losing
+            // arms share deferred completion generation (task_add ≈
+            // complete, workers never in cqring_wait) while syscall and
+            // switch volume are exonerated — this is the falsification
+            // lever. IPI cost is expected to hurt at higher W.
+            if !coop_taskrun_disabled() {
+                builder.setup_coop_taskrun();
+            }
             builder
-                .setup_coop_taskrun()
                 .setup_cqsize(CQ_ENTRIES)
                 .build(SQ_ENTRIES)?
         };
