@@ -1268,10 +1268,26 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    /// The three tests below exercise the PER-WORKER unpark protocol
+    /// (`park_state` slots + `begin_park`). The `TOKIO_URING_GLOBAL`
+    /// knob is process-wide, so when the suite runs with it set the
+    /// handle routes `unpark` through the `GlobalRing` state machine
+    /// instead and the per-worker assertions are meaningless — skip.
+    fn skip_under_global_knob() -> bool {
+        if uring_global_enabled() {
+            eprintln!("skipping: per-worker protocol test under TOKIO_URING_GLOBAL=1");
+            return true;
+        }
+        false
+    }
+
     /// `unpark` before the worker parks sets NOTIFIED and returns without
     /// a syscall; a subsequent `begin_park` consumes the notification.
     #[test]
     fn unpark_before_park_is_consumed() {
+        if skip_under_global_knob() {
+            return;
+        }
         let handle = UringHandle::new(1);
         // No ring fd / external waker published — unpark must not touch
         // them because the worker isn't parked.
@@ -1287,6 +1303,9 @@ mod tests {
     fn unpark_on_worker_uses_msg_ring() {
         use std::sync::Arc;
 
+        if skip_under_global_knob() {
+            return;
+        }
         let handle = Arc::new(UringHandle::new(2));
 
         // Receiver thread: construct reactor, publish, then park.
@@ -1361,6 +1380,9 @@ mod tests {
     /// a non-worker thread causes the eventfd fallback to fire.
     #[test]
     fn unpark_external_uses_eventfd_fallback() {
+        if skip_under_global_knob() {
+            return;
+        }
         let Ok(reactor) = Reactor::new() else {
             eprintln!("skipping: reactor unavailable");
             return;
