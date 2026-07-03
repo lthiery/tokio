@@ -586,7 +586,7 @@ impl Reactor {
     pub(crate) fn send_msg_ring(&mut self, target_ring_fd: RawFd) -> io::Result<()> {
         // Allocate a Control slot for our own send-ack; it'll be removed on
         // first CQE in `drain_completions`.
-        let (ack_ud, _ack_key) = self.alloc_control_slot();
+        let (ack_ud, ack_key) = self.alloc_control_slot();
 
         // The peer-side user_data is the universal MSG_RING_INCOMING_UD —
         // every reactor pre-allocates that slot at the same well-known key.
@@ -600,7 +600,10 @@ impl Reactor {
         .user_data(ack_ud);
 
         // SAFETY: MsgRingData references no user buffers; always safe.
-        unsafe { self.push_sqe(sqe)? };
+        if let Err(e) = unsafe { self.push_sqe(sqe) } {
+            self.free_control_slot(ack_key);
+            return Err(e);
+        }
 
         // Flush immediately — do not wait for park. Non-blocking submit.
         self.ring.submit()?;
@@ -761,15 +764,24 @@ impl Reactor {
             _ => return Ok(()),
         };
 
-        let (ack_ud, _ack_key) = self.alloc_control_slot();
+        let (ack_ud, ack_key) = self.alloc_control_slot();
         let sqe = opcode::PollRemove::new(target_ud).build().user_data(ack_ud);
 
-        // SAFETY: `PollRemove` references no user buffers; it is always safe.
-        unsafe { self.push_sqe(sqe)? };
-        // The slot is now a zombie: disarmed, cancel in flight, freed when
-        // the drain processes its terminal CQE. Counted so
-        // `reap_if_crowded` knows how much is reclaimable.
+        // The slot became a zombie the moment it was disarmed above:
+        // whichever terminal CQE eventually frees it (our POLL_REMOVE, or
+        // kernel-autonomous teardown if the push below fails) will run
+        // the `is_disarmed` decrement. Count it before the fallible push
+        // so increment and decrement stay balanced.
         self.zombies += 1;
+
+        // SAFETY: `PollRemove` references no user buffers; it is always safe.
+        if let Err(e) = unsafe { self.push_sqe(sqe) } {
+            // The cancel never reached the kernel; free its ack slot (no
+            // CQE will arrive for it). The disarmed slot stays counted as
+            // a zombie awaiting its (possibly distant) terminal CQE.
+            self.free_control_slot(ack_key);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -947,12 +959,15 @@ impl Reactor {
     /// [`VARIANT_CONTROL`] slot which is freed on its single
     /// completion — we do not care what the cancel result was.
     pub(crate) fn submit_async_cancel(&mut self, target_user_data: u64) -> io::Result<()> {
-        let (ack_ud, _ack_key) = self.alloc_control_slot();
+        let (ack_ud, ack_key) = self.alloc_control_slot();
         let sqe = opcode::AsyncCancel::new(target_user_data)
             .build()
             .user_data(ack_ud);
         // SAFETY: AsyncCancel carries no user buffers.
-        unsafe { self.push_sqe(sqe)? };
+        if let Err(e) = unsafe { self.push_sqe(sqe) } {
+            self.free_control_slot(ack_key);
+            return Err(e);
+        }
         // Don't wait here — the cancel will flush with the next park or
         // with an explicit submit from the caller. For the
         // future-drop path (the primary caller) we accept a ~one-park
@@ -1035,13 +1050,16 @@ impl Reactor {
     /// `-ENOENT` on this ring; the multishot naturally completes
     /// on its home ring.
     pub(crate) fn submit_cancel_fd(&mut self, fd: RawFd) -> io::Result<()> {
-        let (ack_ud, _) = self.alloc_control_slot();
+        let (ack_ud, ack_key) = self.alloc_control_slot();
         let builder = types::CancelBuilder::fd(types::Fd(fd)).all();
         let sqe = opcode::AsyncCancel2::new(builder)
             .build()
             .user_data(ack_ud);
         // SAFETY: AsyncCancel2 carries no user buffers.
-        unsafe { self.push_sqe(sqe)? };
+        if let Err(e) = unsafe { self.push_sqe(sqe) } {
+            self.free_control_slot(ack_key);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -1086,12 +1104,17 @@ impl Reactor {
         let ts = types::Timespec::new()
             .sec(timeout.as_secs())
             .nsec(timeout.subsec_nanos());
-        let (ud, _key) = self.alloc_control_slot();
+        let (ud, key) = self.alloc_control_slot();
         let sqe = opcode::Timeout::new(&ts as *const _).build().user_data(ud);
 
         // SAFETY: `ts` lives until submit_and_wait returns; the kernel copies
         // the Timespec value during submission.
-        unsafe { self.push_sqe(sqe)? };
+        if let Err(e) = unsafe { self.push_sqe(sqe) } {
+            // The SQE never reached the kernel — no CQE will ever free
+            // the Control slot, so roll it back here.
+            self.free_control_slot(key);
+            return Err(e);
+        }
 
         self.ring.submit_and_wait(1)?;
         self.drain_completions();
@@ -1441,6 +1464,18 @@ impl Reactor {
         let key = self.ops.insert(SlotEntry { gen, state: OpState::Control });
         let key_u32 = u32::try_from(key).expect("slab key exceeds u32");
         (encode(VARIANT_CONTROL, gen, key_u32), key_u32)
+    }
+
+    /// Free a Control slot whose SQE never reached the kernel (push_sqe
+    /// failure after [`Self::alloc_control_slot`]). Without this the slot
+    /// would wait forever for a CQE that cannot arrive — slab-occupancy
+    /// drift that eventually counts against [`SLOT_BUDGET`].
+    fn free_control_slot(&mut self, key: u32) {
+        let removed = self.ops.try_remove(key as usize);
+        debug_assert!(
+            matches!(removed.map(|e| e.state), Some(OpState::Control)),
+            "free_control_slot hit a non-Control slot",
+        );
     }
 
     /// Bump and return the next generation. Wraps modulo 2^24 (the encoded
