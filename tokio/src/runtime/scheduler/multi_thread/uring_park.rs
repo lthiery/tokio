@@ -221,14 +221,22 @@ impl UringParker {
             .expect("park_global called without a global ring")
             .clone();
         let driver_duration = self.compute_legacy_timer_duration(driver, duration);
-        g.park_worker(self.idx, driver_duration, duration);
+        let drove_ring = g.park_worker(self.idx, driver_duration, duration);
         // Release ScheduledIos queued for drop and advance the legacy
         // wheel. Both are cheap no-ops when there is nothing due, so we
         // run them regardless of whether we actually held the ring —
         // distinguishing would buy little and cost plumbing.
         self.handle.release_pending_registrations();
         self.process_legacy_timer_after_park(driver);
-        HadDriver::Yes
+        // Report the stock parker's HadDriver distinction faithfully: a
+        // condvar-parked (or notified-fast-path) worker did not hold the
+        // driver, and saying it did makes the unstable
+        // `enable_eager_driver_handoff` path spuriously notify.
+        if drove_ring {
+            HadDriver::Yes
+        } else {
+            HadDriver::No
+        }
     }
 
     /// Hybrid park flow: legacy timer + uring I/O.

@@ -682,9 +682,15 @@ impl Reactor {
         // Publish the (key, gen) onto the ScheduledIo so a later
         // deregister — local or cross-ring MSG_RING — can find this slot
         // and gen-check it against a possible slab recycle in between.
-        // Both writes and reads for the local path happen on the owning
-        // worker, so Relaxed is sufficient; cross-ring reads are ordered
-        // by the MSG_RING CQE itself.
+        // In per-worker mode both writes and reads for the local path
+        // happen on the owning worker, so Relaxed is sufficient, and
+        // cross-ring reads are ordered by the MSG_RING CQE itself. In
+        // global mode (`TOKIO_URING_GLOBAL=1`) a DIFFERENT holder thread
+        // may read these during a later drain; that read is correctly
+        // ordered only because every holder transition goes through the
+        // shared `TryLock`, whose SeqCst acquire/release pairs
+        // (`util/try_lock.rs`) chain the stores to the reads. Do not
+        // weaken the TryLock's orderings without revisiting this.
         scheduled_io.uring_slab_key.store(key_u32, Ordering::Relaxed);
         scheduled_io.uring_gen.store(gen, Ordering::Relaxed);
 

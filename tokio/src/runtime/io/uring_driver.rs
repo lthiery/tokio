@@ -318,12 +318,15 @@ impl GlobalRing {
     /// min'd in the legacy timer deadline); `condvar_duration` is the raw
     /// scheduler timeout. They differ because timers are the ring
     /// holder's job — condvar parkers must not spin on timer deadlines.
+    ///
+    /// Returns `true` iff this worker won the ring and drove it (the
+    /// stock parker's `HadDriver` distinction).
     pub(crate) fn park_worker(
         &self,
         idx: usize,
         driver_duration: Option<Duration>,
         condvar_duration: Option<Duration>,
-    ) {
+    ) -> bool {
         let slot = &self.slots[idx];
         if slot
             .state
@@ -335,13 +338,15 @@ impl GlobalRing {
             // worker's maintenance polls would otherwise take this early
             // return every time and never reach the park-entry drain.
             self.drain_ops_if_unheld();
-            return;
+            return false;
         }
 
         if let Some(mut reactor) = self.reactor.try_lock() {
             self.park_driver(idx, &mut reactor, driver_duration);
+            true
         } else {
             self.park_condvar(idx, condvar_duration);
+            false
         }
     }
 
