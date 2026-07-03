@@ -206,6 +206,27 @@ struct RecvMultiCompletion {
     bid: Option<u16>,
 }
 
+/// Reusable staging buffers for [`Reactor::drain_completions`].
+///
+/// The drain cannot act on most CQEs while the CQ iterator borrows the
+/// ring, so it stages work here and replays it after the borrow drops.
+/// The buffers live on the reactor — taken (`mem::take`) at drain entry
+/// and put back emptied at exit — so a steady-state drain does no heap
+/// allocation; each `Vec` converges on its high-water burst size.
+/// Only the two buffers every drain touches live here: the owned-buffer
+/// staging vecs (`send`/`recv`/`recv_multi`) stay local `Vec::new()`s —
+/// they never allocate unless one of those ops completes, which never
+/// happens on the readiness path.
+#[derive(Default)]
+struct DrainStaging {
+    /// Slab slots whose terminal CQE arrived this drain.
+    to_remove: Vec<u32>,
+    /// Readiness deliveries. `ScheduledIo::wake` may run arbitrary user
+    /// code (waker callbacks), so it stays strictly outside the
+    /// CQ-iterator borrow.
+    readiness: Vec<(Arc<ScheduledIo>, Ready)>,
+}
+
 // ===== user_data variant tags =====
 
 /// Multi-shot `POLL_ADD` registration. The hot path.
@@ -412,6 +433,10 @@ pub(crate) struct Reactor {
     /// [`super::uring_buf_ring::BufferLease`]s can recycle their
     /// buffer ids even after the reactor is torn down.
     buf_ring: Option<Arc<super::uring_buf_ring::BufferRing>>,
+
+    /// Reusable [`Self::drain_completions`] staging buffers; see
+    /// [`DrainStaging`].
+    staging: DrainStaging,
 }
 
 /// Thread-safe handle for waking a [`Reactor`] from a non-worker thread.
@@ -539,6 +564,7 @@ impl Reactor {
             zombies: 0,
             inline_reaped: false,
             buf_ring: None,
+            staging: DrainStaging::default(),
         })
     }
 
@@ -1164,13 +1190,15 @@ impl Reactor {
         let mut saw_external_wake = false;
 
         // Stage slab removals after the CQ borrow drops; we cannot mutate
-        // `self.ops` while the `cq` iterator borrows `self.ring`. Capacity
-        // hint avoids re-allocs in the common per-park burst.
-        let mut to_remove: Vec<u32> = Vec::with_capacity(16);
-        // Stage readiness deliveries the same way — `ScheduledIo::wake` may
-        // run arbitrary user code (waker callbacks), so we want it strictly
-        // outside the CQ-iterator borrow.
-        let mut readiness_deliveries: Vec<(Arc<ScheduledIo>, Ready)> = Vec::with_capacity(16);
+        // `self.ops` while the `cq` iterator borrows `self.ring`. The
+        // buffers are reactor-owned (`DrainStaging`) so steady-state
+        // drains allocate nothing; take them out for the duration of the
+        // borrow and put them back (emptied) at the end.
+        let DrainStaging {
+            mut to_remove,
+            readiness: mut readiness_deliveries,
+        } = std::mem::take(&mut self.staging);
+        debug_assert!(to_remove.is_empty() && readiness_deliveries.is_empty());
         // Owned-buffer op completions. We cannot deliver them inside the
         // CQ-iterator borrow: delivering means `try_remove`-ing the slab
         // slot to extract the buffer, and the entry's `shared` Arc lives
@@ -1319,7 +1347,7 @@ impl Reactor {
         }
         // Iterator drop syncs the CQ head pointer back to the kernel.
 
-        for key in to_remove {
+        for key in to_remove.drain(..) {
             // Check whether this is a PollMulti slot before removing;
             // only those slots have corresponding ArmTable state, and
             // we want to avoid unnecessary cache-line traffic on
@@ -1478,10 +1506,19 @@ impl Reactor {
             }
         }
 
-        for (io, ready) in readiness_deliveries {
+        for (io, ready) in readiness_deliveries.drain(..) {
             io.set_readiness(Tick::Set, |curr| curr | ready);
             io.wake(ready);
         }
+
+        // Hand the (emptied) buffers back for the next drain. `wake`
+        // above can re-enter user code but not `drain_completions` (it
+        // needs `&mut Reactor`), so nothing raced `self.staging` while
+        // we held the buffers.
+        self.staging = DrainStaging {
+            to_remove,
+            readiness: readiness_deliveries,
+        };
 
         if saw_external_wake {
             drain_eventfd(external_fd);
