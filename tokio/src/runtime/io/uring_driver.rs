@@ -244,10 +244,22 @@ impl GlobalRing {
     /// syscall per op — measured +8..15% on `tcp_register_dereg` when
     /// unconditional) buys nothing there. See `ring_parked` for the
     /// ordering that makes the skip safe.
+    ///
+    /// One exception on the skip path: a pusher that is NOT a worker
+    /// thread has no park of its own coming up, so if every worker is
+    /// condvar-parked while the ring is momentarily unheld the op would
+    /// wait for an unrelated wake (unbounded latency, though never a
+    /// lost op). Kick one worker so someone passes through a park-entry
+    /// drain. Worker pushers skip the kick: their own next park (or
+    /// zero-duration maintenance poll) drains the queue.
     pub(crate) fn push_op(&self, op: PendingOp) {
         self.pending_ops.lock().push(op);
         if self.ring_parked.load(Ordering::SeqCst) {
             let _ = self.ring_waker.wake();
+        } else if crate::runtime::scheduler::multi_thread::uring_park::current_worker_index()
+            .is_none()
+        {
+            self.kick_one_worker();
         }
     }
 
@@ -318,6 +330,11 @@ impl GlobalRing {
             .compare_exchange(NOTIFIED, EMPTY, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
+            // Consumed a pending notification — don't block, but don't
+            // strand queued ops either: a busy, frequently-notified
+            // worker's maintenance polls would otherwise take this early
+            // return every time and never reach the park-entry drain.
+            self.drain_ops_if_unheld();
             return;
         }
 
@@ -325,6 +342,28 @@ impl GlobalRing {
             self.park_driver(idx, &mut reactor, driver_duration);
         } else {
             self.park_condvar(idx, condvar_duration);
+        }
+    }
+
+    /// Best-effort non-blocking drain of the pending-op queue, used on
+    /// park paths that consume a notification without reaching the
+    /// park-entry drain (a busy worker's zero-duration maintenance polls
+    /// can otherwise skip the drain indefinitely while ops sit queued).
+    ///
+    /// Only drains if the ring is free to grab; when the `try_lock`
+    /// fails a holder exists and park-entry/tail drains are its job.
+    fn drain_ops_if_unheld(&self) {
+        if let Some(mut reactor) = self.reactor.try_lock() {
+            let ops = self.take_ops();
+            if ops.is_empty() {
+                return;
+            }
+            apply_pending_ops(&mut reactor, ops);
+            // Non-blocking flush + drain. If this consumes an external
+            // wake CQE, the reactor re-arms `inline_reaped` so the next
+            // blocking park degrades and its caller recomputes state —
+            // required so a pending timer-kick token is not lost here.
+            let _ = reactor.park_timeout(Duration::ZERO);
         }
     }
 
@@ -983,7 +1022,8 @@ impl UringHandle {
         if let Some(g) = self.global.as_ref() {
             // Same FIFO as the Register (drain-time identity read applies
             // identically), same release bookkeeping as below; the ring
-            // kick is push_op's unconditional eventfd write.
+            // kick is push_op's wake-only-if-parked eventfd write (plus
+            // the external-pusher fallback documented on `push_op`).
             g.push_op(PendingOp::Deregister { io: Arc::clone(io) });
             let _ = self.registrations.deregister(&mut self.synced.lock(), io);
             self.metrics.dec_fd_count();
