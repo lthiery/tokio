@@ -294,20 +294,42 @@ impl GlobalRing {
         }
     }
 
-    /// Wake one worker so that *someone* passes through a park-entry
-    /// drain soon. Prefers a condvar-parked worker (it re-parks and
-    /// races for the now-relevant ring); falls back to worker 0, whose
-    /// `NOTIFIED` flag persists across its current activity and forces
-    /// its next park to return and re-enter with fresh state.
+    /// Wake one worker, but only when the ring is genuinely abandoned:
+    /// EVERY worker is condvar-parked. That is the one state in which
+    /// nobody will pass through a park-entry drain on their own — a
+    /// condvar parker re-parks only when woken, and with the ring unheld
+    /// there is no holder to drain for them.
+    ///
+    /// If ANY worker is awake (running, searching, or mid-transition),
+    /// kicking buys nothing: an awake worker's next park either wins the
+    /// free ring — draining the queue at park-entry — or condvar-parks
+    /// because a holder exists, and every holder path from awake back to
+    /// blocking re-drains (the `ring_parked` ordering argument). The old
+    /// unconditional kick (wake first condvar parker, else `unpark(0)`)
+    /// fired on virtually every external push in steady state and cost
+    /// +35..85% on global `tcp_register_dereg` at W2–W8 — the `unpark(0)`
+    /// fallback in particular only forced a spurious NOTIFIED pass on a
+    /// worker whose next park-entry would have drained anyway.
+    ///
+    /// Check-then-act races are benign: a worker that wakes after the
+    /// scan saw it condvar-parked makes the kick redundant (harmless); a
+    /// worker the scan saw awake cannot reach condvar-park without the
+    /// ring being held (park-entry wins a free ring), and a holder drains
+    /// before blocking.
     fn kick_one_worker(&self) {
+        let mut first_condvar = None;
         for (idx, slot) in self.slots.iter().enumerate() {
             if slot.state.load(Ordering::SeqCst) == PARKED_CONDVAR {
-                self.unpark(idx);
+                if first_condvar.is_none() {
+                    first_condvar = Some(idx);
+                }
+            } else {
+                // Someone is awake or ring-parked — they'll drain.
                 return;
             }
         }
-        if !self.slots.is_empty() {
-            self.unpark(0);
+        if let Some(idx) = first_condvar {
+            self.unpark(idx);
         }
     }
 
