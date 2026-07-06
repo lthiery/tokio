@@ -376,3 +376,89 @@ fn local_runtime_foreign_dump_does_not_poll_on_wrong_thread() {
     local.block_on(task).unwrap();
     assert_eq!(*observed.lock().unwrap(), Some(owner));
 }
+
+/// Worker-local tasks are `!Send` and owned by one worker. A dump must leave
+/// them alone: the leader traces the shared task list only, so pinned tasks
+/// must not show up in the dump, must not be polled by the leader, and must
+/// keep running on their worker once the dump is over.
+#[cfg(feature = "worker-local")]
+#[test]
+fn worker_local_tasks_are_not_traced() {
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::ThreadId;
+    use std::time::Duration;
+    use tokio::task::spawn_worker_local;
+
+    let rt = runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let polled_on: Arc<Mutex<Vec<ThreadId>>> = Arc::new(Mutex::new(Vec::new()));
+
+    rt.block_on(async {
+        // Pin a `!Send`, never-completing task to a worker and record every
+        // thread it is polled on.
+        let owner = {
+            let polls = polls.clone();
+            let polled_on = polled_on.clone();
+            tokio::spawn(async move {
+                let rc = Rc::new(());
+                spawn_worker_local(async move {
+                    loop {
+                        let _ = &rc;
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        polled_on.lock().unwrap().push(std::thread::current().id());
+                        tokio::task::yield_now().await;
+                    }
+                });
+                std::thread::current().id()
+            })
+            .await
+            .unwrap()
+        };
+
+        let regular = tokio::spawn(a());
+
+        // Dump from inside the runtime and from a foreign current_thread
+        // runtime on another thread; the multi-thread dump always runs the
+        // trace from a worker, so both must see the same thing.
+        let dumps = vec![Handle::current().dump().await, {
+            let handle = Handle::current();
+            std::thread::spawn(move || {
+                let other = runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                other.block_on(handle.dump())
+            })
+            .join()
+            .unwrap()
+        }];
+
+        for dump in dumps {
+            let tasks: Vec<_> = dump.tasks().iter().collect();
+            assert_eq!(tasks.len(), 1);
+            assert!(tasks[0].trace().to_string().contains("dump::a"));
+
+            // The pinned task is still polled, and only ever on its worker.
+            let before = polls.load(Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while polls.load(Ordering::SeqCst) == before {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("worker-local task stopped running after the dump");
+        }
+
+        regular.abort();
+        let polled_on = polled_on.lock().unwrap();
+        assert!(!polled_on.is_empty());
+        assert!(polled_on.iter().all(|id| *id == owner));
+    });
+}

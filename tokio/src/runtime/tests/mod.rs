@@ -68,6 +68,9 @@ cfg_loom! {
     mod loom_multi_thread;
     mod loom_oneshot;
 
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    mod loom_worker_local;
+
     // Make sure debug assertions are enabled
     #[cfg(not(debug_assertions))]
     compile_error!("these tests require debug assertions to be enabled");
