@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::runtime::Builder;
 use tokio::sync::oneshot;
-use tokio::task::spawn_worker_local;
+use tokio::task::{run_on_any_worker, run_on_each_worker, run_on_worker, spawn_worker_local};
 
 fn rt(workers: usize) -> tokio::runtime::Runtime {
     Builder::new_multi_thread()
@@ -192,6 +192,119 @@ fn block_in_place_allowed_without_worker_local_tasks() {
         })
         .await
         .unwrap();
+    });
+}
+
+#[test]
+fn run_on_worker_targets_correct_worker() {
+    let rt = rt(4);
+    rt.block_on(async {
+        for target in 0..4 {
+            let (tx, rx) = oneshot::channel();
+            run_on_worker(target, move || {
+                spawn_worker_local(async move {
+                    tx.send(tokio::runtime::worker_index()).unwrap();
+                });
+            });
+            assert_eq!(rx.await.unwrap(), Some(target));
+        }
+    });
+}
+
+#[test]
+fn run_on_worker_from_non_runtime_thread() {
+    let rt = rt(2);
+    let handle = rt.handle().clone();
+    let (tx, rx) = oneshot::channel();
+
+    std::thread::spawn(move || {
+        let _guard = handle.enter();
+        run_on_worker(0, move || {
+            tx.send(tokio::runtime::worker_index()).unwrap();
+        });
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(rt.block_on(rx).unwrap(), Some(0));
+}
+
+#[test]
+fn run_on_each_worker_visits_all() {
+    let rt = rt(4);
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        run_on_each_worker(move |index| {
+            let tx = tx.clone();
+            spawn_worker_local(async move {
+                tx.send((index, tokio::runtime::worker_index())).unwrap();
+            });
+        });
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let (index, actual) = rx.recv().await.unwrap();
+            assert_eq!(Some(index), actual);
+            seen.push(index);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+    });
+}
+
+#[test]
+fn run_on_any_worker_distributes() {
+    let rt = rt(2);
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..8 {
+            let tx = tx.clone();
+            run_on_any_worker(move || {
+                tx.send(tokio::runtime::worker_index()).unwrap();
+            });
+        }
+        drop(tx);
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(rx.recv().await.unwrap().unwrap());
+        }
+        // Placement policy is unspecified, but with 8 requests on 2 workers
+        // the current round-robin must touch both.
+        assert_eq!(seen.len(), 2);
+    });
+}
+
+#[test]
+fn run_on_worker_panic_is_contained() {
+    let rt = rt(2);
+    rt.block_on(async {
+        let (tx, rx) = oneshot::channel();
+        run_on_worker(0, || panic!("boom"));
+        // A panicking closure must not take down the worker: queue another
+        // closure on the same worker and observe it running.
+        run_on_worker(0, move || {
+            tx.send(()).unwrap();
+        });
+        rx.await.unwrap();
+    });
+}
+
+#[test]
+#[should_panic(expected = "out of range")]
+fn run_on_worker_index_out_of_range() {
+    let rt = rt(2);
+    rt.block_on(async {
+        run_on_worker(2, || {});
+    });
+}
+
+#[test]
+#[should_panic(expected = "requires the multi-threaded runtime")]
+fn run_on_worker_current_thread_panics() {
+    let rt = Builder::new_current_thread().build().unwrap();
+    rt.block_on(async {
+        run_on_worker(0, || {});
     });
 }
 
