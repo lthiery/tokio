@@ -735,6 +735,16 @@ macro_rules! cfg_metrics_variant {
     }
 }
 
+macro_rules! cfg_worker_local {
+    ($($item:item)*) => {
+        $(
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            #[cfg_attr(docsrs, doc(cfg(all(tokio_unstable, feature = "worker-local"))))]
+            $item
+        )*
+    };
+}
+
 macro_rules! cfg_io_uring {
     ($($item:item)*) => {
         $(
