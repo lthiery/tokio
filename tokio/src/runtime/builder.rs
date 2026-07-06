@@ -106,6 +106,16 @@ pub struct Builder {
     #[cfg(tokio_unstable)]
     pub(super) after_poll: Option<TaskCallback>,
 
+    /// To run when a worker runs out of local work, before it attempts to
+    /// steal from other workers.
+    #[cfg(tokio_unstable)]
+    pub(super) before_steal: Option<Callback>,
+
+    /// To run when a worker is about to attempt stealing tasks from other
+    /// workers' queues.
+    #[cfg(tokio_unstable)]
+    pub(super) on_steal: Option<Callback>,
+
     /// To run after each task is terminated.
     pub(super) after_termination: Option<TaskCallback>,
 
@@ -340,6 +350,11 @@ impl Builder {
             before_poll: None,
             #[cfg(tokio_unstable)]
             after_poll: None,
+
+            #[cfg(tokio_unstable)]
+            before_steal: None,
+            #[cfg(tokio_unstable)]
+            on_steal: None,
 
             keep_alive: None,
 
@@ -966,6 +981,100 @@ impl Builder {
         F: Fn(&TaskMeta<'_>) + Send + Sync + 'static,
     {
         self.before_spawn = Some(std::sync::Arc::new(f));
+        self
+    }
+
+    /// Executes function `f` when a worker runs out of local work, just
+    /// before it attempts to steal tasks from other workers.
+    ///
+    /// `f` is called within the Tokio context, so functions like
+    /// [`tokio::spawn`](crate::spawn) can be called. If the callback
+    /// produces new work for the worker, the worker processes that work
+    /// instead of proceeding to steal. This gives per-worker work sources
+    /// (for example a reactor polled by that worker) a chance to produce
+    /// work before the worker reaches for other workers' queues.
+    ///
+    /// This callback only fires on the multi-threaded scheduler. Setting it
+    /// on a `current_thread` runtime has no effect.
+    ///
+    /// Note: There can only be one before-steal callback for a runtime;
+    /// calling this function more than once replaces the last callback
+    /// defined, rather than adding to it.
+    ///
+    /// **Note**: This is an [unstable API][unstable]. The public API of this type
+    /// may break in 1.x releases. See [the documentation on unstable
+    /// features][unstable] for details.
+    ///
+    /// [unstable]: crate#unstable-features
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tokio::runtime;
+    /// # pub fn main() {
+    /// let runtime = runtime::Builder::new_multi_thread()
+    ///     .on_before_steal(|| {
+    ///         println!("out of local work, about to steal");
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    /// # }
+    /// ```
+    #[cfg(all(not(loom), tokio_unstable))]
+    #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
+    pub fn on_before_steal<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.before_steal = Some(std::sync::Arc::new(f));
+        self
+    }
+
+    /// Executes function `f` when a worker is about to attempt to steal
+    /// tasks from other workers' queues.
+    ///
+    /// This fires after the [`on_before_steal`] callback (if any) has run
+    /// without producing local work, and only when the worker actually
+    /// proceeds to the stealing phase (the scheduler throttles how many
+    /// workers may search for work simultaneously; throttled workers do not
+    /// fire this callback). It is intended as a lightweight notification
+    /// hook, e.g. for metrics; the steal attempt itself may still find all
+    /// other queues empty.
+    ///
+    /// This callback only fires on the multi-threaded scheduler. Setting it
+    /// on a `current_thread` runtime has no effect.
+    ///
+    /// Note: There can only be one on-steal callback for a runtime; calling
+    /// this function more than once replaces the last callback defined,
+    /// rather than adding to it.
+    ///
+    /// **Note**: This is an [unstable API][unstable]. The public API of this type
+    /// may break in 1.x releases. See [the documentation on unstable
+    /// features][unstable] for details.
+    ///
+    /// [`on_before_steal`]: Self::on_before_steal
+    /// [unstable]: crate#unstable-features
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tokio::runtime;
+    /// # pub fn main() {
+    /// let runtime = runtime::Builder::new_multi_thread()
+    ///     .on_steal(|| {
+    ///         println!("attempting to steal work from other workers");
+    ///     })
+    ///     .build()
+    ///     .unwrap();
+    /// # }
+    /// ```
+    #[cfg(all(not(loom), tokio_unstable))]
+    #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
+    pub fn on_steal<F>(&mut self, f: F) -> &mut Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.on_steal = Some(std::sync::Arc::new(f));
         self
     }
 
@@ -1783,6 +1892,10 @@ impl Builder {
                 before_poll: self.before_poll.clone(),
                 #[cfg(tokio_unstable)]
                 after_poll: self.after_poll.clone(),
+                #[cfg(tokio_unstable)]
+                before_steal: self.before_steal.clone(),
+                #[cfg(tokio_unstable)]
+                on_steal: self.on_steal.clone(),
                 after_termination: self.after_termination.clone(),
                 global_queue_interval: self.global_queue_interval,
                 event_interval: self.event_interval,
@@ -2154,6 +2267,10 @@ cfg_rt_multi_thread! {
                     before_poll: self.before_poll.clone(),
                     #[cfg(tokio_unstable)]
                     after_poll: self.after_poll.clone(),
+                    #[cfg(tokio_unstable)]
+                    before_steal: self.before_steal.clone(),
+                    #[cfg(tokio_unstable)]
+                    on_steal: self.on_steal.clone(),
                     after_termination: self.after_termination.clone(),
                     global_queue_interval: self.global_queue_interval,
                     event_interval: self.event_interval,

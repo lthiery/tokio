@@ -32,6 +32,16 @@ pub(crate) struct Config {
     #[cfg(tokio_unstable)]
     pub(crate) after_poll: Option<TaskCallback>,
 
+    /// To run when a worker runs out of local work, before it attempts to
+    /// steal from other workers.
+    #[cfg(tokio_unstable)]
+    pub(crate) before_steal: Option<Callback>,
+
+    /// To run when a worker is about to attempt stealing tasks from other
+    /// workers' queues.
+    #[cfg(tokio_unstable)]
+    pub(crate) on_steal: Option<Callback>,
+
     /// The multi-threaded scheduler includes a per-worker LIFO slot used to
     /// store the last scheduled task. This can improve certain usage patterns,
     /// especially message passing between tasks. However, this LIFO slot is not

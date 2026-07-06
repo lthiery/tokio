@@ -678,6 +678,27 @@ impl Context {
                 }
             }
 
+            // Out of local work: give the before-steal callback a chance to
+            // produce some before we reach for other workers' queues.
+            #[cfg(tokio_unstable)]
+            if self.worker.handle.shared.config.before_steal.is_some() {
+                core = self.run_before_steal_callback(core)?;
+
+                if let Some(task) = core.next_task(&self.worker) {
+                    core = self.run_task(task, core)?;
+                    continue;
+                }
+
+                #[cfg(feature = "worker-local")]
+                {
+                    let (c, ran) = self.poll_worker_local(core)?;
+                    core = c;
+                    if ran {
+                        continue;
+                    }
+                }
+            }
+
             // We consumed all work in the queues and will start searching for work.
             core.stats.end_processing_scheduled_tasks();
 
@@ -1002,6 +1023,21 @@ impl Context {
 
             Some(join_handle)
         }
+    }
+
+    /// Runs the user's before-steal callback with the core available to the
+    /// runtime context, so the callback can spawn work onto this worker.
+    #[cfg(tokio_unstable)]
+    fn run_before_steal_callback(&self, core: Box<Core>) -> RunResult {
+        *self.core.borrow_mut() = Some(core);
+
+        if let Some(f) = &self.worker.handle.shared.config.before_steal {
+            f();
+        }
+
+        // Check if we still have the core: the callback may have called
+        // `block_in_place`, handing the core to another thread.
+        self.core.borrow_mut().take().ok_or(())
     }
 
     fn reset_lifo_enabled(&self, core: &mut Core) {
@@ -1420,6 +1456,15 @@ impl Core {
     fn steal_work(&mut self, worker: &Worker) -> Option<Notified> {
         if !self.transition_to_searching(worker) {
             return None;
+        }
+
+        // The worker is committed to attempting steals: past the searching
+        // throttle above, about to touch other workers' queues. This does
+        // not fire on throttled workers, and it fires at most once per
+        // search regardless of how many victims are probed.
+        #[cfg(tokio_unstable)]
+        if let Some(f) = &worker.handle.shared.config.on_steal {
+            f();
         }
 
         let num = worker.handle.shared.remotes.len();
