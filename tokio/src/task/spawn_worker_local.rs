@@ -177,7 +177,11 @@ where
 {
     Box::new(move || {
         let fut_size = std::mem::size_of::<F>();
-        let _ = spawn_worker_local_inner(async move { f() }, SpawnMeta::new_unnamed(fut_size));
+        // Fire-and-forget: the JoinHandle is intentionally dropped.
+        drop(spawn_worker_local_inner(
+            async move { f() },
+            SpawnMeta::new_unnamed(fut_size),
+        ));
     })
 }
 

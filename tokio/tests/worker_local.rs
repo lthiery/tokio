@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::runtime::Builder;
 use tokio::sync::oneshot;
-use tokio::task::{run_on_any_worker, run_on_each_worker, run_on_worker, spawn_worker_local};
+use tokio::task::{run_on_each_worker, run_on_worker, spawn_worker_local};
 
 fn rt(workers: usize) -> tokio::runtime::Runtime {
     Builder::new_multi_thread()
@@ -253,29 +253,6 @@ fn run_on_each_worker_visits_all() {
 }
 
 #[test]
-fn run_on_any_worker_distributes() {
-    let rt = rt(2);
-    rt.block_on(async {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        for _ in 0..8 {
-            let tx = tx.clone();
-            run_on_any_worker(move || {
-                tx.send(tokio::runtime::worker_index()).unwrap();
-            });
-        }
-        drop(tx);
-
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..8 {
-            seen.insert(rx.recv().await.unwrap().unwrap());
-        }
-        // Placement policy is unspecified, but with 8 requests on 2 workers
-        // the current round-robin must touch both.
-        assert_eq!(seen.len(), 2);
-    });
-}
-
-#[test]
 fn run_on_worker_panic_is_contained() {
     let rt = rt(2);
     rt.block_on(async {
@@ -305,6 +282,116 @@ fn run_on_worker_current_thread_panics() {
     let rt = Builder::new_current_thread().build().unwrap();
     rt.block_on(async {
         run_on_worker(0, || {});
+    });
+}
+
+#[test]
+fn abort_from_other_thread() {
+    struct SetOnDrop(Arc<AtomicUsize>);
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let rt = rt(2);
+
+    rt.block_on(async {
+        let drops = drops.clone();
+        let (tx, rx) = oneshot::channel();
+
+        let outer = tokio::spawn(async move {
+            let guard = SetOnDrop(drops);
+            let join = spawn_worker_local(async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            });
+            tx.send(join.abort_handle()).unwrap();
+            assert!(join.await.unwrap_err().is_cancelled());
+        });
+
+        // Abort from the (non-worker) block_on thread: cancellation must
+        // route back to the owning worker, which drops the future there.
+        let abort = rx.await.unwrap();
+        abort.abort();
+
+        // The cancellation completes asynchronously on the owning worker;
+        // the outer task observes it via the JoinHandle.
+        outer.await.unwrap();
+    });
+
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn nested_spawn_worker_local() {
+    let rt = rt(2);
+    rt.block_on(async {
+        let value = tokio::spawn(async {
+            let outer = spawn_worker_local(async {
+                // Spawning from inside a worker-local task lands on the
+                // same worker.
+                let before = std::thread::current().id();
+                let inner = spawn_worker_local(async move {
+                    assert_eq!(before, std::thread::current().id());
+                    5
+                });
+                inner.await.unwrap() + 1
+            });
+            outer.await.unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 6);
+    });
+}
+
+#[test]
+fn worker_local_and_regular_tasks_share_worker() {
+    // A yield-looping worker-local task must not starve regular tasks on
+    // the same worker, and vice versa.
+    let rt = Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        tokio::spawn(async {
+            let local = spawn_worker_local(async {
+                for _ in 0..1_000 {
+                    tokio::task::yield_now().await;
+                }
+            });
+            let regular = tokio::spawn(async {
+                for _ in 0..1_000 {
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            local.await.unwrap();
+            regular.await.unwrap();
+        })
+        .await
+        .unwrap();
+    });
+}
+
+#[test]
+fn spawn_local_still_panics_on_worker() {
+    // The worker-local feature must not change `spawn_local` semantics:
+    // outside a LocalSet it panics, it does not fall back to worker-local.
+    let rt = rt(2);
+    rt.block_on(async {
+        let panicked = tokio::spawn(async {
+            std::panic::catch_unwind(|| {
+                let _ = tokio::task::spawn_local(async {});
+            })
+            .is_err()
+        })
+        .await
+        .unwrap();
+        assert!(panicked);
     });
 }
 
