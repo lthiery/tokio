@@ -11,7 +11,18 @@ impl Handle {
     }
 
     pub(crate) fn num_alive_tasks(&self) -> usize {
-        self.shared.owned.num_alive_tasks()
+        let num_alive_tasks = self.shared.owned.num_alive_tasks();
+
+        #[cfg(all(tokio_unstable, feature = "worker-local"))]
+        let num_alive_tasks = num_alive_tasks
+            + self
+                .shared
+                .worker_locals
+                .iter()
+                .map(|worker_local| worker_local.num_alive_tasks())
+                .sum::<usize>();
+
+        num_alive_tasks
     }
 
     pub(crate) fn injection_queue_depth(&self) -> usize {
