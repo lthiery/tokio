@@ -68,6 +68,19 @@ use crate::runtime::{
 };
 use crate::runtime::{context, TaskHooks};
 use crate::task::coop;
+
+#[cfg(all(tokio_unstable, feature = "worker-local"))]
+use crate::runtime::scheduler::multi_thread::worker_local::{
+    WorkerLocalScheduler, WorkerLocalShared,
+};
+#[cfg(all(tokio_unstable, feature = "worker-local"))]
+use crate::runtime::task::JoinHandle;
+#[cfg(all(tokio_unstable, feature = "worker-local"))]
+use crate::runtime::TaskMeta;
+#[cfg(all(tokio_unstable, feature = "worker-local"))]
+use std::collections::VecDeque;
+#[cfg(all(tokio_unstable, feature = "worker-local"))]
+use crate::future::Future;
 use crate::util::atomic_cell::AtomicCell;
 use crate::util::rand::{FastRand, RngSeedGenerator};
 
@@ -163,6 +176,12 @@ struct Core {
 
     /// Fast random number generator.
     rand: FastRand,
+
+    /// Queue of runnable worker-local tasks. Only ever touched by the thread
+    /// holding this core; tasks in it are bound to this worker and are
+    /// invisible to stealers.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    worker_local_queue: VecDeque<NotifiedWorkerLocal>,
 }
 
 /// State shared across all workers
@@ -181,6 +200,10 @@ pub(crate) struct Shared {
 
     /// Collection of all active tasks spawned onto this executor.
     pub(crate) owned: OwnedTasks<Arc<Handle>>,
+
+    /// Per-worker state for worker-local tasks.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(super) worker_locals: Box<[WorkerLocalShared]>,
 
     /// Data synchronized by the scheduler mutex
     pub(super) synced: Mutex<Synced>,
@@ -263,6 +286,10 @@ type RunResult = Result<Box<Core>, ()>;
 /// A notified task handle
 type Notified = task::Notified<Arc<Handle>>;
 
+/// A notified worker-local task handle
+#[cfg(all(tokio_unstable, feature = "worker-local"))]
+type NotifiedWorkerLocal = task::Notified<WorkerLocalScheduler>;
+
 /// Value picked out of thin-air. Running the LIFO slot a handful of times
 /// seems sufficient to benefit from locality. More than 3 times probably is
 /// over-weighting. The value can be tuned in the future with data that shows
@@ -309,6 +336,8 @@ pub(super) fn create(
             global_queue_interval: stats.tuned_global_queue_interval(&config),
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            worker_local_queue: VecDeque::new(),
         }));
 
         remotes.push(Remote { steal, unpark });
@@ -331,6 +360,11 @@ pub(super) fn create(
             inject,
             idle,
             owned: OwnedTasks::new(size),
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            worker_locals: (0..size)
+                .map(|_| WorkerLocalShared::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             synced: Mutex::new(Synced {
                 idle: idle_synced,
                 inject: inject_synced,
@@ -448,6 +482,24 @@ where
         }
 
         let cx = maybe_cx.expect("no .is_some() == false cases above should lead here");
+
+        // Worker-local tasks are bound to the OS thread driving their worker.
+        // Handing the core to another thread would let them be polled or
+        // dropped on a different thread, which is unsound for `!Send`
+        // futures. Refuse to block while any are alive on this worker. Note
+        // that this must be checked *before* the core is taken out of the
+        // context below: panicking with the core moved into a local would
+        // drop it, wedging runtime shutdown.
+        #[cfg(all(tokio_unstable, feature = "worker-local"))]
+        if cx.core.borrow().is_some()
+            && !cx.worker.handle.shared.worker_locals[cx.worker.index]
+                .owned
+                .is_empty()
+        {
+            return Err(
+                "cannot call `block_in_place` on a worker that is running worker-local tasks",
+            );
+        }
 
         // Since deferred tasks don't stay on `core`, make sure to wake them
         // before blocking.
@@ -591,10 +643,36 @@ impl Context {
             // Run maintenance, if needed
             core = self.maintenance(core);
 
+            // Periodically prioritize worker-local tasks, mirroring how
+            // `next_task` periodically prioritizes the inject queue. On all
+            // other ticks worker-local tasks only run when the regular
+            // queues are empty (see below), so neither task class can
+            // starve the other.
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            if core.tick % core.global_queue_interval == core.global_queue_interval / 2 {
+                let (c, ran) = self.poll_worker_local(core)?;
+                core = c;
+                if ran {
+                    continue;
+                }
+            }
+
             // First, check work available to the current worker.
             if let Some(task) = core.next_task(&self.worker) {
                 core = self.run_task(task, core)?;
                 continue;
+            }
+
+            // No regular local work: run worker-local tasks before resorting
+            // to stealing. This is also the prompt pickup path for spawn
+            // requests and cross-thread wakes after an unpark.
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            {
+                let (c, ran) = self.poll_worker_local(core)?;
+                core = c;
+                if ran {
+                    continue;
+                }
             }
 
             // We consumed all work in the queues and will start searching for work.
@@ -778,6 +856,137 @@ impl Context {
                 self.worker.handle.task_hooks.poll_stop_callback(&task_meta);
             }
         })
+    }
+
+    /// Runs pending spawn requests, then at most one worker-local task.
+    ///
+    /// Returns the core and whether a task ran (in which case the caller
+    /// should restart its loop).
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    fn poll_worker_local(&self, mut core: Box<Core>) -> Result<(Box<Core>, bool), ()> {
+        core = self.drain_worker_local_spawn_requests(core)?;
+
+        if let Some(task) = core.next_worker_local_task(&self.worker) {
+            let core = self.run_worker_local_task(task, core)?;
+            return Ok((core, true));
+        }
+
+        Ok((core, false))
+    }
+
+    /// Runs a worker-local task.
+    ///
+    /// This mirrors `run_task`, without the LIFO-slot loop (worker-local
+    /// wakes always go to the back of the worker-local queue) and without
+    /// the eager driver handoff optimization.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    fn run_worker_local_task(&self, task: NotifiedWorkerLocal, mut core: Box<Core>) -> RunResult {
+        let task_meta = task.task_meta();
+
+        let task = self.worker.handle.shared.worker_locals[self.worker.index]
+            .owned
+            .assert_owner(task);
+
+        // Make sure the worker is not in the **searching** state. This
+        // enables another idle worker to try to steal work.
+        core.transition_from_searching(&self.worker);
+
+        core.stats.start_poll(
+            task.get_scheduled_at()
+                .prepare(self.worker.handle.shared.started_at),
+        );
+
+        // Make the core available to the runtime context
+        *self.core.borrow_mut() = Some(core);
+
+        // Run the task
+        coop::budget(|| {
+            self.worker
+                .handle
+                .task_hooks
+                .poll_start_callback(&task_meta);
+
+            task.run();
+
+            self.worker.handle.task_hooks.poll_stop_callback(&task_meta);
+        });
+
+        // Check if we still have the core. If not, the task called
+        // `block_in_place` (with no other worker-local tasks alive) and the
+        // core was handed to another thread.
+        let mut core = self.core.borrow_mut().take().ok_or(())?;
+        core.stats.end_poll();
+        Ok(core)
+    }
+
+    /// Runs pending spawn-request closures for this worker.
+    ///
+    /// The closures spawn worker-local tasks through the thread-local
+    /// context, so the core is made available to the context for the
+    /// duration of the drain.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    fn drain_worker_local_spawn_requests(&self, core: Box<Core>) -> RunResult {
+        let worker_local = &self.worker.handle.shared.worker_locals[self.worker.index];
+
+        if !worker_local.has_spawn_requests() {
+            return Ok(core);
+        }
+
+        *self.core.borrow_mut() = Some(core);
+
+        worker_local.drain_spawn_requests();
+
+        // Check if we still have the core: a closure may have called
+        // `block_in_place`, handing the core to another thread.
+        self.core.borrow_mut().take().ok_or(())
+    }
+
+    /// Binds a worker-local task to this worker and schedules it.
+    ///
+    /// Returns `None` if this thread does not currently hold the worker's
+    /// core (it is inside `block_in_place`). Possession of the core is what
+    /// makes touching `owned` sound: only one thread can hold the core, and
+    /// the `block_in_place` gate keeps it on this thread while any
+    /// worker-local tasks are alive.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(crate) fn spawn_worker_local<F>(
+        &self,
+        future: F,
+        id: task::Id,
+        spawned_at: task::SpawnLocation,
+    ) -> Option<JoinHandle<F::Output>>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        if self.core.borrow().is_none() {
+            return None;
+        }
+
+        let handle = &self.worker.handle;
+        let index = self.worker.index;
+
+        let (join_handle, notified) = handle.shared.worker_locals[index].owned.bind(
+            future,
+            WorkerLocalScheduler::new(handle.clone(), index),
+            id,
+            spawned_at,
+        );
+
+        handle.task_hooks.spawn(&TaskMeta {
+            id,
+            spawned_at,
+            _phantom: std::marker::PhantomData,
+        });
+
+        // The scheduler routes the task into this worker's local queue via
+        // the context. `notified` is `None` if the runtime is shutting down,
+        // in which case `bind` already shut the task down.
+        if let Some(notified) = notified {
+            handle.schedule_worker_local_task(index, notified);
+        }
+
+        Some(join_handle)
     }
 
     fn reset_lifo_enabled(&self, core: &mut Core) {
@@ -1147,6 +1356,45 @@ impl Core {
         self.lifo_slot.take().or_else(|| self.run_queue.pop())
     }
 
+    /// Returns the next worker-local task, refilling the local queue from
+    /// this worker's inject queue when it runs dry.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    fn next_worker_local_task(&mut self, worker: &Worker) -> Option<NotifiedWorkerLocal> {
+        if let Some(task) = self.worker_local_queue.pop_front() {
+            return Some(task);
+        }
+
+        let worker_local = &worker.handle.shared.worker_locals[worker.index];
+
+        if worker_local.inject_shared.is_empty() {
+            return None;
+        }
+
+        // Unlike the scheduler-wide inject queue, this queue has a single
+        // consumer (this worker), so take everything in one batch.
+        let mut synced = worker_local.inject_synced.lock();
+        let n = worker_local.inject_shared.len();
+        // safety: passing in the `inject::Synced` created with this `Shared`
+        let mut tasks = unsafe { worker_local.inject_shared.pop_n(&mut synced, n) };
+
+        let ret = tasks.next();
+        self.worker_local_queue.extend(tasks);
+
+        ret
+    }
+
+    /// Returns `true` if this worker has pending worker-local work in any
+    /// form: runnable tasks, cross-thread wakes, or spawn requests.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    fn has_worker_local_work(&self, worker: &Worker) -> bool {
+        if !self.worker_local_queue.is_empty() {
+            return true;
+        }
+
+        let worker_local = &worker.handle.shared.worker_locals[worker.index];
+        !worker_local.inject_shared.is_empty() || worker_local.has_spawn_requests()
+    }
+
     /// Function responsible for stealing tasks from another worker
     ///
     /// Note: Only if less than half the workers are searching for tasks to steal
@@ -1212,12 +1460,25 @@ impl Core {
         self.lifo_slot.is_some() as usize + self.run_queue.len() > 1
     }
 
+    /// Returns `true` if this worker has any pending work, including
+    /// worker-local work.
+    fn has_any_work(&self, worker: &Worker) -> bool {
+        #[cfg(all(tokio_unstable, feature = "worker-local"))]
+        if self.has_worker_local_work(worker) {
+            return true;
+        }
+        #[cfg(not(all(tokio_unstable, feature = "worker-local")))]
+        let _ = worker;
+
+        self.has_tasks()
+    }
+
     /// Prepares the worker state for parking.
     ///
     /// Returns true if the transition happened, false if there is work to do first.
     fn transition_to_parked(&mut self, worker: &Worker) -> bool {
         // Workers should not park if they have work to do
-        if self.has_tasks() || self.is_traced {
+        if self.has_any_work(worker) || self.is_traced {
             return false;
         }
 
@@ -1243,9 +1504,9 @@ impl Core {
 
     /// Returns `true` if the transition happened.
     fn transition_from_parked(&mut self, worker: &Worker) -> bool {
-        // If a task is in the lifo slot/run queue, then we must unpark regardless of
-        // being notified
-        if self.has_tasks() {
+        // If a task is in the lifo slot/run queue (or worker-local work is
+        // pending), then we must unpark regardless of being notified
+        if self.has_any_work(worker) {
             // When a worker wakes, it should only transition to the "searching"
             // state when the wake originates from another worker *or* a new task
             // is pushed. We do *not* want the worker to transition to "searching"
@@ -1302,6 +1563,34 @@ impl Core {
             .shared
             .owned
             .close_and_shutdown_all(start as usize);
+
+        // Shut down this worker's worker-local tasks. This runs on the
+        // thread that owns them: `pre_shutdown` executes on the core-holder
+        // thread, and the `block_in_place` gate prevents the core from
+        // migrating while any worker-local tasks are alive.
+        #[cfg(all(tokio_unstable, feature = "worker-local"))]
+        {
+            let worker_local = &worker.handle.shared.worker_locals[worker.index];
+
+            // Drop pending spawn requests without running them.
+            worker_local.clear_spawn_requests();
+
+            // Close the inject queue so subsequent cross-thread wakes are
+            // dropped, then drain any already-queued notifications.
+            {
+                let mut synced = worker_local.inject_synced.lock();
+                worker_local.inject_shared.close(&mut synced);
+                // safety: passing in the `inject::Synced` created with this
+                // `Shared`
+                while unsafe { worker_local.inject_shared.pop(&mut synced) }.is_some() {}
+            }
+
+            // Drop queued notifications in the local queue.
+            self.worker_local_queue.clear();
+
+            // Cancel and drop all worker-local tasks.
+            worker_local.owned.close_and_shutdown_all();
+        }
 
         self.stats
             .submit(&worker.handle.shared.worker_metrics[worker.index]);
@@ -1405,6 +1694,64 @@ impl Handle {
         if should_notify && core.park.is_some() {
             self.notify_parked_local();
         }
+    }
+
+    /// Schedules a worker-local task onto the worker it is bound to.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(super) fn schedule_worker_local_task(
+        &self,
+        worker_index: usize,
+        task: NotifiedWorkerLocal,
+    ) {
+        if self
+            .shared
+            .config
+            .metrics_schedule_latency_histogram
+            .is_some()
+        {
+            task.set_scheduled_at(ScheduleLatencyInstant::new(self.shared.started_at));
+        }
+
+        with_current(|maybe_cx| {
+            if let Some(cx) = maybe_cx {
+                // Fast path: the current thread is driving the target worker.
+                if self.ptr_eq(&cx.worker.handle) && cx.worker.index == worker_index {
+                    if let Some(core) = cx.core.borrow_mut().as_mut() {
+                        core.stats.inc_local_schedule_count();
+                        core.worker_local_queue.push_back(task);
+                        return;
+                    }
+                }
+            }
+
+            self.push_worker_local_task(worker_index, task);
+        });
+    }
+
+    /// Pushes a worker-local task to its worker's inject queue from another
+    /// thread and unparks that worker.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    fn push_worker_local_task(&self, worker_index: usize, task: NotifiedWorkerLocal) {
+        self.shared.scheduler_metrics.inc_remote_schedule_count();
+
+        let worker_local = &self.shared.worker_locals[worker_index];
+        {
+            let mut synced = worker_local.inject_synced.lock();
+            // safety: passing in the `inject::Synced` created with this
+            // `Shared`. If the queue is closed (shutdown), the task
+            // notification is dropped; the task itself has already been shut
+            // down by `pre_shutdown`.
+            unsafe {
+                worker_local.inject_shared.push(&mut synced, task);
+            }
+        }
+
+        // Unlike regular tasks, this work cannot be picked up by any other
+        // worker, so the target is unparked directly rather than through the
+        // idle set (`idle.unpark_worker_by_id` would corrupt `num_searching`
+        // when the worker isn't parked). Unparking a busy worker just costs
+        // it one wasted park attempt: the parker stores a token.
+        self.shared.remotes[worker_index].unpark.unpark(&self.driver);
     }
 
     fn next_remote_task(&self) -> Option<Notified> {
@@ -1522,6 +1869,12 @@ impl Handle {
         }
 
         debug_assert!(self.shared.owned.is_empty());
+        #[cfg(all(tokio_unstable, feature = "worker-local"))]
+        debug_assert!(self
+            .shared
+            .worker_locals
+            .iter()
+            .all(|worker_local| worker_local.owned.is_empty()));
 
         for mut core in cores.drain(..) {
             core.shutdown(self);
