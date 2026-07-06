@@ -72,6 +72,8 @@ process = [
 # Includes basic task execution capabilities
 rt = []
 rt-multi-thread = ["rt"]
+# Worker-affine (!Send) tasks on the multi-threaded runtime. Requires `--cfg tokio_unstable`.
+worker-local = ["rt-multi-thread"]
 signal = [
   "libc",
   "mio/os-poll",

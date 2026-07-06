@@ -357,6 +357,8 @@
 //! - `schedule-latency`: Allows measurement of task scheduling latencies.
 //! - `io-uring`: Enables `io-uring` (Linux only).
 //! - `taskdump`: Enables `taskdump` (Linux only).
+//! - `worker-local`: Enables spawning worker-affine (`!Send`) tasks on the
+//!   multi-threaded runtime.
 //!
 //! Likewise, this flag enables access to unstable APIs.
 //!
