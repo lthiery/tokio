@@ -357,6 +357,8 @@
 //! - `schedule-latency`: Allows measurement of task scheduling latencies.
 //! - `io-uring`: Enables `io-uring` (Linux only).
 //! - `taskdump`: Enables `taskdump` (Linux only).
+//! - `worker-local`: Enables spawning worker-affine (`!Send`) tasks on the
+//!   multi-threaded runtime.
 //!
 //! Likewise, this flag enables access to unstable APIs.
 //!
@@ -501,6 +503,9 @@ compile_error!(
     "The `taskdump` feature is only currently supported on \
 linux, on `aarch64`, `x86`, `x86_64` and `s390x`."
 );
+
+#[cfg(all(not(tokio_unstable), feature = "worker-local"))]
+compile_error!("The `worker-local` feature requires `--cfg tokio_unstable`.");
 
 #[cfg(all(not(tokio_unstable), feature = "schedule-latency"))]
 compile_error!("The `schedule-latency` feature requires `--cfg tokio_unstable`.");
