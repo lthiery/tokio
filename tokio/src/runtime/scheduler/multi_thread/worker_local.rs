@@ -132,6 +132,17 @@ impl WorkerLocalShared {
         }
     }
 
+    /// Records a pending spawn request. The caller is responsible for
+    /// unparking the target worker.
+    pub(super) fn push_spawn_request(&self, f: Box<dyn FnOnce() + Send>) {
+        let mut guard = self.spawn_requests.lock();
+        guard.push_back(f);
+        // Set the flag while holding the lock so the flag and the queue's
+        // empty/non-empty state cannot disagree in a way that loses a
+        // request.
+        self.has_spawn_requests.store(true, Release);
+    }
+
     /// Returns `true` if there may be pending spawn requests, without
     /// locking.
     pub(super) fn has_spawn_requests(&self) -> bool {

@@ -1754,6 +1754,32 @@ impl Handle {
         self.shared.remotes[worker_index].unpark.unpark(&self.driver);
     }
 
+    /// Queues a closure to run on a specific worker thread and unparks that
+    /// worker.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `worker_index` is out of range.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(crate) fn push_worker_local_spawn_request(
+        &self,
+        worker_index: usize,
+        f: Box<dyn FnOnce() + Send>,
+    ) {
+        assert!(
+            worker_index < self.shared.worker_locals.len(),
+            "worker index {} is out of range: the runtime has {} worker threads",
+            worker_index,
+            self.shared.worker_locals.len(),
+        );
+
+        self.shared.worker_locals[worker_index].push_spawn_request(f);
+
+        // See `push_worker_local_task` for why the worker is unparked
+        // directly rather than through the idle set.
+        self.shared.remotes[worker_index].unpark.unpark(&self.driver);
+    }
+
     fn next_remote_task(&self) -> Option<Notified> {
         if self.shared.inject.is_empty() {
             return None;
