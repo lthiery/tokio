@@ -1001,7 +1001,7 @@ impl Context {
             }
 
             Some(join_handle)
-    }
+        }
     }
 
     fn reset_lifo_enabled(&self, core: &mut Core) {
@@ -1768,7 +1768,35 @@ impl Handle {
             // when the worker isn't parked). Unparking a busy worker just costs
             // it one wasted park attempt: the parker stores a token.
             self.shared.remotes[worker_index].unpark.unpark(&self.driver);
-    }
+        }
+
+        /// Queues a closure to run on a specific worker thread and unparks that
+        /// worker.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `worker_index` is out of range.
+        pub(crate) fn push_worker_local_spawn_request(
+            &self,
+            worker_index: usize,
+            f: Box<dyn FnOnce() + Send>,
+        ) {
+            assert!(
+                worker_index < self.shared.worker_locals.len(),
+                "worker index {} is out of range: the runtime has {} worker threads",
+                worker_index,
+                self.shared.worker_locals.len(),
+            );
+
+            // The push fails if the queue is closed (the runtime is shutting
+            // down); the request is dropped without running and there is no
+            // worker to unpark.
+            if self.shared.worker_locals[worker_index].push_spawn_request(f) {
+                // See `push_worker_local_task` for why the worker is
+                // unparked directly rather than through the idle set.
+                self.shared.remotes[worker_index].unpark.unpark(&self.driver);
+            }
+        }
     }
 
     fn next_remote_task(&self) -> Option<Notified> {
