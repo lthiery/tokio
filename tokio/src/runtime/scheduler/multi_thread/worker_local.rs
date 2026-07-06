@@ -210,6 +210,28 @@ impl WorkerLocalShared {
         self.num_alive.store(0, Relaxed);
     }
 
+    /// Records a pending spawn request and returns `true`; the caller is
+    /// responsible for unparking the target worker.
+    ///
+    /// Returns `false` if the queue is closed (the runtime is shutting
+    /// down); the request is dropped without running.
+    pub(super) fn push_spawn_request(&self, f: Box<dyn FnOnce() + Send>) -> bool {
+        let mut guard = self.spawn_requests.lock();
+        if guard.is_closed {
+            // Drop the closure outside the lock: its destructor may itself
+            // call `run_on_worker`.
+            drop(guard);
+            drop(f);
+            return false;
+        }
+        guard.queue.push_back(f);
+        // Set the flag while holding the lock so the flag and the queue's
+        // empty/non-empty state cannot disagree in a way that loses a
+        // request.
+        self.has_spawn_requests.store(true, Release);
+        true
+    }
+
     /// Returns `true` if there may be pending spawn requests, without
     /// locking.
     pub(super) fn has_spawn_requests(&self) -> bool {
