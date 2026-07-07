@@ -202,6 +202,12 @@ pub(crate) struct Shared {
     #[cfg(all(tokio_unstable, feature = "worker-local"))]
     pub(super) worker_locals: Box<[WorkerLocalShared]>,
 
+    /// Round-robin cursor for placing "any worker" spawn requests. The
+    /// placement policy is deliberately unspecified in the public API so it
+    /// can change later.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    next_any_worker: std::sync::atomic::AtomicUsize,
+
     /// Data synchronized by the scheduler mutex
     pub(super) synced: Mutex<Synced>,
 
@@ -360,6 +366,8 @@ pub(super) fn create(
                 .map(|_| WorkerLocalShared::new())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            next_any_worker: std::sync::atomic::AtomicUsize::new(0),
             synced: Mutex::new(Synced {
                 idle: idle_synced,
                 inject: inject_synced,
@@ -1842,6 +1850,15 @@ impl Handle {
                 self.shared.remotes[worker_index].unpark.unpark(&self.driver);
             }
         }
+    }
+
+    /// Picks a worker for an "any worker" spawn request. The policy
+    /// (currently round-robin) is an implementation detail.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(crate) fn pick_any_worker(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        self.shared.next_any_worker.fetch_add(1, Relaxed) % self.shared.worker_locals.len()
     }
 
     fn next_remote_task(&self) -> Option<Notified> {
