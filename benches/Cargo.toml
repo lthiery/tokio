@@ -106,5 +106,15 @@ name = "remote_spawn"
 path = "remote_spawn.rs"
 harness = false
 
+[[bench]]
+name = "net_tcp_echo"
+path = "net_tcp_echo.rs"
+harness = false
+
+[[bench]]
+name = "net_request_hash"
+path = "net_request_hash.rs"
+harness = false
+
 [lints]
 workspace = true
