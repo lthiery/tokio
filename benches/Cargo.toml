@@ -7,6 +7,7 @@ license = "MIT"
 
 [features]
 test-util = ["tokio/test-util"]
+worker-local = ["tokio/worker-local"]
 
 [dependencies]
 tokio = { version = "1.5.0", path = "../tokio", features = ["full"] }
@@ -104,6 +105,16 @@ harness = false
 [[bench]]
 name = "remote_spawn"
 path = "remote_spawn.rs"
+harness = false
+
+[[bench]]
+name = "net_tcp_echo"
+path = "net_tcp_echo.rs"
+harness = false
+
+[[bench]]
+name = "net_request_hash"
+path = "net_request_hash.rs"
 harness = false
 
 [lints]
