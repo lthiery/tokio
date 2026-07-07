@@ -7,9 +7,10 @@ license = "MIT"
 
 [features]
 test-util = ["tokio/test-util"]
+worker-local = ["tokio/worker-local"]
 
 [dependencies]
-tokio = { version = "1.5.0", path = "../tokio", features = ["full"] }
+tokio = { version = "1.5.0", path = "../tokio", features = ["full", "worker-local"] }
 criterion = "0.5.1"
 rand = "0.9"
 rand_chacha = "0.9"
@@ -119,6 +120,11 @@ harness = false
 [[bench]]
 name = "net_shard_echo"
 path = "net_shard_echo.rs"
+harness = false
+
+[[bench]]
+name = "net_request_hash"
+path = "net_request_hash.rs"
 harness = false
 
 [lints]
