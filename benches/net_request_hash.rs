@@ -18,6 +18,16 @@
 //!
 //! Knobs (env): TOKIO_BENCH_WORKERS, TOKIO_BENCH_HASH_ROUNDS,
 //! TOKIO_BENCH_REQ_BYTES, TOKIO_BENCH_CONNS, TOKIO_BENCH_MSGS.
+//!
+//! Asymmetric-load knobs: TOKIO_BENCH_HASH_ROUNDS_MIN / _MAX draw the
+//! per-hash round count uniformly from [min, max] instead of the fixed
+//! TOKIO_BENCH_HASH_ROUNDS. TOKIO_BENCH_ROUNDS_GRAIN picks the draw grain:
+//! "request" (default; each request draws independently — imbalance
+//! averages out over a connection) or "session" (each connection draws
+//! once for all its requests — a heavy session pins its entire cost to
+//! one worker under worker-local dispatch, the shape work stealing can
+//! rescue). Draws are deterministic (splitmix64 of session/request id),
+//! so both server variants hash identical work.
 
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use std::collections::HashMap;
@@ -47,6 +57,56 @@ fn workers() -> usize {
 
 fn hash_rounds() -> usize {
     env_usize("TOKIO_BENCH_HASH_ROUNDS", HASH_ROUNDS)
+}
+
+#[derive(Clone, Copy)]
+enum RoundsGrain {
+    Request,
+    Session,
+}
+
+/// Uniform [min, max] rounds distribution with a deterministic draw.
+#[derive(Clone, Copy)]
+struct RoundsDist {
+    min: u64,
+    max: u64,
+    grain: RoundsGrain,
+}
+
+impl RoundsDist {
+    fn from_env() -> Self {
+        let fixed = hash_rounds() as u64;
+        let min = env_usize("TOKIO_BENCH_HASH_ROUNDS_MIN", fixed as usize) as u64;
+        let max = env_usize("TOKIO_BENCH_HASH_ROUNDS_MAX", fixed as usize) as u64;
+        assert!(min <= max, "ROUNDS_MIN must be <= ROUNDS_MAX");
+        let grain = match std::env::var("TOKIO_BENCH_ROUNDS_GRAIN").as_deref() {
+            Ok("session") => RoundsGrain::Session,
+            _ => RoundsGrain::Request,
+        };
+        Self { min, max, grain }
+    }
+
+    /// Rounds for a given request. Deterministic in (session, msg_idx), so
+    /// the shared_arc and worker_local variants hash identical work.
+    fn rounds(&self, session: u64, msg_idx: u64) -> usize {
+        if self.min == self.max {
+            return self.min as usize;
+        }
+        let key = match self.grain {
+            RoundsGrain::Request => session.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ msg_idx,
+            RoundsGrain::Session => session,
+        };
+        (self.min + splitmix64(key) % (self.max - self.min + 1)) as usize
+    }
+}
+
+/// splitmix64: cheap, stateless, well-distributed. Deterministic draw so
+/// every run (and both server variants) sees the same workload.
+fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 fn req_bytes() -> usize {
@@ -115,20 +175,23 @@ async fn run_clients(addr: std::net::SocketAddr, iters: u64) -> std::time::Durat
 }
 
 /// Serve one connection: read requests, hash with the session's rolling key
-/// via `lookup` (which owns the variant-specific session store access), and
-/// respond with the digest.
-async fn serve_conn<F>(mut sock: TcpStream, mut roll: F)
+/// via `roll` (which owns the variant-specific session store access), and
+/// respond with the digest. Per-request work is drawn from `dist`.
+async fn serve_conn<F>(mut sock: TcpStream, dist: RoundsDist, mut roll: F)
 where
-    F: FnMut(u64, &[u8]) -> u64,
+    F: FnMut(u64, &[u8], usize) -> u64,
 {
     let payload_len = req_bytes();
     let mut req = vec![0u8; 8 + payload_len];
+    let mut msg_idx = 0u64;
     loop {
         if sock.read_exact(&mut req).await.is_err() {
             return;
         }
         let session = u64::from_le_bytes(req[..8].try_into().unwrap());
-        let digest = roll(session, &req[8..]);
+        let rounds = dist.rounds(session, msg_idx);
+        msg_idx += 1;
+        let digest = roll(session, &req[8..], rounds);
         if sock.write_all(&digest.to_le_bytes()).await.is_err() {
             return;
         }
@@ -145,7 +208,7 @@ fn bench_shared_arc(c: &mut Criterion) {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
                 let sessions = Arc::new(Mutex::new(HashMap::<u64, u64>::new()));
-                let rounds = hash_rounds();
+                let dist = RoundsDist::from_env();
 
                 let server = tokio::spawn(async move {
                     loop {
@@ -155,7 +218,7 @@ fn bench_shared_arc(c: &mut Criterion) {
                         };
                         sock.set_nodelay(true).unwrap();
                         let sessions = sessions.clone();
-                        tokio::spawn(serve_conn(sock, move |session, payload| {
+                        tokio::spawn(serve_conn(sock, dist, move |session, payload, rounds| {
                             let mut sessions = sessions.lock().unwrap();
                             let key = sessions.entry(session).or_insert(session);
                             let digest = keyed_hash(*key, payload, rounds);
@@ -189,7 +252,7 @@ fn bench_worker_local(c: &mut Criterion) {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
                 let n_workers = workers();
-                let rounds = hash_rounds();
+                let dist = RoundsDist::from_env();
 
                 // One dispatcher per worker: receives sockets and spawns a
                 // worker-local handler per connection. Session state is a
@@ -205,7 +268,8 @@ fn bench_worker_local(c: &mut Criterion) {
                                 let sessions = sessions.clone();
                                 tokio::task::spawn_worker_local(serve_conn(
                                     sock,
-                                    move |session, payload| {
+                                    dist,
+                                    move |session, payload, rounds| {
                                         let mut sessions = sessions.borrow_mut();
                                         let key = sessions.entry(session).or_insert(session);
                                         let digest = keyed_hash(*key, payload, rounds);
