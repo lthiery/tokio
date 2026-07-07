@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tokio::runtime::Builder;
 use tokio::sync::oneshot;
-use tokio::task::{run_on_each_worker, run_on_worker, spawn_worker_local};
+use tokio::task::{run_on_any_worker, run_on_each_worker, run_on_worker, spawn_worker_local};
 
 fn rt(workers: usize) -> tokio::runtime::Runtime {
     Builder::new_multi_thread()
@@ -249,6 +249,29 @@ fn run_on_each_worker_visits_all() {
         }
         seen.sort_unstable();
         assert_eq!(seen, vec![0, 1, 2, 3]);
+    });
+}
+
+#[test]
+fn run_on_any_worker_distributes() {
+    let rt = rt(2);
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for _ in 0..8 {
+            let tx = tx.clone();
+            run_on_any_worker(move || {
+                tx.send(tokio::runtime::worker_index()).unwrap();
+            });
+        }
+        drop(tx);
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(rx.recv().await.unwrap().unwrap());
+        }
+        // Placement policy is unspecified, but with 8 requests on 2 workers
+        // the current round-robin must touch both.
+        assert_eq!(seen.len(), 2);
     });
 }
 

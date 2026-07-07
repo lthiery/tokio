@@ -165,6 +165,35 @@ where
     });
 }
 
+/// Runs a closure on a worker thread chosen by the runtime.
+///
+/// Which worker is picked is unspecified and may change between versions;
+/// the current implementation distributes calls across workers. Use this to
+/// spread worker-local work without caring where it lands; the closure can
+/// discover its worker with [`runtime::worker_index`]. See
+/// [`run_on_worker`] for the execution and panic semantics.
+///
+/// # Panics
+///
+/// Panics if called from outside a multi-threaded runtime.
+///
+/// **Note**: This is an [unstable API][unstable]. The public API of this may
+/// break in 1.x releases. See [the documentation on unstable
+/// features][unstable] for details.
+///
+/// [`runtime::worker_index`]: crate::runtime::worker_index
+/// [unstable]: crate#unstable-features
+#[track_caller]
+pub fn run_on_any_worker<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    with_multi_thread_handle("run_on_any_worker", |handle| {
+        let index = handle.pick_any_worker();
+        handle.push_worker_local_spawn_request(index, wrap_spawn_request(f));
+    });
+}
+
 /// Wraps a user closure so it executes inside a worker-local task on the
 /// target worker: the task harness contains panics and fires the usual task
 /// hooks. The outer closure runs in the worker's spawn-request drain, where
