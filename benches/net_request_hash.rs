@@ -19,6 +19,15 @@
 //! Knobs (env): TOKIO_BENCH_WORKERS, TOKIO_BENCH_HASH_ROUNDS,
 //! TOKIO_BENCH_REQ_BYTES, TOKIO_BENCH_CONNS, TOKIO_BENCH_MSGS.
 //!
+//! The `*_churn` cases are the open-loop variants: `TOKIO_BENCH_CONCURRENCY`
+//! (default 32) connections stay in flight continuously, each connection is
+//! a globally unique session (created on first request, evicted on
+//! disconnect), and a completed connection's slot immediately opens the
+//! next — accept, spawn, and session-store churn overlap with in-flight
+//! serving, like a real server. `stealing_local/request_hash_churn` keeps
+//! the rolling key in the handler task (no store, no locks, stealable
+//! tasks): the pure-scheduling comparator for worker_local under churn.
+//!
 //! Asymmetric-load knobs: TOKIO_BENCH_HASH_ROUNDS_MIN / _MAX draw the
 //! per-hash round count uniformly from [min, max] instead of the fixed
 //! TOKIO_BENCH_HASH_ROUNDS. TOKIO_BENCH_ROUNDS_GRAIN picks the draw grain:
@@ -117,6 +126,11 @@ fn num_conns() -> usize {
     env_usize("TOKIO_BENCH_CONNS", NUM_CONNS)
 }
 
+/// In-flight connection count for the churn cases.
+fn concurrency() -> usize {
+    env_usize("TOKIO_BENCH_CONCURRENCY", NUM_CONNS)
+}
+
 fn msgs_per_conn() -> usize {
     env_usize("TOKIO_BENCH_MSGS", MSGS_PER_CONN)
 }
@@ -198,6 +212,80 @@ where
     }
 }
 
+/// Open-loop churn client: maintain `concurrency()` connections in flight,
+/// each with a globally unique session id; as one completes, its slot
+/// immediately opens the next. Total connections per timed round stays
+/// `iters * num_conns()` so criterion scaling matches the batch cases.
+/// Arrivals are staggered by construction (no thundering herd) and overlap
+/// with in-flight serving — a realistic accept-while-serving server load.
+async fn run_churn_clients(addr: std::net::SocketAddr, iters: u64) -> std::time::Duration {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let conc = concurrency();
+    let msgs = msgs_per_conn();
+    let payload_len = req_bytes();
+    let total = iters * num_conns() as u64;
+    // Session ids restart at 0 each timed round, so every round (and both
+    // server variants) sees the identical deterministic workload.
+    let next = Arc::new(AtomicU64::new(0));
+
+    let start = Instant::now();
+    let mut slots = tokio::task::JoinSet::new();
+    for _ in 0..conc.min(total as usize) {
+        let next = next.clone();
+        slots.spawn(async move {
+            loop {
+                let session = next.fetch_add(1, Ordering::Relaxed);
+                if session >= total {
+                    return;
+                }
+                let mut s = TcpStream::connect(addr).await.unwrap();
+                s.set_nodelay(true).unwrap();
+                let mut req = vec![0u8; 8 + payload_len];
+                req[..8].copy_from_slice(&session.to_le_bytes());
+                let mut resp = [0u8; 8];
+                for i in 0..msgs {
+                    req[8] = (i & 0xff) as u8;
+                    s.write_all(&req).await.unwrap();
+                    s.read_exact(&mut resp).await.unwrap();
+                }
+            }
+        });
+    }
+    while slots.join_next().await.is_some() {}
+    start.elapsed()
+}
+
+/// Churn-case connection handler: like `serve_conn`, plus a cleanup hook
+/// invoked with the session id when the connection closes, so session
+/// stores see realistic insert -> use -> evict churn.
+async fn serve_conn_churn<F, C>(mut sock: TcpStream, dist: RoundsDist, mut roll: F, cleanup: C)
+where
+    F: FnMut(u64, &[u8], usize) -> u64,
+    C: FnOnce(u64),
+{
+    let payload_len = req_bytes();
+    let mut req = vec![0u8; 8 + payload_len];
+    let mut msg_idx = 0u64;
+    let mut last_session = None;
+    loop {
+        if sock.read_exact(&mut req).await.is_err() {
+            break;
+        }
+        let session = u64::from_le_bytes(req[..8].try_into().unwrap());
+        last_session = Some(session);
+        let rounds = dist.rounds(session, msg_idx);
+        msg_idx += 1;
+        let digest = roll(session, &req[8..], rounds);
+        if sock.write_all(&digest.to_le_bytes()).await.is_err() {
+            break;
+        }
+    }
+    if let Some(session) = last_session {
+        cleanup(session);
+    }
+}
+
 /// Sessions behind a global `Arc<Mutex>`; handlers spawned onto the shared
 /// work-stealing pool.
 fn bench_shared_arc(c: &mut Criterion) {
@@ -229,6 +317,93 @@ fn bench_shared_arc(c: &mut Criterion) {
                 });
 
                 let elapsed = run_clients(addr, iters).await;
+                server.abort();
+                let _ = server.await;
+                elapsed
+            })
+        })
+    });
+
+    c.bench_function("shared_arc/request_hash_churn", |b: &mut Bencher| {
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let sessions = Arc::new(Mutex::new(HashMap::<u64, u64>::new()));
+                let dist = RoundsDist::from_env();
+
+                let server = tokio::spawn(async move {
+                    loop {
+                        let (sock, _) = match listener.accept().await {
+                            Ok(pair) => pair,
+                            Err(_) => return,
+                        };
+                        sock.set_nodelay(true).unwrap();
+                        let sessions = sessions.clone();
+                        let evict = sessions.clone();
+                        tokio::spawn(serve_conn_churn(
+                            sock,
+                            dist,
+                            move |session, payload, rounds| {
+                                let mut sessions = sessions.lock().unwrap();
+                                let key = sessions.entry(session).or_insert(session);
+                                let digest = keyed_hash(*key, payload, rounds);
+                                *key = digest;
+                                digest
+                            },
+                            move |session| {
+                                evict.lock().unwrap().remove(&session);
+                            },
+                        ));
+                    }
+                });
+
+                let elapsed = run_churn_clients(addr, iters).await;
+                server.abort();
+                let _ = server.await;
+                elapsed
+            })
+        })
+    });
+}
+
+/// No session store at all: sessions are 1:1 with connections under churn,
+/// so the rolling key lives in the handler task and the tasks stay `Send`
+/// and stealable. This is the pure-scheduling comparator for
+/// `worker_local/request_hash_churn`: byte-identical hash work, zero
+/// synchronization, work-stealing placement.
+fn bench_stealing_local(c: &mut Criterion) {
+    let rt = rt();
+    c.bench_function("stealing_local/request_hash_churn", |b: &mut Bencher| {
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let dist = RoundsDist::from_env();
+
+                let server = tokio::spawn(async move {
+                    loop {
+                        let (sock, _) = match listener.accept().await {
+                            Ok(pair) => pair,
+                            Err(_) => return,
+                        };
+                        sock.set_nodelay(true).unwrap();
+                        let mut key: Option<u64> = None;
+                        tokio::spawn(serve_conn_churn(
+                            sock,
+                            dist,
+                            move |session, payload, rounds| {
+                                let k = key.get_or_insert(session);
+                                let digest = keyed_hash(*k, payload, rounds);
+                                *k = digest;
+                                digest
+                            },
+                            |_| {},
+                        ));
+                    }
+                });
+
+                let elapsed = run_churn_clients(addr, iters).await;
                 server.abort();
                 let _ = server.await;
                 elapsed
@@ -305,10 +480,70 @@ fn bench_worker_local(c: &mut Criterion) {
             })
         })
     });
+
+    c.bench_function("worker_local/request_hash_churn", |b: &mut Bencher| {
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let n_workers = workers();
+                let dist = RoundsDist::from_env();
+
+                let mut txs = Vec::with_capacity(n_workers);
+                for w in 0..n_workers {
+                    let (tx, mut rx) = mpsc::unbounded_channel::<TcpStream>();
+                    txs.push(tx);
+                    tokio::task::run_on_worker(w, move || {
+                        tokio::task::spawn_worker_local(async move {
+                            let sessions = Rc::new(RefCell::new(HashMap::<u64, u64>::new()));
+                            while let Some(sock) = rx.recv().await {
+                                let sessions = sessions.clone();
+                                let evict = sessions.clone();
+                                tokio::task::spawn_worker_local(serve_conn_churn(
+                                    sock,
+                                    dist,
+                                    move |session, payload, rounds| {
+                                        let mut sessions = sessions.borrow_mut();
+                                        let key = sessions.entry(session).or_insert(session);
+                                        let digest = keyed_hash(*key, payload, rounds);
+                                        *key = digest;
+                                        digest
+                                    },
+                                    move |session| {
+                                        evict.borrow_mut().remove(&session);
+                                    },
+                                ));
+                            }
+                        });
+                    });
+                }
+
+                let server = tokio::spawn(async move {
+                    let mut next = 0usize;
+                    loop {
+                        let (sock, _) = match listener.accept().await {
+                            Ok(pair) => pair,
+                            Err(_) => return,
+                        };
+                        sock.set_nodelay(true).unwrap();
+                        if txs[next % txs.len()].send(sock).is_err() {
+                            return;
+                        }
+                        next += 1;
+                    }
+                });
+
+                let elapsed = run_churn_clients(addr, iters).await;
+                server.abort();
+                let _ = server.await;
+                elapsed
+            })
+        })
+    });
 }
 
 #[cfg(not(all(tokio_unstable, feature = "worker-local")))]
 fn bench_worker_local(_c: &mut Criterion) {}
 
-criterion_group!(net, bench_shared_arc, bench_worker_local);
+criterion_group!(net, bench_shared_arc, bench_stealing_local, bench_worker_local);
 criterion_main!(net);
