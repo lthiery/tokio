@@ -434,15 +434,23 @@ impl Builder {
     /// via `IORING_OP_MSG_RING`; wakeups from threads outside the runtime are
     /// delivered via an `eventfd`.
     ///
-    /// This option only applies to multi-threaded runtimes. It implicitly
-    /// enables I/O. By default the legacy single-mutex timer wheel is used
-    /// via a hybrid park flow: each worker queries
-    /// `time::Handle::next_wake_tick()` (locks the wheel briefly) to compute
-    /// its `io_uring_enter` timeout as `min(scheduler_timeout,
+    /// On current-thread runtimes (including [`LocalRuntime`] via
+    /// [`Builder::build_local`]) the reactor instead runs in forced
+    /// global-ring mode: one shared ring, driven by whichever thread
+    /// currently holds the scheduler core. Per-worker rings are unsound
+    /// there because the core migrates across `block_on` callers, which
+    /// `IORING_SETUP_SINGLE_ISSUER` cannot tolerate.
+    ///
+    /// This option implicitly enables I/O. By default the legacy
+    /// single-mutex timer wheel is used via a hybrid park flow: each worker
+    /// queries `time::Handle::next_wake_tick()` (locks the wheel briefly)
+    /// to compute its `io_uring_enter` timeout as `min(scheduler_timeout,
     /// time_until_next_timer)`, then calls `parker_process(clock)` after wake
     /// to fire any expired timers. To use the original per-worker timer wheel
     /// design, also call [`Builder::enable_alt_timer`] (requires the
-    /// `rt-alt-timer` Cargo feature).
+    /// `rt-alt-timer` Cargo feature; multi-thread only).
+    ///
+    /// [`LocalRuntime`]: crate::runtime::LocalRuntime
     ///
     /// Requires Linux 6.0+ (for `IORING_SETUP_DEFER_TASKRUN` maturity) and is
     /// gated behind the `io-uring-reactor` Cargo feature + `--cfg
@@ -1759,6 +1767,21 @@ impl Builder {
         use crate::runtime::scheduler;
         use crate::runtime::Config;
 
+        // Sharded-mio has no current_thread story (its whole point is
+        // per-worker registries) and silently falling back to the
+        // traditional driver is how latent misconfiguration hides.
+        // Uring, by contrast, is supported: it degenerates to the
+        // forced-global single-ring shape (see `CurrentThread::new`).
+        #[cfg(all(
+            feature = "io-sharded-mio",
+            feature = "rt-multi-thread",
+            target_os = "linux",
+        ))]
+        assert!(
+            self.io_flavor != IoFlavor::ShardedMio,
+            "enable_sharded_mio() is not supported on current_thread runtimes",
+        );
+
         let mut cfg = self.get_cfg();
         cfg.timer_flavor = TimerFlavor::Traditional;
         let (driver, driver_handle) = driver::Driver::new(cfg)?;
@@ -1802,6 +1825,7 @@ impl Builder {
                 metrics_poll_count_histogram: self.metrics_poll_count_histogram_builder(),
             },
             local_tid,
+            self.io_flavor,
             self.name.clone(),
         );
 

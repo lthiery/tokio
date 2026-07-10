@@ -55,12 +55,15 @@ pub(crate) struct Handle {
     /// If this is a `LocalRuntime`, flags the owning thread ID.
     pub(crate) local_tid: Option<ThreadId>,
 
-    /// Backend-agnostic I/O driver. Current_thread runtimes are
-    /// always `IoFlavor::Traditional` (no per-worker backends), so
-    /// this carries `LEGACY_MIO_VTABLE` whenever io is enabled, and
-    /// `None` only for io-disabled runtimes. Lets the `Registration`
-    /// lazy first-poll path route through the same vtable for both
-    /// scheduler flavors. See `tokio/docs/io-driver-vtable.md`.
+    /// Backend-agnostic I/O driver. Carries `LEGACY_MIO_VTABLE` for
+    /// `IoFlavor::Traditional` (the default) and `URING_VTABLE` for
+    /// `enable_uring_reactor()` runtimes — always in forced global-ring
+    /// mode with one worker slot, because the scheduler core (and with
+    /// it the driving thread) migrates across `block_on` callers, which
+    /// `SINGLE_ISSUER` per-worker rings cannot tolerate. `None` only
+    /// for io-disabled runtimes. Lets the `Registration` lazy
+    /// first-poll path route through the same vtable for both scheduler
+    /// flavors. See `tokio/docs/io-driver-vtable.md`.
     #[cfg(all(
         target_family = "unix",
         any(
@@ -158,6 +161,7 @@ impl CurrentThread {
         seed_generator: RngSeedGenerator,
         config: Config,
         local_tid: Option<ThreadId>,
+        io_flavor: crate::runtime::IoFlavor,
         name: Option<String>,
     ) -> (CurrentThread, Arc<Handle>) {
         let worker_metrics = WorkerMetrics::from_config(&config);
@@ -186,10 +190,60 @@ impl CurrentThread {
                 )
             )
         ))]
-        let io_driver = driver_handle
-            .io
-            .clone_arc()
-            .map(crate::runtime::io::io_driver::IoDriver::from_legacy_mio);
+        let io_driver = match io_flavor {
+            crate::runtime::IoFlavor::Traditional => driver_handle
+                .io
+                .clone_arc()
+                .map(crate::runtime::io::io_driver::IoDriver::from_legacy_mio),
+            // Uring on current_thread is ALWAYS forced global-ring mode
+            // with a single worker slot: the scheduler core migrates
+            // across `block_on` threads (only `LocalRuntime` is `!Send`,
+            // and even its core is driven through the same code), so a
+            // `SINGLE_ISSUER` per-worker ring would be bound to whichever
+            // thread parked first and break on the next core steal.
+            // `new_global` builds the one shared ring eagerly, here on
+            // the builder thread (legal: relaxed ring, no submitter
+            // binding). The env knob `TOKIO_URING_GLOBAL` plays no role.
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            crate::runtime::IoFlavor::UringPerWorker => {
+                Some(crate::runtime::io::io_driver::IoDriver::from_uring(
+                    std::sync::Arc::new(
+                        crate::runtime::io::uring_driver::UringHandle::new_global(1),
+                    ),
+                ))
+            }
+            // Rejected in `build_current_thread_runtime_components`
+            // before this constructor runs.
+            #[cfg(all(
+                feature = "io-sharded-mio",
+                feature = "rt-multi-thread",
+                target_os = "linux",
+            ))]
+            crate::runtime::IoFlavor::ShardedMio => {
+                unreachable!("sharded-mio rejected by the current_thread builder")
+            }
+        };
+        #[cfg(not(all(
+            target_family = "unix",
+            any(
+                feature = "net",
+                all(unix, feature = "process"),
+                all(unix, feature = "signal"),
+                all(
+                    tokio_unstable,
+                    feature = "io-uring",
+                    feature = "rt",
+                    feature = "fs",
+                    target_os = "linux"
+                )
+            )
+        )))]
+        let _ = io_flavor;
 
         let handle = Arc::new(Handle {
             name,
@@ -493,6 +547,36 @@ impl Context {
         duration: Option<Duration>,
     ) -> Box<Core> {
         let (core, ()) = self.enter(core, || {
+            // Uring backend: the legacy driver stack (mio/signal/process
+            // + timer) is never parked — the shared ring is the wake
+            // source, mirroring the multi-thread uring arm where the
+            // stock `Parker` is bypassed. Timers use the same hybrid
+            // flow as `UringParker::park_global`: fold the legacy
+            // wheel's next deadline into the ring timeout, advance the
+            // wheel after waking.
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt",
+                target_os = "linux",
+            ))]
+            if let Some(uring) = handle.uring_handle() {
+                use crate::runtime::io::uring_driver as ud;
+                let g = uring
+                    .global_ring()
+                    .expect("current_thread uring handle is always global-ring mode");
+                let driver_duration = ud::compute_legacy_timer_duration(&handle.driver, duration);
+                // Worker slot 0: this scheduler has exactly one. The
+                // condvar arm inside `park_worker` is unreachable at
+                // n=1 — the sole core holder always wins the `TryLock`
+                // (non-core `block_on` threads park on the scheduler's
+                // `Notify`, never on the ring).
+                let _drove_ring = g.park_worker(0, driver_duration, duration);
+                uring.release_pending_registrations();
+                ud::process_legacy_timer_after_park(&handle.driver);
+                self.defer.wake();
+                return;
+            }
             match duration {
                 Some(dur) => driver.park_timeout(&handle.driver, dur),
                 None => driver.park(&handle.driver),
@@ -640,6 +724,44 @@ impl Handle {
         dump::Dump::new(traces)
     }
 
+    /// The uring backend handle, when this runtime drives I/O through
+    /// the (forced-global) uring reactor. `None` under the legacy mio
+    /// backend and for io-disabled runtimes.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt",
+        target_os = "linux",
+    ))]
+    pub(crate) fn uring_handle(&self) -> Option<&crate::runtime::io::uring_driver::UringHandle> {
+        self.io_driver.as_ref().and_then(|d| d.as_uring())
+    }
+
+    /// Wake whatever the core holder is parked on. Under the legacy
+    /// backend that is the shared driver stack (mio waker + timer
+    /// bookkeeping); under the uring backend the driver stack is never
+    /// parked, so the wake must target the shared ring's park-state
+    /// machine instead — the exact analog of the multi-thread arm
+    /// routing remote wakes through `UringUnparker` rather than
+    /// `driver::Handle::unpark` (which also skips the time handle's
+    /// unpark; the hybrid park flow re-reads the wheel minimum on every
+    /// pass, so it has no wake bookkeeping to update).
+    fn unpark_driver(&self) {
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt",
+            target_os = "linux",
+        ))]
+        if let Some(uring) = self.uring_handle() {
+            // Slot 0: the scheduler's one worker. NOTIFIED-swap; the
+            // eventfd fires only if the holder is blocked in the ring.
+            uring.unpark(0);
+            return;
+        }
+        self.driver.unpark();
+    }
+
     fn next_remote_task(&self) -> Option<Notified> {
         self.shared.inject.pop()
     }
@@ -744,7 +866,7 @@ impl Schedule for Arc<Handle> {
 
                 // Schedule the task
                 self.shared.inject.push(task);
-                self.driver.unpark();
+                self.unpark_driver();
             }
         });
     }
@@ -805,7 +927,7 @@ impl Wake for Handle {
             context::with_scheduler(|maybe_cx| match maybe_cx {
                 Some(CurrentThread(cx)) if Arc::ptr_eq(arc_self, &cx.handle) => {}
                 _ => {
-                    arc_self.driver.unpark();
+                    arc_self.unpark_driver();
                 }
             });
         }
