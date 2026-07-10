@@ -504,6 +504,24 @@ impl Reactor {
     /// thread and moving it to another will cause subsequent `park()` calls
     /// to fail with `EEXIST`.
     pub(crate) fn new() -> io::Result<Self> {
+        Self::new_inner(!defer_taskrun_disabled())
+    }
+
+    /// Create a reactor whose ring is never bound to a single submitter:
+    /// no `SINGLE_ISSUER`, no `DEFER_TASKRUN`, regardless of the
+    /// `TOKIO_URING_DEFER_TASKRUN` knob. Required for rings driven by
+    /// rotating holders ([`GlobalRing`]) when global mode is *forced*
+    /// rather than env-selected — `defer_taskrun_disabled()` only folds
+    /// in [`uring_global_enabled`], so relying on [`Self::new`] there
+    /// would hand a current_thread runtime a SINGLE_ISSUER ring that a
+    /// stolen core then drives from another thread (kernel `EEXIST`).
+    ///
+    /// [`GlobalRing`]: crate::runtime::io::uring_driver::GlobalRing
+    pub(crate) fn new_relaxed() -> io::Result<Self> {
+        Self::new_inner(false)
+    }
+
+    fn new_inner(use_defer_taskrun: bool) -> io::Result<Self> {
         // Acquire the process-wide `io_uring_setup` permit. Released when
         // the scoped guard drops at the end of this block. `PoisonError`
         // is ignored: the permit only guards the build call, so a prior
@@ -520,7 +538,7 @@ impl Reactor {
             // owner's own `io_uring_enter`, which serializes completion
             // processing onto one worker when fds are concentrated
             // (TOKIO_URING_RING_CAP=1). Default on (historical behavior).
-            if !defer_taskrun_disabled() {
+            if use_defer_taskrun {
                 builder.setup_single_issuer().setup_defer_taskrun();
             }
             // `TOKIO_URING_COOP_TASKRUN=0` drops COOP_TASKRUN: completion

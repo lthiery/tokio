@@ -217,8 +217,14 @@ impl GlobalRing {
     /// Build the shared reactor eagerly. Runs on the runtime-builder
     /// thread — legal because global mode never sets `SINGLE_ISSUER`, so
     /// the ring is not bound to its constructing thread.
+    ///
+    /// `new_relaxed` (not `new`) is load-bearing: `Reactor::new` only
+    /// drops `SINGLE_ISSUER`/`DEFER_TASKRUN` when the env knobs say so,
+    /// and forced-global callers (current_thread runtimes, which never
+    /// set `TOKIO_URING_GLOBAL`) would otherwise get a submitter-bound
+    /// ring that holder rotation then breaks.
     fn new(num_workers: usize) -> io::Result<Self> {
-        let reactor = Reactor::new()?;
+        let reactor = Reactor::new_relaxed()?;
         let ring_waker = reactor.external_waker();
         let mut slots = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
@@ -256,9 +262,7 @@ impl GlobalRing {
         self.pending_ops.lock().push(op);
         if self.ring_parked.load(Ordering::SeqCst) {
             let _ = self.ring_waker.wake();
-        } else if crate::runtime::scheduler::multi_thread::uring_park::current_worker_index()
-            .is_none()
-        {
+        } else if current_worker_index().is_none() {
             self.kick_one_worker();
         }
     }
@@ -578,6 +582,50 @@ pub(crate) fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) 
     }
 }
 
+/// Hybrid park flow helper: legacy timer + uring I/O.
+///
+/// When a uring-backed runtime is built without `enable_alt_timer()` (the
+/// default), rings share the legacy single-mutex timer wheel. To make
+/// sleeps fire on time, whoever is about to drive a ring computes its
+/// `io_uring_enter` timeout as `min(scheduler_timeout,
+/// time_until_next_timer)`.
+///
+/// Flavor-agnostic free function (formerly a `UringParker` method) so the
+/// current_thread park path — which cannot reach the
+/// `rt-multi-thread`-gated parker module — shares one copy.
+pub(crate) fn compute_legacy_timer_duration(
+    driver: &crate::runtime::driver::Handle,
+    scheduler_timeout: Option<Duration>,
+) -> Option<Duration> {
+    #[cfg(feature = "time")]
+    if let Some(time_handle) = driver.time_handle_opt() {
+        if time_handle.is_traditional() {
+            if let Some(when) = time_handle.next_wake_tick() {
+                let now = time_handle.time_source().now(driver.clock());
+                let time_dur = time_handle
+                    .time_source()
+                    .tick_to_duration(when.saturating_sub(now));
+                return Some(match scheduler_timeout {
+                    Some(s) => std::cmp::min(s, time_dur),
+                    None => time_dur,
+                });
+            }
+        }
+    }
+    scheduler_timeout
+}
+
+/// Mirror of [`compute_legacy_timer_duration`] for the post-park path:
+/// process expired timers under the legacy flavor.
+pub(crate) fn process_legacy_timer_after_park(driver: &crate::runtime::driver::Handle) {
+    #[cfg(feature = "time")]
+    if let Some(time_handle) = driver.time_handle_opt() {
+        if time_handle.is_traditional() {
+            time_handle.parker_process(driver.clock());
+        }
+    }
+}
+
 /// Shared I/O handle for the uring-reactor backend.
 ///
 /// The Handle-side analog of the mio driver's [`Handle`]. Holds per-worker
@@ -665,7 +713,22 @@ impl std::fmt::Debug for UringHandle {
 }
 
 impl UringHandle {
+    /// Multi-thread-scheduler constructor: per-worker mode by default,
+    /// global-ring mode iff `TOKIO_URING_GLOBAL=1`.
     pub(crate) fn new(num_workers: usize) -> Self {
+        Self::new_inner(num_workers, uring_global_enabled())
+    }
+
+    /// Forced global-ring mode, irrespective of `TOKIO_URING_GLOBAL`.
+    /// Used by the current_thread scheduler, where per-worker rings are
+    /// unsound (the scheduler core — and with it the driving thread —
+    /// migrates across `block_on` callers, violating `SINGLE_ISSUER`),
+    /// so there is no per-worker alternative for the env knob to select.
+    pub(crate) fn new_global(num_workers: usize) -> Self {
+        Self::new_inner(num_workers, true)
+    }
+
+    fn new_inner(num_workers: usize, global_mode: bool) -> Self {
         let mut workers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             workers.push(WorkerState::new());
@@ -680,10 +743,10 @@ impl UringHandle {
         // Failure at this point means the kernel lacks io_uring support —
         // the same condition the per-worker mode `expect`s on at first
         // park, surfaced a little earlier.
-        let global = uring_global_enabled().then(|| {
+        let global = global_mode.then(|| {
             Arc::new(GlobalRing::new(num_workers).expect(
                 "failed to construct shared io_uring Reactor for \
-                 TOKIO_URING_GLOBAL=1 (kernel must support io_uring, \
+                 global-ring mode (kernel must support io_uring, \
                  Linux 6.0+)",
             ))
         });
@@ -896,8 +959,7 @@ impl UringHandle {
     /// spreading new fds rather than concentrating them on the caller's
     /// ring).
     ///
-    /// [`current_worker_index`]:
-    ///     crate::runtime::scheduler::multi_thread::uring_park::current_worker_index
+    /// [`current_worker_index`]: current_worker_index
     ///
     /// Returns the allocated `Arc<ScheduledIo>` together with the assigned
     /// worker index. Callers must remember the index and pass it back into
@@ -1145,6 +1207,49 @@ impl UringHandle {
             let _ = waker.wake();
         }
     }
+}
+
+// ===== CURRENT_WORKER thread-local =====
+
+thread_local! {
+    /// Current worker's index for the running thread, or `None` if this
+    /// thread is not currently executing a uring worker loop (multi-thread
+    /// scheduler) or a core-holding `block_on` (current_thread — planned).
+    ///
+    /// Lives here rather than in `multi_thread::uring_park` (its original
+    /// home) because [`GlobalRing::push_op`] consults it and this module
+    /// is compiled for `rt`-only builds where `multi_thread` does not
+    /// exist. The multi-thread parker re-exports the accessors.
+    ///
+    /// Set by the multi-thread worker entry point / first park and cleared
+    /// on worker exit (see `uring_park.rs` for the pairing discipline).
+    ///
+    /// Used by [`UringHandle::add_source`]-adjacent placement decisions
+    /// and by [`GlobalRing::push_op`] to tell worker pushers (their own
+    /// next park drains the queue) from external pushers (may need a
+    /// kick). `None` means the caller is not on a worker thread.
+    ///
+    /// Distinct from `LOCAL_REACTOR`: that TLS points at this worker's
+    /// `RefCell<Reactor>` (required for `MSG_RING` routing), while this
+    /// one is just the integer index.
+    static CURRENT_WORKER: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Index of the worker currently executing on this thread, or `None` if
+/// this thread is not a uring worker.
+pub(crate) fn current_worker_index() -> Option<usize> {
+    CURRENT_WORKER.with(Cell::get)
+}
+
+/// Publish `idx` as this thread's current worker index. Must be paired
+/// with [`clear_current_worker`] before the worker loop exits.
+pub(crate) fn set_current_worker(idx: usize) {
+    CURRENT_WORKER.with(|c| c.set(Some(idx)));
+}
+
+/// Clear this thread's `CURRENT_WORKER` slot. Idempotent.
+pub(crate) fn clear_current_worker() {
+    CURRENT_WORKER.with(|c| c.set(None));
 }
 
 // ===== LOCAL_REACTOR thread-local =====

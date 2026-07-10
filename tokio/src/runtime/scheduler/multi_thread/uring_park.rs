@@ -41,55 +41,27 @@
 use crate::loom::sync::Arc;
 use crate::runtime::driver;
 use crate::runtime::io::uring_driver::{
-    apply_pending_ops, clear_local_reactor, install_local_reactor_raw, UringHandle,
+    apply_pending_ops, clear_local_reactor, compute_legacy_timer_duration,
+    install_local_reactor_raw, process_legacy_timer_after_park, set_current_worker, UringHandle,
 };
 use crate::runtime::io::uring_reactor::Reactor;
 use crate::runtime::scheduler::multi_thread::park::HadDriver;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::time::Duration;
 
-thread_local! {
-    /// Current worker's index for the running thread, or `None` if this
-    /// thread is not currently executing a multi-thread uring worker loop.
-    ///
-    /// Set by [`UringParker::ensure_reactor_installed`] on first park (the
-    /// same point where `LOCAL_REACTOR` is installed) and cleared by
-    /// [`UringParker::shutdown`] / `Drop`, plus the `ClearUringTls` RAII
-    /// guard in `worker.rs` (belt-and-braces for recycled blocking-pool
-    /// threads across runtimes).
-    ///
-    /// Used by [`UringHandle::add_source`] to place new fd registrations on
-    /// the current worker's ring — preferring `W_ring == W_task` locality
-    /// over round-robin load balance — and by [`UringUnparker::unpark`] to
-    /// short-circuit self-wakes. `None` means the caller is not on a worker
-    /// thread; callers must fall back to a policy that doesn't assume
-    /// worker-local state.
-    ///
-    /// Distinct from `LOCAL_REACTOR`: that TLS points at this worker's
-    /// `RefCell<Reactor>` (required for `MSG_RING` routing), while this one
-    /// is just the integer index — sufficient for routing decisions that
-    /// don't touch the reactor itself.
-    static CURRENT_WORKER: Cell<Option<usize>> = const { Cell::new(None) };
-}
-
-/// Index of the worker currently executing on this thread, or `None` if
-/// this thread is not a multi-thread uring worker.
-///
-/// Currently no callers — `unpark` no longer self-short-circuits (see
-/// [`UringUnparker::unpark`]) and `UringHandle::add_source` uses pure
-/// round-robin placement. Kept around for the planned task-local
-/// placement path documented on [`UringHandle::add_source`].
-#[allow(dead_code)]
-pub(crate) fn current_worker_index() -> Option<usize> {
-    CURRENT_WORKER.with(Cell::get)
-}
-
-/// Publish `idx` as this thread's current worker index. Must be paired with
-/// [`clear_current_worker`] before the worker loop exits.
-fn set_current_worker(idx: usize) {
-    CURRENT_WORKER.with(|c| c.set(Some(idx)));
-}
+// The `CURRENT_WORKER` thread-local these wrap moved to `uring_driver.rs`
+// (it is consulted by `GlobalRing::push_op`, which must compile for
+// `rt`-only builds where this module does not exist). The multi-thread
+// worker code keeps addressing it through this module.
+//
+// `current_worker_index` has no multi-thread callers today — `unpark` no
+// longer self-short-circuits (see `UringUnparker::unpark`) and
+// `UringHandle::add_source` uses pure round-robin placement — but stays
+// re-exported for the planned task-local placement path documented on
+// `UringHandle::add_source`.
+#[allow(unused_imports)]
+pub(crate) use crate::runtime::io::uring_driver::{clear_current_worker, current_worker_index};
 
 /// Publish the current worker index from the worker's `run` entry point,
 /// before any task executes on this thread. Separate from the parker-side
@@ -101,11 +73,6 @@ fn set_current_worker(idx: usize) {
 /// already calls [`clear_current_worker`] on worker exit.
 pub(crate) fn set_current_worker_early(idx: usize) {
     set_current_worker(idx);
-}
-
-/// Clear this thread's `CURRENT_WORKER` slot. Idempotent.
-pub(crate) fn clear_current_worker() {
-    CURRENT_WORKER.with(|c| c.set(None));
 }
 
 /// Per-worker parker for the `io_uring` backend.
@@ -241,45 +208,23 @@ impl UringParker {
 
     /// Hybrid park flow: legacy timer + uring I/O.
     ///
-    /// Mirror of [`super::sharded_mio_park::ShardedMioParker::compute_legacy_timer_duration`].
-    /// When the runtime is built with `enable_uring_reactor()` but without
-    /// `enable_alt_timer()` (the default since the rt-alt-timer feature gate
-    /// landed), each worker still owns its own `io_uring` ring but shares the
-    /// legacy single-mutex timer wheel. To make sleeps fire on time, each
-    /// parker has to compute its `io_uring_enter` timeout as
-    /// `min(scheduler_timeout, time_until_next_timer)`.
+    /// Thin wrapper over the flavor-agnostic
+    /// [`compute_legacy_timer_duration`] in `uring_driver.rs` (hoisted
+    /// there so the current_thread park path shares one copy). See that
+    /// function for the min(scheduler, next-timer) rationale; mirror of
+    /// [`super::sharded_mio_park::ShardedMioParker::compute_legacy_timer_duration`].
     fn compute_legacy_timer_duration(
         &self,
         driver: &driver::Handle,
         scheduler_timeout: Option<Duration>,
     ) -> Option<Duration> {
-        #[cfg(feature = "time")]
-        if let Some(time_handle) = driver.time_handle_opt() {
-            if time_handle.is_traditional() {
-                if let Some(when) = time_handle.next_wake_tick() {
-                    let now = time_handle.time_source().now(driver.clock());
-                    let time_dur = time_handle
-                        .time_source()
-                        .tick_to_duration(when.saturating_sub(now));
-                    return Some(match scheduler_timeout {
-                        Some(s) => std::cmp::min(s, time_dur),
-                        None => time_dur,
-                    });
-                }
-            }
-        }
-        scheduler_timeout
+        compute_legacy_timer_duration(driver, scheduler_timeout)
     }
 
     /// Mirror of [`Self::compute_legacy_timer_duration`] for the post-park
     /// path: process expired timers under the legacy flavor.
     fn process_legacy_timer_after_park(&self, driver: &driver::Handle) {
-        #[cfg(feature = "time")]
-        if let Some(time_handle) = driver.time_handle_opt() {
-            if time_handle.is_traditional() {
-                time_handle.parker_process(driver.clock());
-            }
-        }
+        process_legacy_timer_after_park(driver);
     }
 
     /// Shutdown the parker. Clears the TLS install first (un-publishing the
