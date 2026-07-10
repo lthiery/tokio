@@ -104,6 +104,19 @@ fn extras_enabled() -> bool {
     std::env::var("TOKIO_BENCH_EXTRA").is_ok_and(|v| v.trim() == "1")
 }
 
+/// `TOKIO_BENCH_CT=1` swaps the binary to the current_thread case set:
+/// the same workloads on `new_current_thread()` runtimes, registered
+/// under `traditional_ct/` and `uring_ct/` prefixes, with the
+/// multi-thread cases (and sharded-mio, which has no current_thread
+/// support) skipped entirely. A switch rather than an addition so a ct
+/// sweep cell doesn't also pay for the full multi-thread set; both ct
+/// arms live in the same binary, keeping the workload identical by
+/// construction. `TOKIO_BENCH_WORKERS` is meaningless here — sweep
+/// with workers=[1].
+fn ct_enabled() -> bool {
+    std::env::var("TOKIO_BENCH_CT").is_ok_and(|v| v.trim() == "1")
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -164,6 +177,20 @@ fn rt_sharded_mio() -> Runtime {
 fn rt_uring() -> Runtime {
     let mut b = Builder::new_multi_thread();
     b.worker_threads(workers()).enable_all();
+    b.enable_uring_reactor();
+    b.build().unwrap()
+}
+
+fn rt_traditional_ct() -> Runtime {
+    Builder::new_current_thread().enable_all().build().unwrap()
+}
+
+/// current_thread + uring: forced global-ring mode with one worker slot
+/// (no env knob involved; `TOKIO_URING_GLOBAL` is multi-thread-only).
+#[cfg(all(tokio_unstable, feature = "bench-uring-reactor", target_os = "linux"))]
+fn rt_uring_ct() -> Runtime {
+    let mut b = Builder::new_current_thread();
+    b.enable_all();
     b.enable_uring_reactor();
     b.build().unwrap()
 }
@@ -503,12 +530,21 @@ fn bench_backend(c: &mut Criterion, prefix: &str, rt: &Runtime) {
 }
 
 fn bench_traditional(c: &mut Criterion) {
-    let rt = rt_traditional();
-    bench_backend(c, "traditional", &rt);
+    if ct_enabled() {
+        let rt = rt_traditional_ct();
+        bench_backend(c, "traditional_ct", &rt);
+    } else {
+        let rt = rt_traditional();
+        bench_backend(c, "traditional", &rt);
+    }
 }
 
 #[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
 fn bench_sharded_mio(c: &mut Criterion) {
+    // No current_thread support (the builder asserts); ct sweeps skip.
+    if ct_enabled() {
+        return;
+    }
     let rt = rt_sharded_mio();
     bench_backend(c, "sharded_mio", &rt);
 }
@@ -518,8 +554,13 @@ fn bench_sharded_mio(_c: &mut Criterion) {}
 
 #[cfg(all(tokio_unstable, feature = "bench-uring-reactor", target_os = "linux"))]
 fn bench_uring(c: &mut Criterion) {
-    let rt = rt_uring();
-    bench_backend(c, "uring", &rt);
+    if ct_enabled() {
+        let rt = rt_uring_ct();
+        bench_backend(c, "uring_ct", &rt);
+    } else {
+        let rt = rt_uring();
+        bench_backend(c, "uring", &rt);
+    }
 }
 
 #[cfg(not(all(tokio_unstable, feature = "bench-uring-reactor", target_os = "linux")))]
