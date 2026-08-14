@@ -25,9 +25,6 @@ cfg_io_uring_reactor! {
     pub(crate) mod uring_reactor;
     pub(crate) mod uring_driver;
     pub(crate) mod uring_arm_table;
-    pub(crate) mod uring_bytes_ops;
-    pub(crate) mod uring_buf_ring;
-    pub(crate) mod uring_recv_multi;
 }
 
 // Backend-agnostic IoDriver (manual vtable). Populated by every io

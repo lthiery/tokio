@@ -362,13 +362,10 @@ fn late_timer_from_non_core_block_on_fires() {
     non_core.join().unwrap();
 }
 
-/// The owned-buffer ops (`uring_send`/`uring_recv`) submit via the
-/// per-worker `LOCAL_REACTOR`, which global-ring mode never installs —
-/// on current_thread they must degrade exactly as multi-thread global
-/// mode does (fall back / report unsupported), never crash. Guarded
-/// here only by exercising normal poll-path IO heavily; the owned-buf
-/// API surface is bench-crate-only and not reachable from this test
-/// target. (Placeholder documenting the expectation.)
+/// Exercises the readiness (poll) path heavily on the current_thread
+/// runtime: repeated connect/accept/read/write round-trips must drive
+/// the io_uring reactor's `POLL_ADD_MULTI` registrations without a
+/// crash or hang.
 #[test]
 fn poll_path_only_smoke() {
     let rt = build_rt();
