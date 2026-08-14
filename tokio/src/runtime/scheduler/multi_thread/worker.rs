@@ -1507,9 +1507,7 @@ impl Handle {
             // Track the reason we fall through to the inject queue,
             // for the `lazy_debug` counters below. Computed cheap and
             // gate-elided when the cfg is off.
-            #[cfg(any(
-                all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-            ))]
+            #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
             #[allow(unused_assignments)]
             let mut remote_reason: Option<&'static core::sync::atomic::AtomicU64> = None;
 
@@ -1518,9 +1516,7 @@ impl Handle {
                 if self.ptr_eq(&cx.worker.handle) {
                     // And the current thread still holds a core
                     if let Some(core) = cx.core.borrow_mut().as_mut() {
-                        #[cfg(any(
-                            all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                        ))]
+                        #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
                         {
                             crate::runtime::io::lazy_debug::bump(
                                 &crate::runtime::io::lazy_debug::COUNTERS
@@ -1530,18 +1526,14 @@ impl Handle {
                         self.schedule_local(core, task, is_yield);
                         return;
                     }
-                    #[cfg(any(
-                        all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                    ))]
+                    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
                     {
                         remote_reason = Some(
                             &crate::runtime::io::lazy_debug::COUNTERS.schedule_remote_no_core,
                         );
                     }
                 } else {
-                    #[cfg(any(
-                        all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                    ))]
+                    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
                     {
                         remote_reason = Some(
                             &crate::runtime::io::lazy_debug::COUNTERS
@@ -1550,9 +1542,7 @@ impl Handle {
                     }
                 }
             } else {
-                #[cfg(any(
-                    all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                ))]
+                #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
                 {
                     remote_reason = Some(
                         &crate::runtime::io::lazy_debug::COUNTERS.schedule_remote_no_cx,
@@ -1561,9 +1551,7 @@ impl Handle {
             }
 
             // Otherwise, use the inject queue.
-            #[cfg(any(
-                all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-            ))]
+            #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
             {
                 if let Some(c) = remote_reason {
                     crate::runtime::io::lazy_debug::bump(c);
