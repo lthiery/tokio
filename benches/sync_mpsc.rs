@@ -33,8 +33,6 @@ fn workers() -> usize {
 fn rt() -> tokio::runtime::Runtime {
     let mut b = tokio::runtime::Builder::new_multi_thread();
     b.worker_threads(workers());
-    #[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
-    b.enable_sharded_mio();
     b.build().unwrap()
 }
 

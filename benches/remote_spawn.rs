@@ -96,8 +96,6 @@ fn parallelism_levels() -> Vec<usize> {
 
 fn rt() -> Runtime {
     let mut b = runtime::Builder::new_multi_thread();
-    #[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
-    b.enable_sharded_mio();
     b.build().unwrap()
 }
 

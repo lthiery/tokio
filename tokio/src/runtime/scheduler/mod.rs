@@ -95,9 +95,8 @@ impl Handle {
     /// Backend-agnostic I/O driver. Returns `Some` on every
     /// io-enabled runtime regardless of scheduler flavor:
     /// multi-thread + `IoFlavor::Traditional` and current-thread
-    /// carry `LEGACY_MIO_VTABLE`, `enable_uring_reactor()` carries
-    /// `URING_VTABLE`, and `enable_sharded_mio()` carries
-    /// `SHARDED_MIO_VTABLE`. Returns `None` only for io-disabled
+    /// carry `LEGACY_MIO_VTABLE`, and `enable_uring_reactor()` carries
+    /// `URING_VTABLE`. Returns `None` only for io-disabled
     /// runtimes. Used by [`crate::runtime::io::Registration`] to
     /// route fd registration and deregistration through a single
     /// vtable call regardless of which backend is selected.

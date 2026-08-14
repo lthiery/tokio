@@ -143,13 +143,6 @@ impl Unparker {
 ))]
 use super::uring_park::{UringParker, UringUnparker};
 
-#[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-use super::sharded_mio_park::{ShardedMioParker, ShardedMioUnparker};
-
 /// Per-worker parker. One of these is owned by each worker's `Core`.
 pub(crate) enum WorkerParker {
     /// Shared-driver path (mio/epoll). All workers clone the same underlying
@@ -164,15 +157,6 @@ pub(crate) enum WorkerParker {
         target_os = "linux",
     ))]
     Uring(UringParker),
-
-    /// Per-worker `mio::Poll` path. Each worker owns its own poll
-    /// instance and slab of registrations.
-    #[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-    ShardedMio(ShardedMioParker),
 }
 
 /// Per-worker unparker. Cloned and stored in `Remote` so peer workers and
@@ -188,13 +172,6 @@ pub(crate) enum WorkerUnparker {
         target_os = "linux",
     ))]
     Uring(UringUnparker),
-
-    #[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-    ShardedMio(ShardedMioUnparker),
 }
 
 impl WorkerParker {
@@ -208,12 +185,6 @@ impl WorkerParker {
                 target_os = "linux",
             ))]
             WorkerParker::Uring(p) => WorkerUnparker::Uring(p.unparker()),
-            #[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-            WorkerParker::ShardedMio(p) => WorkerUnparker::ShardedMio(p.unparker()),
         }
     }
 
@@ -227,12 +198,6 @@ impl WorkerParker {
                 target_os = "linux",
             ))]
             WorkerParker::Uring(p) => p.park(handle),
-            #[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-            WorkerParker::ShardedMio(p) => p.park(handle),
         }
     }
 
@@ -250,12 +215,6 @@ impl WorkerParker {
                 target_os = "linux",
             ))]
             WorkerParker::Uring(p) => p.park_timeout(handle, duration),
-            #[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-            WorkerParker::ShardedMio(p) => p.park_timeout(handle, duration),
         }
     }
 
@@ -269,12 +228,6 @@ impl WorkerParker {
                 target_os = "linux",
             ))]
             WorkerParker::Uring(p) => p.shutdown(handle),
-            #[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-            WorkerParker::ShardedMio(p) => p.shutdown(handle),
         }
     }
 
@@ -309,12 +262,6 @@ impl WorkerParker {
                 target_os = "linux",
             ))]
             WorkerParker::Uring(p) => p.eager_init_and_sync(),
-            #[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-            WorkerParker::ShardedMio(p) => p.eager_init_and_sync(),
         }
     }
 }
@@ -334,16 +281,6 @@ impl Clone for WorkerParker {
             WorkerParker::Uring(_) => {
                 unreachable!("UringParker is per-worker; do not clone WorkerParker::Uring")
             }
-            #[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-            WorkerParker::ShardedMio(_) => {
-                unreachable!(
-                    "ShardedMioParker is per-worker; do not clone WorkerParker::ShardedMio"
-                )
-            }
         }
     }
 }
@@ -359,12 +296,6 @@ impl WorkerUnparker {
                 target_os = "linux",
             ))]
             WorkerUnparker::Uring(u) => u.unpark(handle),
-            #[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-            WorkerUnparker::ShardedMio(u) => u.unpark(handle),
         }
     }
 }

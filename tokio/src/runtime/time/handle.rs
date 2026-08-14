@@ -19,11 +19,11 @@ impl Handle {
     }
 
     /// True if this handle is using the legacy single-mutex timer wheel.
-    /// Used by the sharded-mio / uring parkers to decide whether they have
+    /// Used by the uring parkers to decide whether they have
     /// to drive the wheel themselves; the alt-timer flavor manages per-worker
     /// wheels inside the worker loop and does not need parker involvement.
     #[cfg(all(
-        any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
+        feature = "io-uring-reactor",
         target_os = "linux",
     ))]
     pub(crate) fn is_traditional(&self) -> bool {

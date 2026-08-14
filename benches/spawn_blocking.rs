@@ -64,8 +64,6 @@ fn spawn_blocking_concurrency(c: &mut Criterion) {
 fn rt() -> Runtime {
     let mut b = runtime::Builder::new_multi_thread();
     b.enable_all();
-    #[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
-    b.enable_sharded_mio();
     b.build().unwrap()
 }
 

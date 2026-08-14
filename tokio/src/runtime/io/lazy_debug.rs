@@ -1,8 +1,8 @@
 //! Lightweight, process-wide counters for the lazy-on-first-poll
-//! registration path on the sharded-mio backend.
+//! registration path on the io-uring backend.
 //!
 //! Compiled in only when the runtime is built with `tokio_unstable` +
-//! `io-sharded-mio` (or `io-uring-reactor`) on Linux. Activated at
+//! `io-uring-reactor` on Linux. Activated at
 //! runtime by setting the `TOKIO_LAZY_DEBUG` environment variable to a
 //! non-empty value before the runtime starts. The env var gates both
 //! the periodic stderr dump thread and the per-call counter increments,
@@ -53,7 +53,7 @@ counters! {
     rin_race_loser,
     rin_success,
 
-    // ---- sharded_mio_driver register dispatch ----
+    // ---- register dispatch ----
     register_local_calls,
 
     // ---- same-worker sync register fast path ----
@@ -90,15 +90,14 @@ counters! {
     /// Apply-deregister was skipped because either the fd in the kernel
     /// epoll set belongs to a fresher registration (recycled fd) or the
     /// slab slot has been reassigned. Skipping `epoll_ctl_del` here is
-    /// what protects the new registration from being clobbered. See
-    /// `DeregisterOutcome` in `sharded_mio_reactor.rs`.
+    /// what protects the new registration from being clobbered.
     apply_deregister_gen_mismatch,
 
     // ---- deregister entry from Drop ----
     queue_deregister_calls,
     queue_deregister_no_worker,
 
-    // ---- sharded_mio_reactor::poll_and_dispatch ----
+    // ---- poll_and_dispatch ----
     /// `poll_and_dispatch` was entered (one per `reactor.park*` call).
     dispatch_calls,
     /// `mio::Poll::poll` returned successfully (no error/EINTR).
@@ -127,7 +126,7 @@ counters! {
     dispatch_woken_writable,
 
     // ---- unpark observability ----
-    /// `ShardedMioHandle::unpark` was called.
+    /// `unpark` was called.
     unpark_calls,
     /// `unpark` saw `prev == PARKED` and delivered a kernel wake.
     unpark_was_parked,
@@ -203,9 +202,8 @@ counters! {
     /// end-of-trial dumps to compare with `dispatch_woken`.
     steal_drain_woken_total,
 
-    /// `ShardedMioParker::park_on_meta` entered. One call per
-    /// steal-mode park; mode is selected per-park based on whether
-    /// the worker's own slab is empty.
+    /// `park_on_meta` entered. One call per steal-mode park; mode is
+    /// selected per-park based on whether the worker's own slab is empty.
     meta_park_calls,
     /// Steal-mode park returned 0 events because the
     /// `epoll_wait(timeout)` deadline expired without any sibling
@@ -222,15 +220,13 @@ counters! {
 
 pub(crate) static COUNTERS: LazyDebugCounters = LazyDebugCounters::new();
 
-/// Maximum worker index supported by the per-worker counter arrays.
-/// Matches `sharded_mio_reactor::TOKEN_WORKER_BITS = 7` (cap 128).
-/// Bumping past 128 requires widening that token field too — see the
-/// audit trail in `INVESTIGATION-sharded-mio-perf.md`.
+/// Maximum worker index supported by the per-worker counter arrays
+/// (cap 128).
 pub(crate) const MAX_WORKERS: usize = 128;
 
 /// Per-worker counter arrays. Indexed by worker idx as published by
-/// `ShardedMioParker` / `current_worker_index()`. Out-of-range indices
-/// are silently dropped at the bump sites.
+/// `current_worker_index()`. Out-of-range indices are silently
+/// dropped at the bump sites.
 pub(crate) struct PerWorkerCounters {
     /// Worker dispatched ≥1 event during its own
     /// `Reactor::poll_and_dispatch` pass (the [`dispatch_woken`]
@@ -260,8 +256,7 @@ impl PerWorkerCounters {
 pub(crate) static PER_WORKER: PerWorkerCounters = PerWorkerCounters::new();
 
 /// Bump a per-worker counter slot. Out-of-range indices are no-ops
-/// (defensive — should not happen since
-/// `sharded_mio_reactor::pack_token` panics on idx > 127).
+/// (defensive).
 #[inline]
 pub(crate) fn bump_per_worker(arr: &[AtomicU64; MAX_WORKERS], idx: usize) {
     if !enabled() {

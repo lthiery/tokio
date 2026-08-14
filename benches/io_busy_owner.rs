@@ -48,11 +48,6 @@
 //! - `traditional`: shared global mio reactor. Any parking worker can
 //!   call `epoll_wait`, so a busy worker does not stall readiness.
 //!   Expected: idle ≈ busy.
-//! - `sharded_mio`: per-worker epoll fds. A busy worker stalls all
-//!   fds registered on it. Expected: busy ≫ idle.
-//!
-//! The gap between traditional and sharded_mio in the busy case is the
-//! cost the readiness-stealing design is meant to recover.
 
 use criterion::{criterion_group, criterion_main, Bencher, Criterion};
 use std::os::fd::AsRawFd;
@@ -246,14 +241,6 @@ fn rt_traditional() -> Runtime {
         .unwrap()
 }
 
-#[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
-fn rt_sharded_mio() -> Runtime {
-    let mut b = Builder::new_multi_thread();
-    b.worker_threads(workers()).enable_all();
-    b.enable_sharded_mio();
-    b.build().unwrap()
-}
-
 /// Run one iteration: kick K probes, wait for all to wake, return
 /// elapsed time. Burners (if any) run for `BURNER_MS` and end on
 /// their own deadline; they do not gate the bench measurement
@@ -284,7 +271,7 @@ async fn one_iter(num_burners: usize) -> Duration {
         let first_wake_clone = Arc::clone(&first_wake);
         let probe = tokio::spawn(async move {
             // First call to .readable() triggers lazy first-poll
-            // registration of `a` on the running worker (sharded-mio).
+            // registration of `a` on the running worker.
             let async_a = AsyncFd::with_interest(a, Interest::READABLE)
                 .expect("AsyncFd::with_interest");
             let mut guard = async_a.readable().await.expect("readable");
@@ -491,21 +478,5 @@ fn bench_traditional(c: &mut Criterion) {
     });
 }
 
-#[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
-fn bench_sharded_mio(c: &mut Criterion) {
-    let rt = rt_sharded_mio();
-    c.bench_function("sharded_mio/busy_owner_idle", |b| {
-        run_busy_owner(&rt, 0, b)
-    });
-    dump_phase_summary("sharded_mio/busy_owner_idle");
-    c.bench_function("sharded_mio/busy_owner_3burners", |b| {
-        run_busy_owner(&rt, NUM_WORKERS - 1, b)
-    });
-    dump_phase_summary("sharded_mio/busy_owner_3burners");
-}
-
-#[cfg(not(all(feature = "bench-sharded-mio", target_os = "linux")))]
-fn bench_sharded_mio(_c: &mut Criterion) {}
-
-criterion_group!(io_busy_owner, bench_traditional, bench_sharded_mio);
+criterion_group!(io_busy_owner, bench_traditional);
 criterion_main!(io_busy_owner);

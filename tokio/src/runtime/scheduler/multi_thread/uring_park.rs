@@ -21,7 +21,7 @@
 //!
 //! # Timer integration
 //!
-//! Same hybrid park flow as [`super::sharded_mio_park`]. When the runtime is
+//! Hybrid park flow. When the runtime is
 //! built with `enable_uring_reactor()` but without `enable_alt_timer()` (the
 //! default since the `rt-alt-timer` feature gate landed), each worker still
 //! owns its own ring but shares the legacy single-mutex timer wheel. The
@@ -211,8 +211,7 @@ impl UringParker {
     /// Thin wrapper over the flavor-agnostic
     /// [`compute_legacy_timer_duration`] in `uring_driver.rs` (hoisted
     /// there so the current_thread park path shares one copy). See that
-    /// function for the min(scheduler, next-timer) rationale; mirror of
-    /// [`super::sharded_mio_park::ShardedMioParker::compute_legacy_timer_duration`].
+    /// function for the min(scheduler, next-timer) rationale.
     fn compute_legacy_timer_duration(
         &self,
         driver: &driver::Handle,
@@ -457,8 +456,7 @@ impl UringUnparker {
     /// lets the imminent `begin_park` CAS succeed, the worker blocks in
     /// `io_uring_enter`, and `num_searching` stays at 1 so subsequent
     /// `notify_parked_remote` calls are skipped by
-    /// `notify_should_wakeup`. The runtime deadlocks; the same bug bites
-    /// the sharded-mio backend, see `tests/rt_sharded_mio_repro.rs`.
+    /// `notify_should_wakeup`. The runtime deadlocks.
     pub(crate) fn unpark(&self, _driver: &driver::Handle) {
         self.handle.unpark(self.idx);
     }

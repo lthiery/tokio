@@ -30,20 +30,9 @@ cfg_io_uring_reactor! {
     pub(crate) mod uring_recv_multi;
 }
 
-cfg_io_sharded_mio! {
-    // Experimental per-worker mio::Poll reactor. Same per-worker sharding
-    // shape as the uring reactor, but the IO backend is mio rather than
-    // io_uring. Companion to uring-reactor for A/B-measuring driver
-    // sharding independently from io_uring. Consumed by the multi_thread
-    // scheduler's `ShardedMioParker` when `enable_sharded_mio()` is set
-    // on the runtime builder.
-    pub(crate) mod sharded_mio_reactor;
-    pub(crate) mod sharded_mio_driver;
-}
-
 // Backend-agnostic IoDriver (manual vtable). Populated by every io
 // backend after step 3: legacy mio (`LEGACY_MIO_VTABLE`), per-worker
-// uring (`URING_VTABLE`), per-worker sharded-mio (`SHARDED_MIO_VTABLE`).
+// uring (`URING_VTABLE`).
 //
 // Gated to `unix` because the legacy-mio vtable's `register_local`
 // shim constructs a `mio::unix::SourceFd` from the captured `RawFd`,

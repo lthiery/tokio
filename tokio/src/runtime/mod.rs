@@ -445,15 +445,6 @@ pub(crate) enum IoFlavor {
         target_os = "linux",
     ))]
     UringPerWorker,
-    /// Per-worker `mio::Poll` reactor. Companion to `UringPerWorker`
-    /// for A/B-measuring driver sharding independently of `io_uring`.
-    /// See `runtime::io::sharded_mio_reactor`.
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    ShardedMio,
 }
 
 cfg_time! {

@@ -93,17 +93,10 @@ io-uring = ["dep:io-uring", "libc", "mio/os-poll", "mio/os-ext", "dep:slab"]
 rt-alt-timer = ["rt", "rt-multi-thread", "time"]
 # Unstable, experimental. Replaces mio/epoll with per-worker io_uring rings for
 # readiness-model I/O on Linux. Combine with `rt-alt-timer` for the original
-# per-worker-timer-wheel design, or use the default (legacy timer +
-# sharded-mio hybrid park flow) for the lower-overhead path.
+# per-worker-timer-wheel design, or use the default (legacy timer + hybrid
+# park flow) for the lower-overhead path.
 # Requires `--cfg tokio_unstable` to enable.
 io-uring-reactor = ["rt", "rt-multi-thread", "time", "net", "dep:io-uring", "libc", "dep:slab", "dep:bytes"]
-# Experimental. Companion to io-uring-reactor for A/B-measuring driver
-# sharding independently from io_uring. Gives each worker its own mio::Poll
-# instance. See `io-uring-reactor` for the timer-flavor knob. Temporarily
-# callable without `--cfg tokio_unstable` so it can be benched apples-to-apples
-# against the default mio path; the unstable gate may be reinstated before
-# upstreaming.
-io-sharded-mio = ["rt", "rt-multi-thread", "time", "net", "dep:slab"]
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.
 taskdump = ["dep:backtrace"]
 
@@ -133,10 +126,8 @@ libc = { version = "0.2.168", optional = true }
 mio = { version = "1.2.0", default-features = false, features = ["os-poll", "os-ext"], optional = true }
 backtrace = { version = "0.3.58", optional = true }
 
-# `slab` is needed by both the tokio_unstable-gated `io-uring-reactor` and the
-# (now-stable-feature) `io-sharded-mio`. Declared at the linux target level so
-# the `dep:slab` directive in the `io-sharded-mio` feature resolves without
-# requiring `--cfg tokio_unstable`.
+# `slab` is needed by the tokio_unstable-gated `io-uring-reactor`. Declared at
+# the linux target level so the `dep:slab` directive resolves.
 [target.'cfg(target_os = "linux")'.dependencies]
 slab = { version = "0.4.9", optional = true }
 

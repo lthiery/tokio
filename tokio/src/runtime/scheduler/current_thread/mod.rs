@@ -217,16 +217,6 @@ impl CurrentThread {
                     ),
                 ))
             }
-            // Rejected in `build_current_thread_runtime_components`
-            // before this constructor runs.
-            #[cfg(all(
-                feature = "io-sharded-mio",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
-            crate::runtime::IoFlavor::ShardedMio => {
-                unreachable!("sharded-mio rejected by the current_thread builder")
-            }
         };
         #[cfg(not(all(
             target_family = "unix",

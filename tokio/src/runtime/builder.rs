@@ -477,50 +477,6 @@ impl Builder {
         self
     }
 
-    /// Enable the experimental per-worker `mio::Poll` IO reactor.
-    ///
-    /// Mirror of [`enable_uring_reactor`] but using `mio::Poll` per
-    /// worker rather than `io_uring`. Intended for A/B-measuring how
-    /// much of the uring reactor's multi-worker wins come from
-    /// sharding the driver vs. from `io_uring` itself.
-    ///
-    /// By default uses the legacy single-mutex timer wheel via the hybrid
-    /// park flow: each worker queries `time::Handle::next_wake_tick()` to
-    /// compute its `mio::Poll::poll` timeout as `min(scheduler_timeout,
-    /// time_until_next_timer)`, then calls `parker_process(clock)` after
-    /// wake to fire any expired timers. To opt into the original per-worker
-    /// timer wheel design, also call [`Builder::enable_alt_timer`] (requires
-    /// the `rt-alt-timer` Cargo feature).
-    ///
-    /// The two knobs ([`enable_uring_reactor`] and this one) are
-    /// last-write-wins: whichever is called last on the builder wins.
-    /// They are not a compile error to set both, deliberately, to keep
-    /// benchmark toggling ergonomic.
-    ///
-    /// Gated behind the `io-sharded-mio` Cargo feature. Linux-only to keep
-    /// the A/B fair on the bench platform.
-    ///
-    /// [`enable_uring_reactor`]: Builder::enable_uring_reactor
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    )))
-    )]
-    pub fn enable_sharded_mio(&mut self) -> &mut Self {
-        self.enable_io();
-        self.enable_time();
-        self.io_flavor = IoFlavor::ShardedMio;
-        self
-    }
-
     /// Enable eager hand-off of the I/O and time drivers for multi-threaded
     /// runtimes, which is disabled by default.
     ///
@@ -1766,21 +1722,6 @@ impl Builder {
     ) -> io::Result<(CurrentThread, Handle, BlockingPool)> {
         use crate::runtime::scheduler;
         use crate::runtime::Config;
-
-        // Sharded-mio has no current_thread story (its whole point is
-        // per-worker registries) and silently falling back to the
-        // traditional driver is how latent misconfiguration hides.
-        // Uring, by contrast, is supported: it degenerates to the
-        // forced-global single-ring shape (see `CurrentThread::new`).
-        #[cfg(all(
-            feature = "io-sharded-mio",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        assert!(
-            self.io_flavor != IoFlavor::ShardedMio,
-            "enable_sharded_mio() is not supported on current_thread runtimes",
-        );
 
         let mut cfg = self.get_cfg();
         cfg.timer_flavor = TimerFlavor::Traditional;

@@ -124,10 +124,10 @@ impl Handle {
         }
 
         /// Non-panicking accessor for the time driver handle. Used by the
-        /// sharded-mio / uring parker to drive the legacy timer wheel from
-        /// outside the regular `Driver::park_internal` path.
+        /// uring parker to drive the legacy timer wheel from outside the
+        /// regular `Driver::park_internal` path.
         #[cfg(all(
-            any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
+            feature = "io-uring-reactor",
             target_os = "linux",
         ))]
         pub(crate) fn time_handle_opt(&self) -> Option<&crate::runtime::time::Handle> {

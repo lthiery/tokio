@@ -1,10 +1,9 @@
 //! TCP echo throughput bench. Exercises the io-driver registration and
-//! readiness path. Used to compare backends (traditional / sharded-mio /
-//! uring) and to check for regressions across the IoDriver vtable refactor.
+//! readiness path. Used to compare backends (traditional / uring) and to
+//! check for regressions across the IoDriver vtable refactor.
 //!
 //! Build matrix:
 //! - default features: traditional mio only
-//! - `--features bench-sharded-mio` + `--cfg tokio_unstable`: adds sharded-mio
 //! - `--features bench-uring-reactor` + `--cfg tokio_unstable`: adds uring
 //!
 //! Each backend's bench function exists only when its feature is built.
@@ -107,8 +106,7 @@ fn extras_enabled() -> bool {
 /// `TOKIO_BENCH_CT=1` swaps the binary to the current_thread case set:
 /// the same workloads on `new_current_thread()` runtimes, registered
 /// under `traditional_ct/` and `uring_ct/` prefixes, with the
-/// multi-thread cases (and sharded-mio, which has no current_thread
-/// support) skipped entirely. A switch rather than an addition so a ct
+/// multi-thread cases skipped entirely. A switch rather than an addition so a ct
 /// sweep cell doesn't also pay for the full multi-thread set; both ct
 /// arms live in the same binary, keeping the workload identical by
 /// construction. `TOKIO_BENCH_WORKERS` is meaningless here — sweep
@@ -165,13 +163,6 @@ fn rt_traditional() -> Runtime {
         .unwrap()
 }
 
-#[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
-fn rt_sharded_mio() -> Runtime {
-    let mut b = Builder::new_multi_thread();
-    b.worker_threads(workers()).enable_all();
-    b.enable_sharded_mio();
-    b.build().unwrap()
-}
 
 #[cfg(all(tokio_unstable, feature = "bench-uring-reactor", target_os = "linux"))]
 fn rt_uring() -> Runtime {
@@ -539,19 +530,6 @@ fn bench_traditional(c: &mut Criterion) {
     }
 }
 
-#[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
-fn bench_sharded_mio(c: &mut Criterion) {
-    // No current_thread support (the builder asserts); ct sweeps skip.
-    if ct_enabled() {
-        return;
-    }
-    let rt = rt_sharded_mio();
-    bench_backend(c, "sharded_mio", &rt);
-}
-
-#[cfg(not(all(feature = "bench-sharded-mio", target_os = "linux")))]
-fn bench_sharded_mio(_c: &mut Criterion) {}
-
 #[cfg(all(tokio_unstable, feature = "bench-uring-reactor", target_os = "linux"))]
 fn bench_uring(c: &mut Criterion) {
     if ct_enabled() {
@@ -566,5 +544,5 @@ fn bench_uring(c: &mut Criterion) {
 #[cfg(not(all(tokio_unstable, feature = "bench-uring-reactor", target_os = "linux")))]
 fn bench_uring(_c: &mut Criterion) {}
 
-criterion_group!(net, bench_traditional, bench_sharded_mio, bench_uring);
+criterion_group!(net, bench_traditional, bench_uring);
 criterion_main!(net);

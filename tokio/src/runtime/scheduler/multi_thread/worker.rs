@@ -287,31 +287,6 @@ pub(super) fn create(
         IoFlavor::UringPerWorker => Some(std::sync::Arc::new(
             crate::runtime::io::uring_driver::UringHandle::new(size),
         )),
-        #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-        IoFlavor::ShardedMio => None,
-    };
-
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    let sharded_mio_handle = match io_flavor {
-        IoFlavor::Traditional => None,
-        #[cfg(all(
-            tokio_unstable,
-            feature = "io-uring-reactor",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        IoFlavor::UringPerWorker => None,
-        IoFlavor::ShardedMio => Some(std::sync::Arc::new(
-            crate::runtime::io::sharded_mio_driver::ShardedMioHandle::new(size),
-        )),
     };
 
     // Create the local queues
@@ -333,24 +308,6 @@ pub(super) fn create(
                 WorkerParker::Uring(
                     crate::runtime::scheduler::multi_thread::uring_park::UringParker::new(
                         worker_idx, handle,
-                    ),
-                )
-            }
-            #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-            IoFlavor::ShardedMio => {
-                let handle = std::sync::Arc::clone(
-                    sharded_mio_handle
-                        .as_ref()
-                        .expect("sharded-mio handle constructed above"),
-                );
-                WorkerParker::ShardedMio(
-                    crate::runtime::scheduler::multi_thread::sharded_mio_park::ShardedMioParker::new(
-                        worker_idx,
-                        handle,
                     ),
                 )
             }
@@ -420,14 +377,6 @@ pub(super) fn create(
         ))]
         IoFlavor::UringPerWorker => uring_handle.as_ref().map(|h| {
             crate::runtime::io::io_driver::IoDriver::from_uring(std::sync::Arc::clone(h))
-        }),
-        #[cfg(all(
-            feature = "io-sharded-mio",
-            feature = "rt-multi-thread",
-            target_os = "linux",
-        ))]
-        IoFlavor::ShardedMio => sharded_mio_handle.as_ref().map(|h| {
-            crate::runtime::io::io_driver::IoDriver::from_sharded_mio(std::sync::Arc::clone(h))
         }),
     };
 
@@ -703,44 +652,6 @@ fn run(worker: Arc<Worker>) {
     ))]
     let _clear_uring_tls = ClearUringTls;
 
-    // Sharded-mio counterpart to the uring TLS discipline above. The
-    // self-wake short-circuit in `ShardedMioUnparker::unpark` relies on
-    // `CURRENT_WORKER` being populated before any task can observe a
-    // wake on this thread. See the uring comment block above for the
-    // full rationale — the reasoning transfers verbatim.
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    struct ClearShardedMioTls;
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    impl Drop for ClearShardedMioTls {
-        fn drop(&mut self) {
-            crate::runtime::io::sharded_mio_driver::clear_local_reactor();
-            crate::runtime::scheduler::multi_thread::sharded_mio_park::clear_current_worker();
-        }
-    }
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    {
-        crate::runtime::io::sharded_mio_driver::clear_local_reactor();
-        crate::runtime::scheduler::multi_thread::sharded_mio_park::clear_current_worker();
-    }
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    let _clear_sharded_mio_tls = ClearShardedMioTls;
-
     // Publish the worker index into `CURRENT_WORKER` *before* any task
     // runs on this thread. This is what `UringHandle::add_source` reads to
     // decide placement (`W_ring == W_task`). Installing inside the parker's
@@ -757,15 +668,6 @@ fn run(worker: Arc<Worker>) {
         target_os = "linux",
     ))]
     crate::runtime::scheduler::multi_thread::uring_park::set_current_worker_early(
-        worker.index,
-    );
-
-    #[cfg(all(
-        feature = "io-sharded-mio",
-        feature = "rt-multi-thread",
-        target_os = "linux",
-    ))]
-    crate::runtime::scheduler::multi_thread::sharded_mio_park::set_current_worker_early(
         worker.index,
     );
 
@@ -1609,7 +1511,6 @@ impl Handle {
             // gate-elided when the cfg is off.
             #[cfg(any(
                 all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
             ))]
             #[allow(unused_assignments)]
             let mut remote_reason: Option<&'static core::sync::atomic::AtomicU64> = None;
@@ -1621,7 +1522,6 @@ impl Handle {
                     if let Some(core) = cx.core.borrow_mut().as_mut() {
                         #[cfg(any(
                             all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                            all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
                         ))]
                         {
                             crate::runtime::io::lazy_debug::bump(
@@ -1634,7 +1534,6 @@ impl Handle {
                     }
                     #[cfg(any(
                         all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                        all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
                     ))]
                     {
                         remote_reason = Some(
@@ -1644,7 +1543,6 @@ impl Handle {
                 } else {
                     #[cfg(any(
                         all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                        all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
                     ))]
                     {
                         remote_reason = Some(
@@ -1656,7 +1554,6 @@ impl Handle {
             } else {
                 #[cfg(any(
                     all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                    all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
                 ))]
                 {
                     remote_reason = Some(
@@ -1668,7 +1565,6 @@ impl Handle {
             // Otherwise, use the inject queue.
             #[cfg(any(
                 all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"),
-                all(feature = "io-sharded-mio", feature = "rt-multi-thread", target_os = "linux"),
             ))]
             {
                 if let Some(c) = remote_reason {

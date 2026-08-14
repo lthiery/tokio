@@ -11,10 +11,9 @@ use std::task::{ready, Context, Poll};
 
 /// Source trait bound used by `Registration::new_with_interest`.
 ///
-/// On Linux with the experimental `io-uring-reactor` or `io-sharded-mio`
-/// feature enabled, the vtable-routed backends need a raw fd so they can
-/// (uring) submit `POLL_ADD_MULTI` keyed on it, or (sharded-mio) call
-/// `register_local` at first-poll without holding the original `Source`
+/// On Linux with the experimental `io-uring-reactor` feature enabled,
+/// the vtable-routed backend needs a raw fd so it can submit
+/// `POLL_ADD_MULTI` keyed on it without holding the original `Source`
 /// reference. We expose that fd via a [`registration_raw_fd`] method
 /// rather than a direct [`AsRawFd`] supertrait bound, because
 /// [`mio::unix::SourceFd<'_>`] — used by `AsyncFd` — does not itself
@@ -224,7 +223,7 @@ impl Registration {
     /// On unix targets, this constructor does **not** consult any
     /// runtime; if no Tokio runtime is set in thread-local storage,
     /// the panic is deferred to the first poll. This is true for
-    /// every backend (legacy mio, sharded-mio, io-uring). On non-unix
+    /// every backend (legacy mio, io-uring). On non-unix
     /// targets the legacy `add_source` path is still eager, so the
     /// panic remains at construction.
     #[track_caller]
@@ -317,8 +316,8 @@ impl Registration {
 
         // Every io-enabled runtime now exposes an `IoDriver`:
         // multi_thread + `IoFlavor::Traditional` and current_thread
-        // both carry `LEGACY_MIO_VTABLE`, the per-worker flavors carry
-        // `URING_VTABLE` / `SHARDED_MIO_VTABLE`. If `io_driver()`
+        // both carry `LEGACY_MIO_VTABLE`, the per-worker flavor carries
+        // `URING_VTABLE`. If `io_driver()`
         // returns `None`, the runtime was built with io disabled —
         // that path panics on the way in (mirrors the pre-vtable
         // panic from `driver().io()`).

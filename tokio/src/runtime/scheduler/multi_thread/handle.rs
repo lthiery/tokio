@@ -56,10 +56,9 @@ pub(crate) struct Handle {
     /// Backend-agnostic io-driver value (manual vtable). `Some` when
     /// the runtime selected a non-traditional flavor — currently
     /// `IoFlavor::UringPerWorker` (built from
-    /// [`IoDriver::from_uring`][fu]) or `IoFlavor::ShardedMio` (built
-    /// from [`IoDriver::from_sharded_mio`][fs], `LEGACY_MIO_VTABLE`
-    /// from [`IoDriver::from_legacy_mio`][fl]) — and `None` only for
-    /// io-disabled runtimes.
+    /// [`IoDriver::from_uring`][fu]), with `LEGACY_MIO_VTABLE`
+    /// from [`IoDriver::from_legacy_mio`][fl] otherwise — and `None`
+    /// only for io-disabled runtimes.
     ///
     /// Kept on the scheduler handle (rather than on `driver::Handle`)
     /// so that `Registration::ensure_registered` can reach it on first
@@ -69,7 +68,6 @@ pub(crate) struct Handle {
     /// See `tokio/docs/io-driver-vtable.md` for the design.
     ///
     /// [fu]: crate::runtime::io::io_driver::IoDriver::from_uring
-    /// [fs]: crate::runtime::io::io_driver::IoDriver::from_sharded_mio
     /// [fl]: crate::runtime::io::io_driver::IoDriver::from_legacy_mio
     #[cfg(all(
         target_family = "unix",

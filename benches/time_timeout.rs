@@ -20,17 +20,10 @@ fn build_run_time(workers: usize) -> Runtime {
     } else {
         let mut b = tokio::runtime::Builder::new_multi_thread();
         b.enable_all().worker_threads(workers);
-        // Bench-mode A/B knobs. Independent since the rt-alt-timer feature
-        // gate landed in Step 3: enabling sharded-mio no longer implies the
-        // alt-timer flavor. Combinations:
-        //   bench-alt-timer alone           → traditional I/O + alt-timer
-        //   bench-sharded-mio alone         → sharded-mio I/O + legacy timer
-        //                                     (hybrid park flow)
-        //   both                            → sharded-mio I/O + alt-timer
+        // Bench-mode A/B knob: opt into the alt-timer flavor (per-worker
+        // timer wheels) to isolate its cost from the traditional I/O path.
         #[cfg(feature = "bench-alt-timer")]
         b.enable_alt_timer();
-        #[cfg(all(feature = "bench-sharded-mio", target_os = "linux"))]
-        b.enable_sharded_mio();
         b.build().unwrap()
     }
 }

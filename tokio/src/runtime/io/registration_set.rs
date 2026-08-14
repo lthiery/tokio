@@ -71,8 +71,8 @@ impl RegistrationSet {
 
     /// Track an externally-allocated `Arc<ScheduledIo>` in this set.
     ///
-    /// Used by every vtable-routed backend (legacy mio, sharded-mio,
-    /// uring) — the `Arc<ScheduledIo>` is produced by the vtable's
+    /// Used by every vtable-routed backend (legacy mio, uring): the
+    /// `Arc<ScheduledIo>` is produced by the vtable's
     /// `allocate_scheduled_io` shim (an infallible `Arc::new`) and
     /// linked into the set at `register_local` time. Keeping the
     /// shutdown check on the linking step (rather than on the

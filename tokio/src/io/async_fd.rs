@@ -221,8 +221,8 @@ impl<T: AsRawFd> AsyncFd<T> {
     /// This function panics if there is no current reactor set, or if the `rt`
     /// feature flag is not enabled.
     ///
-    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
-    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// On `tokio_unstable` builds with the experimental `io-uring-reactor`
+    /// feature, the runtime lookup is deferred
     /// to the first I/O operation on the returned `AsyncFd`, so this
     /// constructor itself does not panic and may be called from any
     /// thread; the panic moves to the first readiness call.
@@ -244,8 +244,8 @@ impl<T: AsRawFd> AsyncFd<T> {
     /// This function panics if there is no current reactor set, or if the `rt`
     /// feature flag is not enabled.
     ///
-    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
-    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// On `tokio_unstable` builds with the experimental `io-uring-reactor`
+    /// feature, the runtime lookup is deferred
     /// to the first I/O operation on the returned `AsyncFd`, so this
     /// constructor itself does not panic and may be called from any
     /// thread; the panic moves to the first readiness call.
@@ -280,8 +280,8 @@ impl<T: AsRawFd> AsyncFd<T> {
     /// This function panics if there is no current reactor set, or if the `rt`
     /// feature flag is not enabled.
     ///
-    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
-    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// On `tokio_unstable` builds with the experimental `io-uring-reactor`
+    /// feature, the runtime lookup is deferred
     /// to the first I/O operation on the returned `AsyncFd`, so this
     /// constructor itself does not panic and may be called from any
     /// thread; the panic moves to the first readiness call.
@@ -306,8 +306,8 @@ impl<T: AsRawFd> AsyncFd<T> {
     /// This function panics if there is no current reactor set, or if the `rt`
     /// feature flag is not enabled.
     ///
-    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
-    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// On `tokio_unstable` builds with the experimental `io-uring-reactor`
+    /// feature, the runtime lookup is deferred
     /// to the first I/O operation on the returned `AsyncFd`, so this
     /// constructor itself does not panic and may be called from any
     /// thread; the panic moves to the first readiness call.

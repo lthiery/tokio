@@ -79,13 +79,9 @@ pub(crate) struct IoDriverVTable {
     /// `interest`. Returns the worker index the registration was
     /// bound to.
     ///
-    /// The sharded-mio backend tries the worker-local fast path
-    /// (caller-thread is a sharded-mio worker → register directly on
-    /// that worker's registry); on miss, queues a Register op onto a
-    /// round-robin-picked worker. The uring backend always queues a
-    /// `POLL_ADD_MULTI` SQE onto a round-robin-picked ring (uring
-    /// SQEs must be submitted by the ring's owning worker, so there
-    /// is no in-place fast path).
+    /// The uring backend always queues a `POLL_ADD_MULTI` SQE onto a
+    /// round-robin-picked ring (uring SQEs must be submitted by the
+    /// ring's owning worker, so there is no in-place fast path).
     pub register_local: unsafe fn(
         NonNull<()>,
         &Arc<ScheduledIo>,
@@ -94,8 +90,8 @@ pub(crate) struct IoDriverVTable {
     ) -> io::Result<usize>,
 
     /// Deregister a previously-registered `ScheduledIo`. The owning
-    /// worker index lives on the `ScheduledIo` itself (`uring_worker` /
-    /// `sharded_mio_worker`), so each backend reads it directly. The
+    /// worker index lives on the `ScheduledIo` itself (`uring_worker`),
+    /// so each backend reads it directly. The
     /// `source` is required by the mio-based backends to call
     /// `mio::Registry::deregister`; the uring shim ignores it because
     /// `POLL_REMOVE` is keyed off `ScheduledIo` alone.
@@ -364,147 +360,6 @@ cfg_io_uring_reactor! {
 }
 
 // =====================================================================
-// Sharded-mio backend vtable
-// =====================================================================
-
-cfg_io_sharded_mio! {
-    use crate::runtime::io::sharded_mio_driver::ShardedMioHandle;
-
-    /// VTable for `ShardedMioHandle`. Each shim casts the type-erased
-    /// data pointer back to `*const ShardedMioHandle` and forwards to
-    /// the inherent method, mirroring [`URING_VTABLE`].
-    pub(crate) static SHARDED_MIO_VTABLE: IoDriverVTable = IoDriverVTable {
-        allocate_scheduled_io: sharded_mio_allocate_scheduled_io,
-        register_local:        sharded_mio_register_local,
-        deregister:            sharded_mio_deregister,
-        unpark_worker:         sharded_mio_unpark_worker,
-        num_workers:           sharded_mio_num_workers,
-        clone_data:            sharded_mio_clone_data,
-        drop_data:             sharded_mio_drop_data,
-    };
-
-    #[inline]
-    unsafe fn as_sharded_mio_handle(data: NonNull<()>) -> &'static ShardedMioHandle {
-        // SAFETY: caller guarantees `data` came from
-        // `Arc::into_raw(arc: Arc<ShardedMioHandle>)` and the strong
-        // count is still positive (held by this `IoDriver` value). The
-        // reference lifetime is bounded by the surrounding shim's call
-        // frame; we erase to `'static` here to keep the shim signature
-        // simple and never leak the reference past the shim's return.
-        unsafe { &*(data.as_ptr() as *const ShardedMioHandle) }
-    }
-
-    unsafe fn sharded_mio_allocate_scheduled_io(data: NonNull<()>) -> Arc<ScheduledIo> {
-        let handle = unsafe { as_sharded_mio_handle(data) };
-        handle.allocate_scheduled_io()
-    }
-
-    unsafe fn sharded_mio_register_local(
-        data: NonNull<()>,
-        shared: &Arc<ScheduledIo>,
-        fd: RawFd,
-        interest: Interest,
-    ) -> io::Result<usize> {
-        let handle = unsafe { as_sharded_mio_handle(data) };
-        handle.register_local(shared, fd, interest)
-    }
-
-    unsafe fn sharded_mio_deregister(
-        data: NonNull<()>,
-        io: &Arc<ScheduledIo>,
-        source: &mut dyn RegistrationSource,
-    ) -> io::Result<()> {
-        let handle = unsafe { as_sharded_mio_handle(data) };
-        // Sharded-mio's deregister is queued onto the owning worker
-        // (registry mutation stays on a single thread per shard).
-        // Read the fd from the source so the worker can call
-        // `Registry::deregister(SourceFd(&fd), ...)` later — the
-        // original source value may be dropped by then.
-        let fd = source.registration_raw_fd();
-        handle.queue_deregister(io, fd);
-        Ok(())
-    }
-
-    unsafe fn sharded_mio_unpark_worker(data: NonNull<()>, worker_idx: usize) -> bool {
-        let handle = unsafe { as_sharded_mio_handle(data) };
-        handle.unpark(worker_idx)
-    }
-
-    unsafe fn sharded_mio_num_workers(data: NonNull<()>) -> usize {
-        let handle = unsafe { as_sharded_mio_handle(data) };
-        handle.num_workers()
-    }
-
-    unsafe fn sharded_mio_clone_data(data: NonNull<()>) -> NonNull<()> {
-        // SAFETY: see `uring_clone_data` — same reconstitute/clone/forget
-        // idiom, just monomorphized on `ShardedMioHandle`.
-        let arc = unsafe {
-            Arc::<ShardedMioHandle>::from_raw(data.as_ptr() as *const ShardedMioHandle)
-        };
-        let bumped = Arc::clone(&arc);
-        std::mem::forget(arc);
-        let raw = Arc::into_raw(bumped) as *mut ();
-        // SAFETY: `Arc::into_raw` is documented to return a non-null
-        // pointer for a live Arc.
-        unsafe { NonNull::new_unchecked(raw) }
-    }
-
-    unsafe fn sharded_mio_drop_data(data: NonNull<()>) {
-        // SAFETY: see `uring_drop_data`.
-        let arc = unsafe {
-            Arc::<ShardedMioHandle>::from_raw(data.as_ptr() as *const ShardedMioHandle)
-        };
-        drop(arc);
-    }
-
-    impl IoDriver {
-        /// If this driver is the sharded-mio backend, return a borrow
-        /// of the underlying handle. Used at the few call sites that
-        /// still need backend-specific inherent methods.
-        pub(crate) fn as_sharded_mio(&self) -> Option<&ShardedMioHandle> {
-            if self.vtable_is(&SHARDED_MIO_VTABLE) {
-                // SAFETY: vtable identity proves `data` came from
-                // `Arc::into_raw(_: Arc<ShardedMioHandle>)`; the Arc
-                // is alive for as long as `self` is.
-                Some(unsafe { &*(self.data.as_ptr() as *const ShardedMioHandle) })
-            } else {
-                None
-            }
-        }
-
-        /// If this driver is the sharded-mio backend, return a fresh
-        /// owning `Arc<ShardedMioHandle>` (bumps the strong count).
-        /// Used by the scheduler builder when constructing per-worker
-        /// parkers.
-        pub(crate) fn as_sharded_mio_arc(&self) -> Option<Arc<ShardedMioHandle>> {
-            if self.vtable_is(&SHARDED_MIO_VTABLE) {
-                // SAFETY: vtable identity proves `data` came from
-                // `Arc::into_raw(_: Arc<ShardedMioHandle>)`. Reconstitute
-                // / clone / forget idiom; see `as_uring_arc`.
-                unsafe {
-                    let arc = Arc::<ShardedMioHandle>::from_raw(
-                        self.data.as_ptr() as *const ShardedMioHandle,
-                    );
-                    let bumped = Arc::clone(&arc);
-                    std::mem::forget(arc);
-                    Some(bumped)
-                }
-            } else {
-                None
-            }
-        }
-
-        /// Construct an `IoDriver` from an owned `Arc<ShardedMioHandle>`.
-        pub(crate) fn from_sharded_mio(handle: Arc<ShardedMioHandle>) -> Self {
-            // SAFETY: `SHARDED_MIO_VTABLE`'s shims expect `data` to be
-            // the `Arc::into_raw` of an `Arc<ShardedMioHandle>`;
-            // that's what `from_arc::<ShardedMioHandle>` produces.
-            unsafe { Self::from_arc(handle, &SHARDED_MIO_VTABLE) }
-        }
-    }
-}
-
-// =====================================================================
 // Legacy mio (single-shard shared `mio::Poll`) backend vtable
 // =====================================================================
 //
@@ -521,7 +376,7 @@ cfg_io_sharded_mio! {
 use crate::runtime::io::Handle as LegacyMioHandle;
 
 /// VTable for the legacy single-shared-mio `runtime::io::Handle`.
-/// Mirrors `URING_VTABLE` / `SHARDED_MIO_VTABLE` shape; the legacy
+/// Mirrors `URING_VTABLE` shape; the legacy
 /// backend's special-cases (single shard, sync registry-mutation
 /// path, panicking `unpark`) are absorbed into the shims.
 pub(crate) static LEGACY_MIO_VTABLE: IoDriverVTable = IoDriverVTable {
@@ -546,7 +401,7 @@ unsafe fn as_legacy_mio_handle(data: NonNull<()>) -> &'static LegacyMioHandle {
 }
 
 unsafe fn legacy_mio_allocate_scheduled_io(_data: NonNull<()>) -> Arc<ScheduledIo> {
-    // Matches uring / sharded-mio shape: infallible `Arc::new`. The
+    // Matches uring shape: infallible `Arc::new`. The
     // legacy `RegistrationSet` linkage happens lazily in
     // `legacy_mio_register_local` via `Handle::register_existing`,
     // mirroring the existing two-step `allocate_existing` + register
@@ -645,8 +500,6 @@ mod tests {
     use super::*;
     #[cfg(feature = "io-uring-reactor")]
     use crate::runtime::io::uring_driver::UringHandle;
-    #[cfg(feature = "io-sharded-mio")]
-    use crate::runtime::io::sharded_mio_driver::ShardedMioHandle;
 
     /// Constructing an `IoDriver` from an `Arc<UringHandle>`, cloning it,
     /// and dropping both clones must not leak the inner allocation, and
@@ -697,72 +550,7 @@ mod tests {
         assert_eq!(Arc::strong_count(&inner), 1);
     }
 
-    /// Mirror of [`uring_vtable_dispatch_and_refcount`] for the
-    /// sharded-mio backend: refcount accounting through the vtable's
-    /// `clone_data` / `drop_data` shims must match `Arc<ShardedMioHandle>`
-    /// directly, and `num_workers` must read back via the vtable.
-    #[cfg(feature = "io-sharded-mio")]
-    #[test]
-    fn sharded_mio_vtable_dispatch_and_refcount() {
-        let inner = Arc::new(ShardedMioHandle::new(4));
-        let weak = Arc::downgrade(&inner);
-        assert_eq!(Arc::strong_count(&inner), 1);
-
-        let driver = IoDriver::from_sharded_mio(Arc::clone(&inner));
-        assert_eq!(Arc::strong_count(&inner), 2);
-        assert_eq!(driver.num_workers(), 4);
-        assert!(driver.vtable_is(&SHARDED_MIO_VTABLE));
-
-        let driver2 = driver.clone();
-        assert_eq!(Arc::strong_count(&inner), 3);
-        assert_eq!(driver2.num_workers(), 4);
-
-        drop(driver);
-        assert_eq!(Arc::strong_count(&inner), 2);
-        drop(driver2);
-        assert_eq!(Arc::strong_count(&inner), 1);
-
-        drop(inner);
-        assert!(weak.upgrade().is_none());
-    }
-
-    #[cfg(feature = "io-sharded-mio")]
-    #[test]
-    fn as_sharded_mio_arc_bumps_count() {
-        let inner = Arc::new(ShardedMioHandle::new(2));
-        let driver = IoDriver::from_sharded_mio(Arc::clone(&inner));
-        assert_eq!(Arc::strong_count(&inner), 2);
-
-        let recovered = driver
-            .as_sharded_mio_arc()
-            .expect("sharded-mio vtable matches");
-        assert_eq!(Arc::strong_count(&inner), 3);
-        assert!(Arc::ptr_eq(&recovered, &inner));
-
-        drop(recovered);
-        assert_eq!(Arc::strong_count(&inner), 2);
-        drop(driver);
-        assert_eq!(Arc::strong_count(&inner), 1);
-    }
-
-    /// Cross-vtable identity: `as_uring*` returns `None` for a
-    /// sharded-mio driver, and vice versa. Guards against accidental
-    /// `vtable_is` mismatches if one of the statics gets shuffled
-    /// across compilation units.
-    #[cfg(all(feature = "io-uring-reactor", feature = "io-sharded-mio"))]
-    #[test]
-    fn vtable_identity_does_not_alias() {
-        let uring_driver = IoDriver::from_uring(Arc::new(UringHandle::new(1)));
-        let sharded_driver = IoDriver::from_sharded_mio(Arc::new(ShardedMioHandle::new(1)));
-
-        assert!(uring_driver.as_uring().is_some());
-        assert!(uring_driver.as_sharded_mio().is_none());
-        assert!(sharded_driver.as_sharded_mio().is_some());
-        assert!(sharded_driver.as_uring().is_none());
-    }
-
-    /// Mirror of [`uring_vtable_dispatch_and_refcount`] /
-    /// [`sharded_mio_vtable_dispatch_and_refcount`] for the legacy
+    /// Mirror of [`uring_vtable_dispatch_and_refcount`] for the legacy
     /// single-shared-mio backend. Constructing an `IoDriver` from an
     /// `Arc<runtime::io::Handle>`, cloning, and dropping must keep
     /// the refcount honest. `num_workers` reads back as `1`
@@ -795,10 +583,8 @@ mod tests {
 
     /// Identity-aliasing check for the legacy backend: a
     /// `LEGACY_MIO_VTABLE`-backed `IoDriver` reports `None` from
-    /// `as_uring()` / `as_sharded_mio()`. The reverse direction is
-    /// already covered by `vtable_identity_does_not_alias` (when
-    /// both sharded features are on).
-    #[cfg(any(feature = "io-uring-reactor", feature = "io-sharded-mio"))]
+    /// `as_uring()`.
+    #[cfg(feature = "io-uring-reactor")]
     #[test]
     fn legacy_mio_vtable_identity_does_not_alias() {
         let (_drv, handle) = crate::runtime::io::Driver::new(1024)
@@ -806,9 +592,6 @@ mod tests {
         let legacy_driver = IoDriver::from_legacy_mio(Arc::new(handle));
 
         assert!(legacy_driver.vtable_is(&LEGACY_MIO_VTABLE));
-        #[cfg(feature = "io-uring-reactor")]
         assert!(legacy_driver.as_uring().is_none());
-        #[cfg(feature = "io-sharded-mio")]
-        assert!(legacy_driver.as_sharded_mio().is_none());
     }
 }

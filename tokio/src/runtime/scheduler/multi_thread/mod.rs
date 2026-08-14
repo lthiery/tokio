@@ -26,13 +26,6 @@ pub(crate) use park::{Parker, WorkerParker, WorkerUnparker};
 ))]
 pub(crate) mod uring_park;
 
-#[cfg(all(
-    feature = "io-sharded-mio",
-    feature = "rt-multi-thread",
-    target_os = "linux",
-))]
-pub(crate) mod sharded_mio_park;
-
 pub(crate) mod queue;
 
 mod worker;

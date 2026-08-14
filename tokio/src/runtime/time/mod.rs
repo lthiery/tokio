@@ -110,7 +110,7 @@ enum Inner {
         /// `Handle::next_wake_tick`, `Handle::process_at_time`), and by
         /// `Handle::reregister` when an insert lowers the minimum.
         ///
-        /// Sharded-mio and io-uring parkers read it without taking the
+        /// The io-uring parkers read it without taking the
         /// mutex on the pre-park (`next_wake_tick`) and post-park
         /// (`parker_process`) hot paths, allowing them to skip the wheel
         /// walk entirely when no timer is registered. The cached value is
@@ -253,7 +253,7 @@ impl Driver {
         let next_wake = lock.wheel.next_expiration_time();
         lock.next_wake =
             next_wake.map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
-        // Mirror to lock-free cache so sharded-mio/uring fast-path readers
+        // Mirror to lock-free cache so uring fast-path readers
         // observe the same value without taking the mutex.
         handle
             .inner
@@ -333,21 +333,21 @@ impl Handle {
         self.process_at_time(now);
     }
 
-    /// Wrapper around [`Handle::process`] used by the sharded-mio parker.
+    /// Wrapper around [`Handle::process`] used by the io-uring parker.
     ///
     /// In the legacy + traditional-park path, the time driver wraps the
     /// IoStack, so `Driver::park_internal` reads `next_wake` and processes
-    /// the wheel after wake. Sharded-mio bypasses that wrapper (each worker
-    /// owns its own `mio::Poll`), so the parker has to advance the wheel
-    /// itself. This is the entry point for that.
+    /// the wheel after wake. The io-uring parker bypasses that wrapper
+    /// (each worker owns its own ring), so the parker has to advance the
+    /// wheel itself. This is the entry point for that.
     ///
     /// Includes a lock-free empty-wheel fast path: if no timer is
     /// registered, this returns without acquiring the inner mutex or
     /// walking the wheel. This makes timer-free workloads (e.g. pure
     /// `Notify` / `watch` notification storms) pay zero cost per park
-    /// for the timer subsystem under sharded-mio / io-uring.
+    /// for the timer subsystem under io-uring.
     #[cfg(all(
-        any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
+        feature = "io-uring-reactor",
         target_os = "linux",
     ))]
     pub(crate) fn parker_process(&self, clock: &Clock) {
@@ -359,8 +359,8 @@ impl Handle {
     }
 
     /// Returns the absolute tick of the next pending timer, or `None` if
-    /// no timers are registered. Sharded-mio's parker uses this to compute
-    /// its `mio::Poll::poll` timeout (`min(io_timeout, time_timeout)`).
+    /// no timers are registered. The io-uring parker uses this to compute
+    /// its poll timeout (`min(io_timeout, time_timeout)`).
     ///
     /// Mirrors the pre-park logic in [`Driver::park_internal`]: queries the
     /// wheel directly (so newly-registered timers that haven't been through
@@ -374,7 +374,7 @@ impl Handle {
     /// entirely. The non-empty path still locks and re-derives the value
     /// from the wheel so newly-registered timers are picked up.
     #[cfg(all(
-        any(feature = "io-sharded-mio", feature = "io-uring-reactor"),
+        feature = "io-uring-reactor",
         target_os = "linux",
     ))]
     pub(crate) fn next_wake_tick(&self) -> Option<u64> {
@@ -432,7 +432,7 @@ impl Handle {
         let next_wake_tick = lock.wheel.poll_at();
         lock.next_wake = next_wake_tick
             .map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
-        // Mirror to lock-free cache for sharded-mio / io-uring readers.
+        // Mirror to lock-free cache for io-uring readers.
         self.inner
             .next_wake_atomic()
             .store(next_wake_to_atomic(next_wake_tick), Ordering::Release);

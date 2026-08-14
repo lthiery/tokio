@@ -665,9 +665,8 @@ pub(crate) struct UringHandle {
     /// nearly every round-trip wakes a fresh deep-idle worker (~15× the
     /// wakeups/round-trip at W64 vs W16 on a 64-core host, with
     /// `io_uring_enter` volume flat). Bounding the active ring set keeps
-    /// those rings warm and many-fds-deep (so one wake drains many CQEs —
-    /// the amortization the sharded-mio cross-group drain achieves on the
-    /// epoll side) while leaving surplus workers parked. Topology-agnostic:
+    /// those rings warm and many-fds-deep (so one wake drains many CQEs)
+    /// while leaving surplus workers parked. Topology-agnostic:
     /// wake cost on this hardware has no locality gradient, so the lever is
     /// wake *count*, not where the wake lands. See
     /// `.claude/STAGE-A-FINDINGS-uring-wake-cliff.md`.
@@ -1023,11 +1022,10 @@ impl UringHandle {
     /// already has the Arc, so we use [`RegistrationSet::allocate_existing`]
     /// rather than [`RegistrationSet::allocate`].
     ///
-    /// Note: at present only the sharded-mio backend is genuinely lazy
-    /// (its registry mutation is per-shard). The uring backend already
-    /// queues the SQE and lets the worker submit it, so eager and lazy
-    /// look identical from io_uring's perspective. We expose the shape
-    /// uniformly so the vtable stays clean.
+    /// Note: the uring backend already queues the SQE and lets the
+    /// worker submit it, so eager and lazy look identical from
+    /// io_uring's perspective. We expose the shape uniformly so the
+    /// vtable stays clean.
     pub(crate) fn register_local(
         &self,
         shared: &Arc<ScheduledIo>,

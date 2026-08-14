@@ -760,16 +760,3 @@ macro_rules! cfg_io_uring_reactor {
         )*
     };
 }
-
-macro_rules! cfg_io_sharded_mio {
-    ($($item:item)*) => {
-        $(
-            #[cfg(all(
-                feature = "io-sharded-mio",
-                feature = "rt-multi-thread",
-                target_os = "linux",
-            ))]
-            $item
-        )*
-    };
-}

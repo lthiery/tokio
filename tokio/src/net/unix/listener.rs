@@ -73,8 +73,8 @@ impl UnixListener {
     /// from a future driven by a tokio runtime, otherwise runtime can be set
     /// explicitly with [`Runtime::enter`](crate::runtime::Runtime::enter) function.
     ///
-    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
-    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// On `tokio_unstable` builds with the experimental `io-uring-reactor`
+    /// feature, the runtime lookup is deferred
     /// to the first I/O operation on the returned handle, so this
     /// constructor itself does not panic and may be called from any
     /// thread; the panic moves to the first readiness/IO call.
@@ -143,8 +143,8 @@ impl UnixListener {
     /// from a future driven by a tokio runtime, otherwise runtime can be set
     /// explicitly with [`Runtime::enter`](crate::runtime::Runtime::enter) function.
     ///
-    /// On `tokio_unstable` builds with the experimental `io-sharded-mio`
-    /// or `io-uring-reactor` features, the runtime lookup is deferred
+    /// On `tokio_unstable` builds with the experimental `io-uring-reactor`
+    /// feature, the runtime lookup is deferred
     /// to the first I/O operation on the returned handle, so this
     /// constructor itself does not panic and may be called from any
     /// thread; the panic moves to the first readiness/IO call.

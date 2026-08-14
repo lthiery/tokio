@@ -387,14 +387,3 @@ fn poll_path_only_smoke() {
         }
     });
 }
-
-/// `enable_sharded_mio()` + current_thread must fail loudly, not
-/// silently fall back to the traditional driver.
-#[cfg(feature = "io-sharded-mio")]
-#[test]
-#[should_panic(expected = "not supported on current_thread")]
-fn sharded_mio_rejected_on_current_thread() {
-    let _ = runtime::Builder::new_current_thread()
-        .enable_sharded_mio()
-        .build();
-}
