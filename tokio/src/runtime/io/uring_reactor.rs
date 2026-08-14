@@ -176,6 +176,25 @@ const VARIANT_CONTROL: u8 = 0x01;
 /// External-thread wake delivered via eventfd `POLL_ADD_MULTI`.
 const VARIANT_EVENTFD: u8 = 0x02;
 
+/// Single-shot completion op for the in-tree `tokio::fs` ops
+/// (open/read/write). The `key` indexes the [`FsOpSlab`] (a slab separate
+/// from this reactor's readiness `ops`); `gen` is unused (0) since fs ops
+/// are single-shot and their slot is not recycled while a CQE is in
+/// flight. Delivered to the slab by [`Reactor::drain_completions`].
+///
+/// [`FsOpSlab`]: super::uring_fs_ops::FsOpSlab
+const VARIANT_FS_OP: u8 = 0x03;
+
+/// Encode the `user_data` an fs-op SQE carries: the [`FsOpSlab`] slot index
+/// in the [`VARIANT_FS_OP`] namespace. Called by the [`GlobalRing`] op
+/// path when it stamps a freshly-allocated slot's SQE.
+///
+/// [`FsOpSlab`]: super::uring_fs_ops::FsOpSlab
+/// [`GlobalRing`]: super::uring_driver::GlobalRing
+pub(crate) fn fs_op_user_data(slot: usize) -> u64 {
+    encode(VARIANT_FS_OP, 0, slot as u32)
+}
+
 // ===== well-known slab keys =====
 
 /// Slab key for the eventfd `POLL_ADD_MULTI` registration. Inserted first.
@@ -294,6 +313,14 @@ pub(crate) struct Reactor {
     /// Reusable [`Self::drain_completions`] staging buffers; see
     /// [`DrainStaging`].
     staging: DrainStaging,
+
+    /// Slab of in-flight `tokio::fs` completion ops (open/read/write),
+    /// shared with the [`GlobalRing`] so any worker's `Op` future can poll
+    /// for its completion while a different worker holds the ring. The
+    /// holder delivers fs CQEs into it from [`Self::drain_completions`].
+    ///
+    /// [`GlobalRing`]: super::uring_driver::GlobalRing
+    fs_ops: Arc<super::uring_fs_ops::FsOpSlab>,
 }
 
 /// Thread-safe handle for waking a [`Reactor`] from a non-worker thread.
@@ -391,7 +418,38 @@ impl Reactor {
             zombies: 0,
             inline_reaped: false,
             staging: DrainStaging::default(),
+            fs_ops: Arc::new(super::uring_fs_ops::FsOpSlab::new()),
         })
+    }
+
+    /// Clone the shared fs-op slab. The [`GlobalRing`] holds one such clone
+    /// so its op path (register/poll/cancel) and this reactor's completion
+    /// drain both reach the same slots.
+    ///
+    /// [`GlobalRing`]: super::uring_driver::GlobalRing
+    pub(crate) fn fs_ops(&self) -> Arc<super::uring_fs_ops::FsOpSlab> {
+        Arc::clone(&self.fs_ops)
+    }
+
+    /// Stage an fs-op SQE (already stamped with its [`fs_op_user_data`]) for
+    /// submission on the shared ring. Called by the ring holder when it
+    /// drains a `PendingOp::SubmitFsOp` from the [`GlobalRing`] FIFO.
+    ///
+    /// # Safety
+    ///
+    /// The op's buffers / path / fd must stay valid for the whole operation.
+    /// They do: the `Op` future's data (or its `CancelData` after a drop)
+    /// lives in the [`FsOpSlab`] slot named by the SQE's `user_data` until
+    /// the terminal CQE frees it.
+    ///
+    /// [`FsOpSlab`]: super::uring_fs_ops::FsOpSlab
+    /// [`GlobalRing`]: super::uring_driver::GlobalRing
+    pub(crate) unsafe fn submit_fs_entry(
+        &mut self,
+        entry: io_uring::squeue::Entry,
+    ) -> io::Result<()> {
+        // SAFETY: forwarded to the caller (see this method's contract).
+        unsafe { self.push_sqe(entry) }
     }
 
     /// Obtain a thread-safe waker that can unblock this reactor's `park()`
@@ -788,6 +846,11 @@ impl Reactor {
         } = std::mem::take(&mut self.staging);
         debug_assert!(to_remove.is_empty() && readiness_deliveries.is_empty());
 
+        // Fs-op completions, delivered to the shared `FsOpSlab` after the CQ
+        // borrow drops. Empty in the common (readiness-only) drain, so no
+        // allocation unless a `tokio::fs` op actually completed this pass.
+        let mut fs_completions: Vec<(usize, cqueue::Entry)> = Vec::new();
+
         let cq = self.ring.completion();
         for cqe in cq {
             let (variant, gen, key) = decode(cqe.user_data());
@@ -847,6 +910,14 @@ impl Reactor {
                     saw_external_wake = true;
                 }
 
+                VARIANT_FS_OP => {
+                    // Single-shot fs op (open/read/write). The slot lives in
+                    // the separate `FsOpSlab`, not `self.ops`, so stage the
+                    // CQE and deliver after the CQ borrow drops. `gen` is
+                    // unused for fs ops (no in-flight recycle).
+                    fs_completions.push((key as usize, cqe));
+                }
+
                 _ => {
                     // Unknown variant — ignore. Could happen if a future
                     // op type is introduced and an old binary sees its
@@ -892,6 +963,13 @@ impl Reactor {
             io.wake(ready);
         }
 
+        // Deliver fs-op completions into the shared slab: flip the awaiting
+        // `Op`'s slot to Completed and wake it, or (if it was dropped) free
+        // the slot and close a delivered fd for the Open case.
+        for (idx, cqe) in fs_completions {
+            self.fs_ops.deliver(idx, cqe);
+        }
+
         // Hand the (emptied) buffers back for the next drain. `wake`
         // above can re-enter user code but not `drain_completions` (it
         // needs `&mut Reactor`), so nothing raced `self.staging` while
@@ -905,6 +983,44 @@ impl Reactor {
             drain_eventfd(external_fd);
         }
         saw_external_wake
+    }
+
+    /// Drain in-flight `tokio::fs` ops at runtime shutdown so their owned
+    /// buffers / fds are released and no CQE is left un-reaped. Mirrors the
+    /// legacy `UringContext::drop`: flush staged SQEs, drop already-completed
+    /// slots, then block for the terminal CQE of each op still in the kernel
+    /// (delivering it, which frees the slot and closes a delivered Open fd).
+    ///
+    /// Called by [`GlobalRing`]'s drop AFTER it has drained the op FIFO onto
+    /// this ring, so every fs SQE is already staged. Best-effort: a kernel
+    /// error breaks the loop rather than hanging shutdown.
+    ///
+    /// [`GlobalRing`]: super::uring_driver::GlobalRing
+    pub(crate) fn drain_fs_ops_on_shutdown(&mut self) {
+        // Already-landed completions carry no owed buffer; drop them.
+        self.fs_ops.reap_completed();
+
+        while self.fs_ops.has_pending_kernel_ops() {
+            // Submit any staged SQEs and block for at least one completion.
+            if self.ring.submit_and_wait(1).is_err() {
+                break;
+            }
+
+            let mut fs_completions: Vec<(usize, cqueue::Entry)> = Vec::new();
+            let cq = self.ring.completion();
+            for cqe in cq {
+                let (variant, _gen, key) = decode(cqe.user_data());
+                if variant == VARIANT_FS_OP {
+                    fs_completions.push((key as usize, cqe));
+                }
+                // Non-fs CQEs (readiness / eventfd) are irrelevant at
+                // shutdown; consuming them from the CQ is enough.
+            }
+            for (idx, cqe) in fs_completions {
+                self.fs_ops.deliver(idx, cqe);
+            }
+            self.fs_ops.reap_completed();
+        }
     }
 
     // ===== private helpers =====

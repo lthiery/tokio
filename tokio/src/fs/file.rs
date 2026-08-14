@@ -969,6 +969,21 @@ impl Inner {
         ))]
         {
             if let Ok(handle) = crate::runtime::Handle::try_current() {
+                // Uring-reactor runtime: the shared ring handles the in-tree
+                // fs ops, so route straight to the uring read (the `Op`
+                // future binds to the reactor via its backend seam). No
+                // legacy side-driver probe, so no second ring is created.
+                #[cfg(all(
+                    tokio_unstable,
+                    feature = "io-uring-reactor",
+                    feature = "rt",
+                    target_os = "linux",
+                ))]
+                if handle.inner.uring_handle().is_some() {
+                    let fd: crate::io::uring::utils::ArcFd = std;
+                    return Ok(spawn(Self::uring_read(fd, buf, max_buf_size)));
+                }
+
                 let driver_handle = handle.inner.driver().io();
 
                 if driver_handle.is_uring_ready(io_uring::opcode::Read::CODE) {

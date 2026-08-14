@@ -19,12 +19,18 @@ mod metrics;
 use metrics::IoDriverMetrics;
 
 cfg_io_uring_reactor! {
-    // Experimental per-worker io_uring reactor. Consumed by the
+    // Experimental single shared io_uring reactor. Consumed by the
     // multi_thread scheduler's `UringParker` when `enable_uring_reactor()`
     // is selected on the runtime builder.
     pub(crate) mod uring_reactor;
     pub(crate) mod uring_driver;
     pub(crate) mod uring_arm_table;
+
+    // The reactor-side slab for the in-tree `tokio::fs` io_uring ops, so a
+    // uring-reactor runtime routes fs completions onto the one shared ring
+    // instead of the legacy fs side-driver. `io-uring-reactor` implies the
+    // `io-uring` feature (the ops themselves), so this is unconditional.
+    pub(crate) mod uring_fs_ops;
 }
 
 // Backend-agnostic IoDriver (manual vtable). Populated by every io

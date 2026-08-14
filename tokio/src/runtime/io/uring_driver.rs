@@ -69,6 +69,15 @@ pub(crate) enum PendingOp {
     /// drain-time read observes the real key. The slab entry's Arc is
     /// released by the reactor on the terminal CQE, not here.
     Deregister { io: Arc<ScheduledIo> },
+    /// Submit a `tokio::fs` completion op (open/read/write). The `entry` is
+    /// already stamped with its [`FsOpSlab`] slot's `user_data` (via
+    /// [`fs_op_user_data`]); the holder just pushes it onto the ring. The
+    /// slot itself was allocated by [`UringHandle::register_op`] before this
+    /// op was queued, so the awaiting `Op` future can poll it immediately.
+    ///
+    /// [`FsOpSlab`]: super::uring_fs_ops::FsOpSlab
+    /// [`fs_op_user_data`]: super::uring_reactor::fs_op_user_data
+    SubmitFsOp { entry: io_uring::squeue::Entry },
 }
 
 
@@ -124,6 +133,13 @@ pub(crate) struct GlobalRing {
 
     /// Per-worker park slots, indexed by worker id.
     slots: Box<[GlobalParkSlot]>,
+
+    /// Slab of in-flight `tokio::fs` completion ops, shared with the
+    /// [`Reactor`]. The op path (`register_op` / `poll_op` / `cancel_op` on
+    /// [`UringHandle`]) touches it here; the ring holder delivers CQEs into
+    /// the same slab from `Reactor::drain_completions`. Held behind an `Arc`
+    /// so the future side never needs the ring `TryLock`.
+    fs_ops: Arc<super::uring_fs_ops::FsOpSlab>,
 }
 
 impl std::fmt::Debug for GlobalRing {
@@ -142,6 +158,7 @@ impl GlobalRing {
     fn new(num_workers: usize) -> io::Result<Self> {
         let reactor = Reactor::new()?;
         let ring_waker = reactor.external_waker();
+        let fs_ops = reactor.fs_ops();
         let mut slots = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             slots.push(GlobalParkSlot {
@@ -156,7 +173,13 @@ impl GlobalRing {
             ring_waker,
             ring_parked: std::sync::atomic::AtomicBool::new(false),
             slots: slots.into_boxed_slice(),
+            fs_ops,
         })
+    }
+
+    /// Shared fs-op slab accessor for the [`UringHandle`] op path.
+    fn fs_ops(&self) -> &Arc<super::uring_fs_ops::FsOpSlab> {
+        &self.fs_ops
     }
 
     /// Queue a register/deregister op and kick the ring — but only when
@@ -467,6 +490,24 @@ impl GlobalRing {
     }
 }
 
+impl Drop for GlobalRing {
+    /// Drain any in-flight `tokio::fs` ops before the ring is torn down, so
+    /// owned buffers / fds are released and no CQE is left un-reaped. Runs
+    /// at runtime shutdown, after worker threads have joined (the runtime
+    /// joins them before dropping the scheduler handle that owns the
+    /// `UringHandle`), so `try_lock` on the reactor always succeeds here.
+    fn drop(&mut self) {
+        if let Some(mut reactor) = self.reactor.try_lock() {
+            // First flush the op FIFO onto the ring so every queued fs SQE
+            // is staged (a `SubmitFsOp` may still be sitting here if the
+            // owning `Op` was created but never yet drained by a holder).
+            let pending = std::mem::take(&mut *self.pending_ops.lock());
+            apply_pending_ops(&mut reactor, pending);
+            reactor.drain_fs_ops_on_shutdown();
+        }
+    }
+}
+
 /// Translate a batch of [`PendingOp`]s into SQEs on `reactor`'s ring.
 ///
 /// The current holder of the shared ring drains the one queue. SQEs
@@ -492,6 +533,11 @@ pub(crate) fn apply_pending_ops(reactor: &mut Reactor, pending: Vec<PendingOp>) 
                 let (slab_key, slab_gen) = io.uring_slab_identity();
                 reactor.deregister(slab_key, slab_gen)
             }
+            // The op's `FsOpSlab` slot is already allocated and the SQE is
+            // stamped with its `user_data`; just stage it on the ring.
+            // SAFETY: the op's buffers / fd live in the slab slot named by
+            // the SQE until its terminal CQE (see `submit_fs_entry`).
+            PendingOp::SubmitFsOp { entry } => unsafe { reactor.submit_fs_entry(entry) },
         };
     }
 }
@@ -701,6 +747,57 @@ impl UringHandle {
     /// via [`Self::register_local`].
     pub(crate) fn allocate_scheduled_io(&self) -> Arc<ScheduledIo> {
         Arc::new(ScheduledIo::default())
+    }
+
+    // ===== tokio::fs completion-op path =====
+    //
+    // These three methods give the reactor the same op-submission surface
+    // the legacy fs side-driver exposes on `runtime::io::Handle`, so the
+    // upstream `Op<T>` future drives either backend unchanged. Submission
+    // routes through the shared-ring op FIFO (the future's thread may not be
+    // the ring holder); completion is delivered by the holder's
+    // `drain_completions`. See `uring_fs_ops::FsOpSlab`.
+
+    /// Register an fs op: allocate a slab slot, stamp the SQE's `user_data`
+    /// with it, and queue the SQE for submission on the shared ring.
+    /// Returns the slot index (the `Op` future's handle to its completion).
+    ///
+    /// # Safety
+    ///
+    /// The entry's operands (buffer, path, fd) must stay valid for the whole
+    /// operation. The `Op` future upholds this by keeping its `data` (or its
+    /// `CancelData` after a drop) alive in the slab slot until the terminal
+    /// CQE.
+    pub(crate) unsafe fn register_op(
+        &self,
+        entry: io_uring::squeue::Entry,
+        waker: std::task::Waker,
+    ) -> io::Result<usize> {
+        let slot = self.global.fs_ops().insert_waiting(waker);
+        let entry = entry.user_data(super::uring_reactor::fs_op_user_data(slot));
+        self.global.push_op(PendingOp::SubmitFsOp { entry });
+        Ok(slot)
+    }
+
+    /// Re-poll the fs op at `slot`. `Some(cqe)` once complete (slot freed),
+    /// `None` while still in flight (waker refreshed).
+    pub(crate) fn poll_op(
+        &self,
+        slot: usize,
+        waker: &std::task::Waker,
+    ) -> Option<io_uring::cqueue::Entry> {
+        self.global.fs_ops().poll(slot, waker)
+    }
+
+    /// Cancel the fs op at `slot` on `Op` drop: park the op's `data` in the
+    /// slot as `CancelData` so its buffers / fd outlive the in-flight SQE,
+    /// or clean up immediately if the completion already landed.
+    pub(crate) fn cancel_op<T: crate::runtime::driver::op::Cancellable>(
+        &self,
+        slot: usize,
+        data: Option<T>,
+    ) {
+        self.global.fs_ops().cancel(slot, data);
     }
 
     /// Queue a `POLL_REMOVE` for `io` onto the shared ring's op queue.

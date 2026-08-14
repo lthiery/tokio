@@ -295,6 +295,42 @@ impl Handle {
         Ok(index)
     }
 
+    /// Re-poll the op at `index`: `Some(cqe)` once the completion has landed
+    /// (slot freed), otherwise `None` with the waker refreshed. This is the
+    /// legacy side-driver's half of the backend-agnostic `Op<T>` protocol;
+    /// the uring reactor exposes the same method (`UringHandle::poll_op`).
+    /// The body is the relocated `Op::poll` `State::Polled` logic.
+    pub(crate) fn poll_op(
+        &self,
+        index: usize,
+        waker: &Waker,
+    ) -> Option<io_uring::cqueue::Entry> {
+        let mut ctx = self.get_uring().lock();
+        let lifecycle = ctx.ops.get_mut(index).expect("Lifecycle must be present");
+
+        match mem::replace(lifecycle, Lifecycle::Submitted) {
+            // Only replace the stored waker if it wouldn't wake the new one.
+            Lifecycle::Waiting(prev) if !prev.will_wake(waker) => {
+                *lifecycle = Lifecycle::Waiting(waker.clone());
+                None
+            }
+            Lifecycle::Waiting(prev) => {
+                *lifecycle = Lifecycle::Waiting(prev);
+                None
+            }
+            Lifecycle::Completed(cqe) => {
+                ctx.remove_op(index);
+                Some(cqe)
+            }
+            Lifecycle::Submitted => {
+                unreachable!("Submitted lifecycle should never be seen here");
+            }
+            Lifecycle::Cancelled(_) => {
+                unreachable!("Cancelled lifecycle should never be seen here");
+            }
+        }
+    }
+
     pub(crate) fn cancel_op<T: Cancellable>(&self, index: usize, data: Option<T>) {
         let mut guard = self.get_uring().lock();
         let ctx = &mut *guard;

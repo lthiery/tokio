@@ -96,7 +96,7 @@ rt-alt-timer = ["rt", "rt-multi-thread", "time"]
 # per-worker-timer-wheel design, or use the default (legacy timer + hybrid
 # park flow) for the lower-overhead path.
 # Requires `--cfg tokio_unstable` to enable.
-io-uring-reactor = ["rt", "rt-multi-thread", "time", "net", "dep:io-uring", "libc", "dep:slab", "dep:bytes"]
+io-uring-reactor = ["io-uring", "rt", "rt-multi-thread", "time", "net", "dep:io-uring", "libc", "dep:slab", "dep:bytes"]
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.
 taskdump = ["dep:backtrace"]
 
