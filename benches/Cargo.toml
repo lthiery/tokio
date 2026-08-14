@@ -8,6 +8,10 @@ license = "MIT"
 [features]
 test-util = ["tokio/test-util"]
 bench-uring-reactor = ["tokio/io-uring-reactor"]
+# fs on the legacy io_uring side-driver (its own ring) + mio net readiness:
+# the two-event-system "sidecar" arm of the unified-driver fs bench. Enables
+# the in-tree io_uring fs ops WITHOUT the reactor.
+bench-uring-sidecar = ["tokio/io-uring"]
 # Switches the benchmark runtime to `enable_alt_timer()` (per-worker timer
 # wheels) without enabling any sharded I/O. Used to isolate the cost of the
 # alternative timer from the cost of the I/O reactor in A/B benches like
@@ -23,6 +27,7 @@ rand_chacha = "0.9"
 [dev-dependencies]
 tokio-util = { version = "0.7.0", path = "../tokio-util", features = ["full"] }
 tokio-stream = { version = "0.1", path = "../tokio-stream" }
+tempfile = "3.1.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.42"
@@ -115,6 +120,11 @@ harness = false
 [[bench]]
 name = "net_tcp_echo"
 path = "net_tcp_echo.rs"
+harness = false
+
+[[bench]]
+name = "unified_fs"
+path = "unified_fs.rs"
 harness = false
 
 [[bench]]

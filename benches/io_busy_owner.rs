@@ -85,21 +85,21 @@ use tokio::runtime::{Builder, Runtime};
 // teardown machinery; each criterion bench function also dumps on
 // drop via `PhaseDumpOnDrop`.
 struct PhaseStats {
-    spawn_probes_us_sum:   AtomicU64,
+    spawn_probes_us_sum: AtomicU64,
     spawn_probes_us_count: AtomicU64,
-    pre_burner_sleep_us_sum:   AtomicU64,
+    pre_burner_sleep_us_sum: AtomicU64,
     pre_burner_sleep_us_count: AtomicU64,
-    spawn_burners_us_sum:   AtomicU64,
+    spawn_burners_us_sum: AtomicU64,
     spawn_burners_us_count: AtomicU64,
-    post_burner_sleep_us_sum:   AtomicU64,
+    post_burner_sleep_us_sum: AtomicU64,
     post_burner_sleep_us_count: AtomicU64,
-    kicker_thread_us_sum:   AtomicU64,
+    kicker_thread_us_sum: AtomicU64,
     kicker_thread_us_count: AtomicU64,
-    kick_to_first_wake_us_sum:   AtomicU64,
+    kick_to_first_wake_us_sum: AtomicU64,
     kick_to_first_wake_us_count: AtomicU64,
-    first_to_last_wake_us_sum:   AtomicU64,
+    first_to_last_wake_us_sum: AtomicU64,
     first_to_last_wake_us_count: AtomicU64,
-    iter_total_us_sum:   AtomicU64,
+    iter_total_us_sum: AtomicU64,
     iter_total_us_count: AtomicU64,
 }
 
@@ -172,7 +172,10 @@ impl PhaseStats {
             (
                 "pre_burner_sleep_us",
                 self.pre_burner_sleep_us_count.load(Ordering::Relaxed),
-                self.mean_us(&self.pre_burner_sleep_us_sum, &self.pre_burner_sleep_us_count),
+                self.mean_us(
+                    &self.pre_burner_sleep_us_sum,
+                    &self.pre_burner_sleep_us_count,
+                ),
             ),
             (
                 "spawn_burners_us",
@@ -182,7 +185,10 @@ impl PhaseStats {
             (
                 "post_burner_sleep_us",
                 self.post_burner_sleep_us_count.load(Ordering::Relaxed),
-                self.mean_us(&self.post_burner_sleep_us_sum, &self.post_burner_sleep_us_count),
+                self.mean_us(
+                    &self.post_burner_sleep_us_sum,
+                    &self.post_burner_sleep_us_count,
+                ),
             ),
             (
                 "kicker_thread_us",
@@ -192,12 +198,18 @@ impl PhaseStats {
             (
                 "kick_to_first_wake_us",
                 self.kick_to_first_wake_us_count.load(Ordering::Relaxed),
-                self.mean_us(&self.kick_to_first_wake_us_sum, &self.kick_to_first_wake_us_count),
+                self.mean_us(
+                    &self.kick_to_first_wake_us_sum,
+                    &self.kick_to_first_wake_us_count,
+                ),
             ),
             (
                 "first_to_last_wake_us",
                 self.first_to_last_wake_us_count.load(Ordering::Relaxed),
-                self.mean_us(&self.first_to_last_wake_us_sum, &self.first_to_last_wake_us_count),
+                self.mean_us(
+                    &self.first_to_last_wake_us_sum,
+                    &self.first_to_last_wake_us_count,
+                ),
             ),
             (
                 "iter_total_us",
@@ -272,8 +284,8 @@ async fn one_iter(num_burners: usize) -> Duration {
         let probe = tokio::spawn(async move {
             // First call to .readable() triggers lazy first-poll
             // registration of `a` on the running worker.
-            let async_a = AsyncFd::with_interest(a, Interest::READABLE)
-                .expect("AsyncFd::with_interest");
+            let async_a =
+                AsyncFd::with_interest(a, Interest::READABLE).expect("AsyncFd::with_interest");
             let mut guard = async_a.readable().await.expect("readable");
 
             // Stash the first-wake timestamp.
@@ -288,13 +300,8 @@ async fn one_iter(num_burners: usize) -> Duration {
             // anyone polled it again. We don't actually re-poll it;
             // `clear_ready` is for hygiene.
             let mut buf = [0u8; 1];
-            let _ = unsafe {
-                libc::read(
-                    async_a.get_ref().as_raw_fd(),
-                    buf.as_mut_ptr() as *mut _,
-                    1,
-                )
-            };
+            let _ =
+                unsafe { libc::read(async_a.get_ref().as_raw_fd(), buf.as_mut_ptr() as *mut _, 1) };
             guard.clear_ready();
         });
         probe_handles.push(probe);
@@ -323,9 +330,7 @@ async fn one_iter(num_burners: usize) -> Duration {
         .map(|_| {
             let stop_signal = stop_signal.clone();
             tokio::spawn(async move {
-                while !stop_signal.load(Ordering::Relaxed)
-                    && Instant::now() < burner_deadline
-                {
+                while !stop_signal.load(Ordering::Relaxed) && Instant::now() < burner_deadline {
                     std::hint::spin_loop();
                 }
             })
@@ -470,9 +475,7 @@ fn dump_phase_summary(label: &str) {
 
 fn bench_traditional(c: &mut Criterion) {
     let rt = rt_traditional();
-    c.bench_function("traditional/busy_owner_idle", |b| {
-        run_busy_owner(&rt, 0, b)
-    });
+    c.bench_function("traditional/busy_owner_idle", |b| run_busy_owner(&rt, 0, b));
     c.bench_function("traditional/busy_owner_3burners", |b| {
         run_busy_owner(&rt, NUM_WORKERS - 1, b)
     });

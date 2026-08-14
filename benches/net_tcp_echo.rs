@@ -163,7 +163,6 @@ fn rt_traditional() -> Runtime {
         .unwrap()
 }
 
-
 #[cfg(all(tokio_unstable, feature = "bench-uring-reactor", target_os = "linux"))]
 fn rt_uring() -> Runtime {
     let mut b = Builder::new_multi_thread();
