@@ -127,8 +127,14 @@ fn sleep_fires() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     });
     let elapsed = started.elapsed();
-    assert!(elapsed >= Duration::from_millis(40), "returned early: {elapsed:?}");
-    assert!(elapsed < Duration::from_secs(5), "took too long: {elapsed:?}");
+    assert!(
+        elapsed >= Duration::from_millis(40),
+        "returned early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "took too long: {elapsed:?}"
+    );
 }
 
 /// A remote `Handle::spawn` while the core holder is blocked in
@@ -216,8 +222,7 @@ fn core_migrates_across_block_on_threads() {
 /// and still completes via the remote-wake path.
 #[test]
 fn concurrent_block_on_two_threads() {
-    let _watchdog =
-        HangWatchdog::arm("concurrent_block_on_two_threads", Duration::from_secs(60));
+    let _watchdog = HangWatchdog::arm("concurrent_block_on_two_threads", Duration::from_secs(60));
     let rt = Arc::new(build_rt());
 
     let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
@@ -253,10 +258,9 @@ fn shutdown_on_other_thread() {
     let streams = rt.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (c, (s, _)) =
-            tokio::join!(async { TcpStream::connect(addr).await.unwrap() }, async {
-                listener.accept().await.unwrap()
-            });
+        let (c, (s, _)) = tokio::join!(async { TcpStream::connect(addr).await.unwrap() }, async {
+            listener.accept().await.unwrap()
+        });
         (listener, c, s)
     });
     std::thread::spawn(move || {

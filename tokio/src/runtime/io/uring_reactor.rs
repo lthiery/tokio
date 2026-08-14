@@ -61,11 +61,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// Submission queue depth. Per-worker, so small is fine: the steady-state
+/// Submission queue depth. One ring, so small is fine: the steady-state
 /// SQE rate is dominated by one POLL_ADD_MULTI per registered fd (submitted
-/// once, lives until dereg) plus a handful of per-park control ops. A worker
-/// with dozens of live registrations stages well under 64 SQEs between
-/// submissions.
+/// once, lives until dereg) plus a handful of per-park control ops. Even
+/// with dozens of live registrations the ring stages well under 64 SQEs
+/// between submissions.
 ///
 /// Sized at 128 — a comfortable 2–4× over observed peaks in
 /// `net_uring_bench.rs`. The prior 512 was needlessly large and, combined
@@ -135,10 +135,11 @@ const ZOMBIE_REAP_WATER: usize = 512;
 /// `io_uring_setup` calls taking 10–18 ms and some returning `-ENOMEM`.
 ///
 /// The permit is held only for the `build()` call itself. Setup happens
-/// once per worker at runtime startup and never again, so there is no
+/// once per runtime at startup and never again, so there is no
 /// steady-state cost. Serialization shifts the cold-start cost from
-/// "concurrent and quadratic in worker count" to "serial and linear",
-/// which is a win on both total wall time and tail latency.
+/// "concurrent and quadratic in the number of rings being set up at once"
+/// to "serial and linear", which is a win on both total wall time and tail
+/// latency.
 ///
 /// Note that this serialization is deliberately process-wide, not
 /// per-runtime: the contention is on kernel resources shared across all
@@ -236,13 +237,14 @@ enum OpState {
     Eventfd,
 }
 
-/// Per-worker io_uring reactor.
+/// The single shared io_uring reactor for the whole runtime.
 ///
-/// Owns a single [`IoUring`] instance. The owning worker is the sole submitter
-/// (enforced by `IORING_SETUP_SINGLE_ISSUER`); cross-worker wakeups come in via
-/// `MSG_RING` SQEs submitted on the sender's own ring; external-thread wakeups
-/// come in via a per-reactor [`eventfd`] registered with `POLL_ADD_MULTI` on
-/// this same ring.
+/// Owns the one [`IoUring`] instance, driven by whichever worker currently
+/// holds it (holder rotation). The ring is built WITHOUT
+/// `IORING_SETUP_SINGLE_ISSUER` so any worker can be the submitter; wakeups
+/// for a worker not currently holding the ring go through its condvar, and
+/// external-thread wakeups come in via the reactor's [`eventfd`] registered
+/// with `POLL_ADD_MULTI` on this ring.
 ///
 /// [`eventfd`]: https://man7.org/linux/man-pages/man2/eventfd.2.html
 pub(crate) struct Reactor {
@@ -252,8 +254,7 @@ pub(crate) struct Reactor {
     external_wake_fd: Arc<OwnedFd>,
 
     /// Active op slab keyed by `u32` (cast on insert; we cap at `u32::MAX`
-    /// in practice since the slab is per-worker and bounded by active fd
-    /// count).
+    /// in practice since the slab is bounded by active fd count).
     ops: Slab<SlotEntry>,
 
     /// Arm table for [`OpState::PollMulti`] slots. Publishes
@@ -281,7 +282,7 @@ pub(crate) struct Reactor {
     /// next `park`/`park_timeout`, which must then NOT block. The in-line
     /// reap runs between the parker's `begin_park` (park state already
     /// `PARKED`) and the blocking `submit_and_wait` — a window in which an
-    /// unparker may have delivered its eventfd/MSG_RING wake CQE. If the
+    /// unparker may have delivered its eventfd wake CQE. If the
     /// reap consumes that CQE, the unparker's `NOTIFIED` flag stands and
     /// every subsequent unpark skips the syscall, so blocking now would
     /// sleep on a wake that will never re-fire (observed as the second
@@ -479,16 +480,12 @@ impl Reactor {
         }
 
         // Publish the (key, gen) onto the ScheduledIo so a later
-        // deregister — local or cross-ring MSG_RING — can find this slot
-        // and gen-check it against a possible slab recycle in between.
-        // In per-worker mode both writes and reads for the local path
-        // happen on the owning worker, so Relaxed is sufficient, and
-        // cross-ring reads are ordered by the MSG_RING CQE itself. In
-        // global mode (`TOKIO_URING_GLOBAL=1`) a DIFFERENT holder thread
-        // may read these during a later drain; that read is correctly
-        // ordered only because every holder transition goes through the
-        // shared `TryLock`, whose SeqCst acquire/release pairs
-        // (`util/try_lock.rs`) chain the stores to the reads. Do not
+        // deregister can find this slot and gen-check it against a possible
+        // slab recycle in between. A DIFFERENT holder thread may read these
+        // during a later drain (the ring rotates between workers); that
+        // read is correctly ordered only because every holder transition
+        // goes through the shared `TryLock`, whose SeqCst acquire/release
+        // pairs (`util/try_lock.rs`) chain the stores to the reads. Do not
         // weaken the TryLock's orderings without revisiting this.
         scheduled_io.uring_slab_key.store(key_u32, Ordering::Relaxed);
         scheduled_io.uring_gen.store(gen, Ordering::Relaxed);
@@ -639,12 +636,6 @@ impl Reactor {
     ///   target's slab slot is freed at that point, dropping its buffer.
     /// * If the target op already completed, the cancel returns
     ///   `-ENOENT` on its own CQE and has no other effect.
-    /// * If the `target_user_data` refers to an op that lives on a
-    ///   different ring (e.g. the future was dropped from a worker
-    ///   other than the one that submitted), the cancel finds nothing
-    ///   on this ring and returns `-ENOENT`. The target op completes
-    ///   naturally on its owning ring in due course — the buffer is
-    ///   still safely released, just not as promptly.
     ///
     /// The cancel's own CQE is tagged with a fresh
     /// [`VARIANT_CONTROL`] slot which is freed on its single
@@ -675,10 +666,9 @@ impl Reactor {
     /// CQEs for every matching in-flight op. The cancel's own ack
     /// CQE is tagged with a fresh [`VARIANT_CONTROL`] slot.
     ///
-    /// Must be called on the worker that owns the target op's ring
-    /// (same-ring cancellation). Cross-ring cancels silently return
-    /// `-ENOENT` on this ring; the op naturally completes on its
-    /// home ring.
+    /// The target op lives on the same shared ring this cancel is
+    /// submitted to, so the match resolves against the in-flight op
+    /// directly.
     pub(crate) fn submit_cancel_fd(&mut self, fd: RawFd) -> io::Result<()> {
         let (ack_ud, ack_key) = self.alloc_control_slot();
         let builder = types::CancelBuilder::fd(types::Fd(fd)).all();

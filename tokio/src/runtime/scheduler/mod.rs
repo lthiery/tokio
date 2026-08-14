@@ -67,8 +67,8 @@ impl Handle {
     }
 
     /// The uring backend handle, when this runtime drives I/O through the
-    /// uring reactor (multi-thread: per-worker or `TOKIO_URING_GLOBAL=1`;
-    /// current_thread: forced global-ring). Used by the legacy time
+    /// uring reactor (single shared ring; multi-thread and current_thread
+    /// alike). Used by the legacy time
     /// driver's insert path to wake a parker that will honor a
     /// newly-lowered wheel minimum — the traditional `IoHandle` unpark
     /// targets a mio driver nobody polls under this backend.
@@ -84,14 +84,14 @@ impl Handle {
             Handle::MultiThread(h) => {
                 h.io_driver.as_ref().and_then(|d| d.as_uring())
             }
-            // current_thread + `enable_uring_reactor()`: forced
-            // global-ring mode. Timer-insert kicks route through here
+            // current_thread + `enable_uring_reactor()`: the same shared
+            // ring. Timer-insert kicks route through here
             // to `unpark_for_timer` → `GlobalRing::timer_kick`.
             Handle::CurrentThread(h) => h.uring_handle(),
         }
     }
 
-    /// The shared per-worker `io_uring` reactor handle, if the runtime was
+    /// The single shared `io_uring` reactor handle, if the runtime was
     /// Backend-agnostic I/O driver. Returns `Some` on every
     /// io-enabled runtime regardless of scheduler flavor:
     /// multi-thread + `IoFlavor::Traditional` and current-thread

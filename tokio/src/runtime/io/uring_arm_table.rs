@@ -1,22 +1,23 @@
-//! Cross-ring "arm" table for the per-worker uring reactor.
+//! "Arm" table for the single shared uring reactor.
 //!
-//! Each [`POLL_ADD_MULTI`] registration lives in a slab slot owned
-//! exclusively by its issuing worker. That slab is `!Sync`: `slab::Slab`'s
-//! backing `Vec` may reallocate on insert, invalidating any reference a
-//! peer worker tried to hold onto. So to let cross-thread paths affect a
-//! live registration — specifically, to set a "disarm this slot, cancel
-//! is inbound" flag — we publish a parallel, stably-addressed table
-//! keyed on the same slab index.
+//! Each [`POLL_ADD_MULTI`] registration lives in a slab slot on the one
+//! ring, mutated only by whichever worker currently holds (drives) it. That
+//! slab is `!Sync`: `slab::Slab`'s backing `Vec` may reallocate on insert,
+//! invalidating any reference another thread tried to hold onto. So to let
+//! cross-thread paths affect a live registration — specifically, to set a
+//! "disarm this slot, cancel is inbound" flag — we publish a parallel,
+//! stably-addressed table keyed on the same slab index.
 //!
 //! # Why not sharded-slab (the crate)?
 //!
 //! `sharded-slab::Slab::get(key)` returns a `Ref<'_>` guard that increments
 //! and decrements a page refcount on every access. That refcount exists
 //! to protect cross-shard readers from concurrent `remove` on another
-//! shard's entry. In our model the owning worker is the **sole remover**
-//! and it is also the **sole drain reader** — so the race the crate
-//! guards against cannot happen, and the two atomics per drain CQE are
-//! pure overhead on a path that runs once per readiness event.
+//! shard's entry. In our model the ring's current holder is the **sole
+//! remover** and it is also the **sole drain reader** (both serialized by
+//! the reactor's `TryLock`) — so the race the crate guards against cannot
+//! happen, and the two atomics per drain CQE are pure overhead on a path
+//! that runs once per readiness event.
 //!
 //! This table gives us the Sync structure we actually need: one
 //! `AtomicU64` per slot, no per-read refcount, and stable addressing
@@ -35,9 +36,10 @@
 //!
 //! Slot allocation is chunked: [`ARM_CHUNK`] slots per chunk, up to
 //! [`ARM_MAX_CHUNKS`] chunks. Each chunk is cache-line-aligned and each
-//! slot is itself cache-line-padded to prevent cross-worker false
-//! sharing on the disarm write. Chunks are allocated lazily by the
-//! owning worker on first `publish` into their index range; pointer
+//! slot is itself cache-line-padded to prevent cross-thread false
+//! sharing on the disarm write (other threads flip the disarm bit
+//! concurrently). Chunks are allocated lazily by the ring's current holder
+//! on first `publish` into their index range; pointer
 //! stability is preserved for the lifetime of the table.
 //!
 //! [`POLL_ADD_MULTI`]: io_uring::opcode::PollAdd::multi
@@ -49,8 +51,8 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 /// cold-start allocation granular while matching OS page size for locality.
 pub(crate) const ARM_CHUNK: usize = 64;
 
-/// Maximum chunks per worker. 4096 × 64 = 262 144 in-flight PollMulti
-/// slots per ring — several orders of magnitude above realistic peak fd
+/// Maximum chunks. 4096 × 64 = 262 144 in-flight PollMulti
+/// slots on the ring — several orders of magnitude above realistic peak fd
 /// counts. The per-`ArmTable` pointer array costs 32 KiB up front;
 /// individual chunks are allocated on demand.
 pub(crate) const ARM_MAX_CHUNKS: usize = 4096;
@@ -80,7 +82,7 @@ fn state_disarmed(state: u64) -> bool {
 }
 
 /// Single slot. Cache-line aligned to prevent false sharing on disarm
-/// writes from peer workers.
+/// writes from other threads.
 #[repr(C, align(64))]
 struct ArmSlot {
     state: AtomicU64,
@@ -111,11 +113,11 @@ impl ArmChunk {
     }
 }
 
-/// Chunked, cross-worker-accessible table of per-slot arm state.
+/// Chunked, cross-thread-accessible table of per-slot arm state.
 ///
-/// Indexed by slab key. Grown by the owning worker as new slab slots are
-/// allocated; peer workers read and RMW individual slot atoms without
-/// ever mutating the `chunks` array itself.
+/// Indexed by slab key. Grown by the ring's current holder as new slab
+/// slots are allocated; other threads read and RMW individual slot atoms
+/// without ever mutating the `chunks` array itself.
 pub(crate) struct ArmTable {
     /// Fixed-size pointer array. Each entry is lazily populated with a
     /// boxed `ArmChunk` on first `publish` into its index range.
@@ -127,7 +129,7 @@ pub(crate) struct ArmTable {
 impl std::fmt::Debug for ArmTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Don't walk the chunks — they contain live atomics touched by
-        // peer workers. Summarize capacity only.
+        // other threads. Summarize capacity only.
         f.debug_struct("ArmTable")
             .field("max_chunks", &self.chunks.len())
             .field("chunk_size", &ARM_CHUNK)
@@ -152,7 +154,7 @@ impl ArmTable {
     /// version asserted here; the panic killed the worker thread and the
     /// runtime hung on its deaf ring).
     ///
-    /// Called only from the owning worker on the `publish` path. The CAS
+    /// Called only from the ring's current holder on the `publish` path. The CAS
     /// handles the should-be-impossible race of two concurrent installs
     /// on the same chunk (single writer by contract, but the CAS keeps
     /// us safe if the contract is ever violated — e.g. by a test).
@@ -236,7 +238,7 @@ impl ArmTable {
     }
 
     /// Zero the slot after the kernel's terminal CQE for the slab entry
-    /// at `key`. Called by the owning worker on slab removal.
+    /// at `key`. Called by the ring's current holder on slab removal.
     ///
     /// After `clear`, a peer's `try_disarm` call with the old gen will
     /// observe gen mismatch and correctly no-op. Not strictly required
@@ -262,13 +264,12 @@ impl ArmTable {
         }
     }
 
-    /// Cross-worker: try to flip `DISARMED` from 0 to 1 for the slot
+    /// Cross-thread: try to flip `DISARMED` from 0 to 1 for the slot
     /// at `key`, conditional on the stored gen matching `expected_gen`.
     ///
     /// Returns `true` if the caller flipped the bit; the caller then
     /// owns the responsibility of kicking off the actual cancellation
-    /// (local POLL_REMOVE if on the owning worker, MSG_RING cross-ring
-    /// deregister otherwise).
+    /// (a POLL_REMOVE queued for the ring's current holder to submit).
     ///
     /// Returns `false` if:
     /// - the chunk containing `key` is uninstalled (no such slot);

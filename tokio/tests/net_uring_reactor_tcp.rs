@@ -162,7 +162,10 @@ fn tcp_read_blocks_then_wakes() {
         sock.read_exact(&mut buf).await.unwrap();
         let elapsed = start.elapsed();
         assert_eq!(&buf, b"delayed");
-        assert!(elapsed >= Duration::from_millis(20), "read returned too early: {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "read returned too early: {elapsed:?}"
+        );
         server.await.unwrap();
     });
 }

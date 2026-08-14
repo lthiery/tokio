@@ -36,19 +36,17 @@ use std::time::Duration;
 pub(crate) const EMPTY: usize = 0;
 pub(crate) const PARKED: usize = 1;
 pub(crate) const NOTIFIED: usize = 2;
-/// Global-ring mode only: parked on the per-worker condvar because another
-/// worker holds the shared ring. Mirrors the stock parker's
-/// `PARKED_CONDVAR`; in global mode [`PARKED`] plays the stock
-/// `PARKED_DRIVER` role.
+/// Parked on the per-worker condvar because another worker holds the
+/// shared ring. Mirrors the stock parker's `PARKED_CONDVAR`; [`PARKED`]
+/// plays the stock `PARKED_DRIVER` role (this worker is driving the ring).
 pub(crate) const PARKED_CONDVAR: usize = 3;
 
-/// An operation that needs to be submitted on a specific worker's ring.
+/// An operation that needs to be submitted on the shared ring.
 ///
-/// Cross-worker fd (de)registration goes through this queue because
-/// `IORING_OP_POLL_ADD` / `POLL_REMOVE` must be submitted on the ring where
-/// the registration lives (and `SINGLE_ISSUER` pins submission to the owning
-/// worker thread). Any thread — worker or external — can push ops here;
-/// only the owning worker drains.
+/// fd (de)registration goes through this queue because
+/// `IORING_OP_POLL_ADD` / `POLL_REMOVE` must be submitted on the one ring
+/// by whichever worker is currently holding (driving) it. Any thread,
+/// worker or external, can push ops here; only the current holder drains.
 #[derive(Debug)]
 pub(crate) enum PendingOp {
     /// Install a multi-shot POLL_ADD for `fd` / `interest`. The reactor
@@ -74,7 +72,7 @@ pub(crate) enum PendingOp {
 }
 
 
-/// Per-worker park slot for global-ring mode. The stock parker's `Inner`
+/// Per-worker park slot. The stock parker's `Inner`
 /// state machine, minus the driver reference (the shared ring lives on
 /// [`GlobalRing`], not per worker).
 struct GlobalParkSlot {
@@ -358,8 +356,7 @@ impl GlobalRing {
         // reactor's `inline_reaped` flag then degrades the park below to
         // a non-blocking pass (the reap can consume our own eventfd wake
         // CQE while `state == PARKED`, and unparkers who saw PARKED have
-        // already stopped re-delivering — same invariant as per-worker
-        // mode).
+        // already stopped re-delivering).
         apply_pending_ops(reactor, self.take_ops());
 
         let result = match duration {
@@ -367,7 +364,7 @@ impl GlobalRing {
             None => reactor.park(),
         };
         // Park errors are spurious wakes; liveness comes from the next
-        // unpark, exactly as in per-worker mode.
+        // unpark.
         let _ = result;
 
         self.ring_parked.store(false, Ordering::SeqCst);
@@ -472,8 +469,7 @@ impl GlobalRing {
 
 /// Translate a batch of [`PendingOp`]s into SQEs on `reactor`'s ring.
 ///
-/// Shared by the per-worker parker (each worker drains its own queue)
-/// and global-ring mode (the current holder drains the one queue). SQEs
+/// The current holder of the shared ring drains the one queue. SQEs
 /// are staged, not submitted — they flush with the next
 /// `submit_and_wait` or explicit non-blocking submit. (Not quite
 /// unconditionally: `Reactor::register`/`deregister` reap completions
@@ -547,7 +543,7 @@ pub(crate) fn process_legacy_timer_after_park(driver: &crate::runtime::driver::H
 /// Shared I/O handle for the uring-reactor backend.
 ///
 /// The Handle-side analog of the mio driver's [`Handle`]. Holds per-worker
-/// slots used for cross-worker and external unparking, plus the shared
+/// park slots used for cross-thread and external unparking, plus the shared
 /// registration set and metrics (reused wholesale from the mio side — they
 /// are backend-agnostic).
 ///
@@ -763,9 +759,8 @@ thread_local! {
     /// next park drains the queue) from external pushers (may need a
     /// kick). `None` means the caller is not on a worker thread.
     ///
-    /// Distinct from `LOCAL_REACTOR`: that TLS points at this worker's
-    /// `RefCell<Reactor>` (required for `MSG_RING` routing), while this
-    /// one is just the integer index.
+    /// This is just the integer index consulted by
+    /// [`GlobalRing::push_op`].
     static CURRENT_WORKER: Cell<Option<usize>> = const { Cell::new(None) };
 }
 

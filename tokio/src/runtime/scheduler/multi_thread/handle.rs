@@ -49,7 +49,7 @@ pub(crate) struct Handle {
     ///
     /// `IoFlavor::Traditional` preserves the historical shared-`IoStack`
     /// (`mio`/`epoll`) path. `IoFlavor::Uring` (when compiled in) is
-    /// the experimental per-worker `io_uring` reactor. See [`IoFlavor`].
+    /// the experimental single-ring `io_uring` reactor. See [`IoFlavor`].
     #[allow(dead_code)]
     pub(crate) io_flavor: IoFlavor,
 
