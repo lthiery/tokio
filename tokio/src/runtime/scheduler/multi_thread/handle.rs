@@ -48,14 +48,14 @@ pub(crate) struct Handle {
     /// I/O driver flavor selected by the runtime builder.
     ///
     /// `IoFlavor::Traditional` preserves the historical shared-`IoStack`
-    /// (`mio`/`epoll`) path. `IoFlavor::UringPerWorker` (when compiled in) is
+    /// (`mio`/`epoll`) path. `IoFlavor::Uring` (when compiled in) is
     /// the experimental per-worker `io_uring` reactor. See [`IoFlavor`].
     #[allow(dead_code)]
     pub(crate) io_flavor: IoFlavor,
 
     /// Backend-agnostic io-driver value (manual vtable). `Some` when
     /// the runtime selected a non-traditional flavor — currently
-    /// `IoFlavor::UringPerWorker` (built from
+    /// `IoFlavor::Uring` (built from
     /// [`IoDriver::from_uring`][fu]), with `LEGACY_MIO_VTABLE`
     /// from [`IoDriver::from_legacy_mio`][fl] otherwise — and `None`
     /// only for io-disabled runtimes.

@@ -473,7 +473,7 @@ impl Builder {
     pub fn enable_uring_reactor(&mut self) -> &mut Self {
         self.enable_io();
         self.enable_time();
-        self.io_flavor = IoFlavor::UringPerWorker;
+        self.io_flavor = IoFlavor::Uring;
         self
     }
 

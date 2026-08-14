@@ -1,14 +1,12 @@
-//! Per-worker io_uring reactor (experimental).
+//! Single shared io_uring reactor (experimental).
 //!
 //! This is an alternative to the mio-backed [`Driver`] that uses io_uring in
-//! readiness mode (via `POLL_ADD_MULTI`) for fd readiness events. Each worker
-//! owns its own ring, eliminating submission contention. Cross-worker wakeups
-//! use `MSG_RING`; external-thread wakeups use a per-worker eventfd registered
-//! with `POLL_ADD_MULTI`.
+//! readiness mode (via `POLL_ADD_MULTI`) for fd readiness events. There is
+//! one ring for the whole runtime, driven by whichever worker parks first
+//! (holder rotation, the stock mio `Parker` discipline); wakeups from other
+//! threads use an eventfd registered with `POLL_ADD_MULTI`.
 //!
-//! Scope for v1: readiness-model only — same semantics as the mio driver. Ops
-//! like `RECV_MULTI`, `SEND_ZC`, and `ACCEPT_MULTI` are out of scope and will
-//! layer on top later.
+//! Scope: readiness-model only, same semantics as the mio driver.
 //!
 //! # `user_data` encoding
 //!
@@ -34,10 +32,8 @@
 //!   enum match per CQE:
 //!     - [`VARIANT_POLL_MULTI`] — multi-shot `POLL_ADD` registration.
 //!     - [`VARIANT_CONTROL`] — one-shot control op (POLL_REMOVE ack,
-//!       TIMEOUT, MSG_RING send-ack) whose result we discard.
+//!       TIMEOUT) whose result we discard.
 //!     - [`VARIANT_EVENTFD`] — external-thread wake delivered via eventfd.
-//!     - [`VARIANT_MSG_RING_INCOMING`] — cross-worker wake delivered via
-//!       `MSG_RING` from a peer reactor.
 //!
 //! The encoding replaces the legacy `EXPOSE_IO`-pointer scheme: the kernel
 //! never sees a pointer, so pointer-reuse races are impossible. The
@@ -151,49 +147,6 @@ const ZOMBIE_REAP_WATER: usize = 512;
 /// in-process runtimes, etc.).
 static RING_SETUP_PERMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// `TOKIO_URING_DEFER_TASKRUN=0` → build rings WITHOUT
-/// `SINGLE_ISSUER`/`DEFER_TASKRUN`. Read once per process and cached so
-/// every ring in the process gets the same flags — a mid-run env change
-/// must not produce a mixed fleet.
-///
-/// Implied by [`uring_global_enabled`]: driver-holder rotation is
-/// illegal under `SINGLE_ISSUER` (the kernel binds the ring's submitter
-/// to one task), so the global-ring mode forces these flags off no
-/// matter what `TOKIO_URING_DEFER_TASKRUN` says.
-fn defer_taskrun_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var("TOKIO_URING_DEFER_TASKRUN").is_ok_and(|v| v.trim() == "0")
-    }) || uring_global_enabled()
-}
-
-/// `TOKIO_URING_COOP_TASKRUN=0` → build rings WITHOUT `COOP_TASKRUN`,
-/// so completion task_work IPIs its target instead of waiting for the
-/// target's next kernel entry. Read once per process and cached, same
-/// mixed-fleet rationale as the defer knob. Probe knob for the W1/W2
-/// echo anomaly — see the builder comment in [`Reactor::new`].
-fn coop_taskrun_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        std::env::var("TOKIO_URING_COOP_TASKRUN").is_ok_and(|v| v.trim() == "0")
-    })
-}
-
-/// `TOKIO_URING_GLOBAL=1` → Phase-1 global-ring mode: ONE shared ring
-/// for the whole runtime, driven by whichever worker parks first (the
-/// stock mio `Parker` discipline), instead of one ring per worker.
-/// Read once per process and cached, same rationale as the defer knob.
-///
-/// See `.claude/DESIGN-uring-global-phase1.md` in the repo root for the
-/// design, the task_work-pinning concern, and the pre-registered
-/// kill-criterion.
-pub(crate) fn uring_global_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("TOKIO_URING_GLOBAL").is_ok_and(|v| v.trim() == "1")
-    })
-}
-
 /// Reusable staging buffers for [`Reactor::drain_completions`].
 ///
 /// The drain cannot act on most CQEs while the CQ iterator borrows the
@@ -216,31 +169,16 @@ struct DrainStaging {
 /// Multi-shot `POLL_ADD` registration. The hot path.
 const VARIANT_POLL_MULTI: u8 = 0x00;
 
-/// One-shot control op (POLL_REMOVE ack, TIMEOUT, MSG_RING send-ack).
+/// One-shot control op (POLL_REMOVE ack, TIMEOUT).
 const VARIANT_CONTROL: u8 = 0x01;
 
 /// External-thread wake delivered via eventfd `POLL_ADD_MULTI`.
 const VARIANT_EVENTFD: u8 = 0x02;
 
-/// Cross-worker wake delivered via a peer's `MSG_RING`.
-const VARIANT_MSG_RING_INCOMING: u8 = 0x03;
-
 // ===== well-known slab keys =====
-//
-// These are populated as the very first inserts in `Reactor::new`, in this
-// order, so peers can encode the receiver's incoming-MSG_RING `user_data`
-// without per-worker advertisement.
 
 /// Slab key for the eventfd `POLL_ADD_MULTI` registration. Inserted first.
 const KEY_EVENTFD: u32 = 0;
-
-/// Slab key for the incoming-MSG_RING slot. Inserted second.
-const KEY_MSG_RING_INCOMING: u32 = 1;
-
-/// Encoded `user_data` value that peers stamp on `MsgRingData` SQEs targeting
-/// our ring. The slot is reactor-lifetime (gen never advances), so this is a
-/// universal constant — no per-peer advertisement is required.
-const MSG_RING_INCOMING_UD: u64 = encode(VARIANT_MSG_RING_INCOMING, 0, KEY_MSG_RING_INCOMING);
 
 /// Encoded `user_data` for the eventfd POLL_ADD_MULTI registration. Submitted
 /// once at construction and never re-issued.
@@ -296,12 +234,6 @@ enum OpState {
     /// The eventfd `POLL_ADD_MULTI` registration. Inserted at `Reactor::new`
     /// and never removed during the reactor's lifetime.
     Eventfd,
-
-    /// Receive slot for incoming `MSG_RING` wakes from peer reactors.
-    /// Inserted at `Reactor::new` and never removed. The slot itself has no
-    /// kernel registration; peers encode this slot's key into the
-    /// `MsgRingData` SQEs they push on their own rings.
-    MsgRingIncoming,
 }
 
 /// Per-worker io_uring reactor.
@@ -407,45 +339,20 @@ impl ExternalWaker {
 }
 
 impl Reactor {
-    /// Create a new reactor, performing `io_uring_setup` with the flags
-    /// required by the design:
+    /// Create the runtime's single shared reactor, performing
+    /// `io_uring_setup` with the flags the one-ring design needs:
     ///
-    /// - `IORING_SETUP_SINGLE_ISSUER` — submission is worker-exclusive.
-    /// - `IORING_SETUP_DEFER_TASKRUN` — task_work runs at `io_uring_enter`
-    ///   time, avoiding cross-CPU IPIs. Requires SINGLE_ISSUER.
     /// - `IORING_SETUP_COOP_TASKRUN` — cooperative task_work scheduling.
     ///
-    /// Kernel requirement: Linux 6.0+ (DEFER_TASKRUN landed in 5.19 but was
-    /// not mature until 6.x; we target 6.0 as the minimum supported kernel).
+    /// The ring is deliberately built WITHOUT `IORING_SETUP_SINGLE_ISSUER`
+    /// / `IORING_SETUP_DEFER_TASKRUN`. There is one ring for the whole
+    /// runtime, driven by whichever worker parks first (holder rotation,
+    /// the stock mio `Parker` discipline), so the submitter identity must
+    /// not be pinned to one thread: `SINGLE_ISSUER` would make a second
+    /// holder's `io_uring_enter` fail with `EEXIST`.
     ///
-    /// # Thread binding
-    ///
-    /// `new()` performs an initial `io_uring_enter` to submit the eventfd
-    /// registration. Because `IORING_SETUP_SINGLE_ISSUER` binds the ring's
-    /// submitter identity on the first `enter`, **`new()` must be called on
-    /// the same thread that will drive the reactor** — typically, the worker
-    /// thread itself during runtime spawn. Constructing a `Reactor` on one
-    /// thread and moving it to another will cause subsequent `park()` calls
-    /// to fail with `EEXIST`.
+    /// Kernel requirement: Linux 6.0+.
     pub(crate) fn new() -> io::Result<Self> {
-        Self::new_inner(!defer_taskrun_disabled())
-    }
-
-    /// Create a reactor whose ring is never bound to a single submitter:
-    /// no `SINGLE_ISSUER`, no `DEFER_TASKRUN`, regardless of the
-    /// `TOKIO_URING_DEFER_TASKRUN` knob. Required for rings driven by
-    /// rotating holders ([`GlobalRing`]) when global mode is *forced*
-    /// rather than env-selected — `defer_taskrun_disabled()` only folds
-    /// in [`uring_global_enabled`], so relying on [`Self::new`] there
-    /// would hand a current_thread runtime a SINGLE_ISSUER ring that a
-    /// stolen core then drives from another thread (kernel `EEXIST`).
-    ///
-    /// [`GlobalRing`]: crate::runtime::io::uring_driver::GlobalRing
-    pub(crate) fn new_relaxed() -> io::Result<Self> {
-        Self::new_inner(false)
-    }
-
-    fn new_inner(use_defer_taskrun: bool) -> io::Result<Self> {
         // Acquire the process-wide `io_uring_setup` permit. Released when
         // the scoped guard drops at the end of this block. `PoisonError`
         // is ignored: the permit only guards the build call, so a prior
@@ -456,27 +363,7 @@ impl Reactor {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut builder = IoUring::builder();
-            // `TOKIO_URING_DEFER_TASKRUN=0` drops SINGLE_ISSUER +
-            // DEFER_TASKRUN (COOP_TASKRUN stays). A/B knob for the
-            // uring-global design: DEFER_TASKRUN ties CQE posting to the
-            // owner's own `io_uring_enter`, which serializes completion
-            // processing onto one worker when fds are concentrated
-            // (TOKIO_URING_RING_CAP=1). Default on (historical behavior).
-            if use_defer_taskrun {
-                builder.setup_single_issuer().setup_defer_taskrun();
-            }
-            // `TOKIO_URING_COOP_TASKRUN=0` drops COOP_TASKRUN: completion
-            // task_work is queued with TWA_SIGNAL (IPI) instead of
-            // TWA_SIGNAL_NO_IPI, so CQEs post immediately instead of at
-            // the target task's next kernel entry. Probe knob for the
-            // W1/W2 echo median anomaly: perf_window showed both losing
-            // arms share deferred completion generation (task_add ≈
-            // complete, workers never in cqring_wait) while syscall and
-            // switch volume are exonerated — this is the falsification
-            // lever. IPI cost is expected to hurt at higher W.
-            if !coop_taskrun_disabled() {
-                builder.setup_coop_taskrun();
-            }
+            builder.setup_coop_taskrun();
             builder
                 .setup_cqsize(CQ_ENTRIES)
                 .build(SQ_ENTRIES)?
@@ -484,14 +371,11 @@ impl Reactor {
 
         let external_wake_fd = make_eventfd()?;
 
-        // Pre-allocate the two reactor-lifetime slab slots in the order
-        // required by the well-known-key constants. Slab fills the lowest
-        // free index first, so a fresh slab gives us key=0 then key=1.
+        // Pre-allocate the reactor-lifetime eventfd slab slot. Slab fills
+        // the lowest free index first, so a fresh slab gives us key=0.
         let mut ops: Slab<SlotEntry> = Slab::new();
         let k_evt = ops.insert(SlotEntry { gen: 0, state: OpState::Eventfd });
-        let k_msg = ops.insert(SlotEntry { gen: 0, state: OpState::MsgRingIncoming });
         debug_assert_eq!(k_evt as u32, KEY_EVENTFD, "well-known slab order changed");
-        debug_assert_eq!(k_msg as u32, KEY_MSG_RING_INCOMING, "well-known slab order changed");
 
         register_eventfd_multishot(&mut ring, external_wake_fd.as_raw_fd())?;
 
@@ -509,72 +393,20 @@ impl Reactor {
         })
     }
 
-    /// Raw fd of the underlying ring. Needed by other workers so they can
-    /// submit `MSG_RING` SQEs targeting this reactor's CQ.
-    pub(crate) fn ring_fd(&self) -> RawFd {
-        self.ring.as_raw_fd()
-    }
-
-    /// Clone the reactor's arm table. The [`UringHandle`] holds one
-    /// such clone per worker so cross-thread paths can observe per-slot
-    /// `(gen, DISARMED)` state without needing to reach the owner's
-    /// `Reactor` (which is `!Sync`). Called once at worker startup,
-    /// right after `ring_fd()` / `external_waker()`.
-    ///
-    /// [`UringHandle`]: super::uring_driver::UringHandle
-    pub(crate) fn arm_table(&self) -> Arc<ArmTable> {
-        Arc::clone(&self.arm_table)
-    }
-
     /// Obtain a thread-safe waker that can unblock this reactor's `park()`
     /// from any thread, including non-worker threads (spawn_blocking,
-    /// external code calling `waker.wake()`).
+    /// external code calling `waker.wake()`). The [`GlobalRing`] holds one
+    /// to wake whichever worker is driving the ring.
     ///
     /// The returned `ExternalWaker` is cheap to clone and may be held across
     /// runtime shutdown — waking a dead reactor is a no-op error which
     /// callers should ignore.
-    #[allow(dead_code)]
+    ///
+    /// [`GlobalRing`]: super::uring_driver::GlobalRing
     pub(crate) fn external_waker(&self) -> ExternalWaker {
         ExternalWaker {
             fd: self.external_wake_fd.clone(),
         }
-    }
-
-    /// Send a `MSG_RING` wake to another reactor's ring.
-    ///
-    /// Must be called from the worker that owns **this** reactor —
-    /// `SINGLE_ISSUER` requires submission on our own ring.
-    ///
-    /// Per the design, this flushes immediately (`io_uring_enter(submit,
-    /// min_complete=0)`) rather than deferring to our next park, so the
-    /// target worker receives the wake with low latency. Cost is one
-    /// non-blocking syscall, comparable to an eventfd write.
-    #[allow(dead_code)]
-    pub(crate) fn send_msg_ring(&mut self, target_ring_fd: RawFd) -> io::Result<()> {
-        // Allocate a Control slot for our own send-ack; it'll be removed on
-        // first CQE in `drain_completions`.
-        let (ack_ud, ack_key) = self.alloc_control_slot();
-
-        // The peer-side user_data is the universal MSG_RING_INCOMING_UD —
-        // every reactor pre-allocates that slot at the same well-known key.
-        let sqe = opcode::MsgRingData::new(
-            types::Fd(target_ring_fd),
-            0,                       // `result` — surfaces as CQE.result on receiver; unused.
-            MSG_RING_INCOMING_UD,    // CQE user_data posted on the *target* ring.
-            None,                    // no user_flags pass-through.
-        )
-        .build()
-        .user_data(ack_ud);
-
-        // SAFETY: MsgRingData references no user buffers; always safe.
-        if let Err(e) = unsafe { self.push_sqe(sqe) } {
-            self.free_control_slot(ack_key);
-            return Err(e);
-        }
-
-        // Flush immediately — do not wait for park. Non-blocking submit.
-        self.ring.submit()?;
-        Ok(())
     }
 
     /// Register interest in readiness events for `fd`.
@@ -1025,12 +857,6 @@ impl Reactor {
                     saw_external_wake = true;
                 }
 
-                VARIANT_MSG_RING_INCOMING => {
-                    // Cross-worker wake. No payload to dispatch — the
-                    // scheduler's task-queue checks happen around park().
-                    // Slot stays.
-                }
-
                 _ => {
                     // Unknown variant — ignore. Could happen if a future
                     // op type is introduced and an old binary sees its
@@ -1045,7 +871,7 @@ impl Reactor {
             // Check whether this is a PollMulti slot before removing;
             // only those slots have corresponding ArmTable state, and
             // we want to avoid unnecessary cache-line traffic on
-            // Control/Eventfd/MsgRingIncoming slot removals.
+            // Control/Eventfd slot removals.
             let is_poll_multi = matches!(
                 self.ops.get(key as usize).map(|e| &e.state),
                 Some(OpState::PollMulti { .. }),
@@ -1261,7 +1087,6 @@ mod tests {
             (VARIANT_POLL_MULTI, 0x00FF_FFFF, u32::MAX),
             (VARIANT_CONTROL, 0x12_3456, 0xDEAD_BEEF),
             (VARIANT_EVENTFD, 0, KEY_EVENTFD),
-            (VARIANT_MSG_RING_INCOMING, 0, KEY_MSG_RING_INCOMING),
         ];
         for (v, g, k) in cases {
             let ud = encode(v, g, k);
@@ -1274,22 +1099,20 @@ mod tests {
     /// compile time; verify the layout against the variant tags.
     #[test]
     fn well_known_constants_decode_correctly() {
-        let (v, g, k) = decode(MSG_RING_INCOMING_UD);
-        assert_eq!((v, g, k), (VARIANT_MSG_RING_INCOMING, 0, KEY_MSG_RING_INCOMING));
         let (v, g, k) = decode(EVENTFD_UD);
         assert_eq!((v, g, k), (VARIANT_EVENTFD, 0, KEY_EVENTFD));
     }
 
     /// Ring construction succeeds on a supported kernel. Smoke test for the
-    /// setup flags — if SINGLE_ISSUER/DEFER_TASKRUN aren't available we want
-    /// the failure surfaced here, not deep inside park().
+    /// setup flags — if the required flags aren't available we want the
+    /// failure surfaced here, not deep inside park().
     #[test]
     fn reactor_new_succeeds() {
         let reactor = Reactor::new();
         match reactor {
             Ok(r) => {
-                // Two well-known slots pre-allocated.
-                assert_eq!(r.ops.len(), 2);
+                // The single well-known eventfd slot is pre-allocated.
+                assert_eq!(r.ops.len(), 1);
             }
             Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
                 eprintln!("skipping: io_uring not supported on this kernel");
@@ -1342,56 +1165,6 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "park took suspiciously long: {elapsed:?}",
-        );
-    }
-
-    /// A reactor can send a MSG_RING wake to another reactor and unblock
-    /// its park. Exercises the cross-worker wake path with the universal
-    /// `MSG_RING_INCOMING_UD` constant.
-    #[test]
-    fn msg_ring_wakes_peer() {
-        use std::sync::mpsc;
-
-        let (fd_tx, fd_rx) = mpsc::channel::<RawFd>();
-        let (elapsed_tx, elapsed_rx) = mpsc::channel::<Duration>();
-
-        let receiver_thread = std::thread::spawn(move || {
-            let Ok(mut receiver) = Reactor::new() else {
-                fd_tx.send(-1).unwrap();
-                return;
-            };
-            fd_tx.send(receiver.ring_fd()).unwrap();
-
-            let start = std::time::Instant::now();
-            receiver.park().expect("receiver park should return");
-            elapsed_tx.send(start.elapsed()).unwrap();
-        });
-
-        let target_fd = fd_rx.recv().unwrap();
-        if target_fd == -1 {
-            eprintln!("skipping: receiver reactor unavailable");
-            receiver_thread.join().unwrap();
-            return;
-        }
-
-        let Ok(mut sender) = Reactor::new() else {
-            eprintln!("skipping: sender reactor unavailable");
-            return;
-        };
-
-        std::thread::sleep(Duration::from_millis(50));
-        sender.send_msg_ring(target_fd).expect("send_msg_ring should succeed");
-
-        receiver_thread.join().unwrap();
-        let elapsed = elapsed_rx.recv().unwrap();
-
-        assert!(
-            elapsed >= Duration::from_millis(25),
-            "receiver park returned too quickly: {elapsed:?}",
-        );
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "receiver park took suspiciously long: {elapsed:?}",
         );
     }
 

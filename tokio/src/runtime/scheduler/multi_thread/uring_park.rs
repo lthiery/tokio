@@ -1,118 +1,66 @@
-//! Per-worker `io_uring` parker for the multi-thread scheduler.
+//! Worker parker for the single-ring `io_uring` reactor.
 //!
-//! Each worker thread owns a [`UringParker`]. Unlike the traditional [`Parker`]
-//! (which shares an `IoStack` behind a `TryLock`), uring parkers are fully
-//! independent: each worker parks on its own ring, and cross-worker wakes are
-//! routed via `IORING_OP_MSG_RING`.
-//!
-//! # Lifecycle
-//!
-//! The [`Reactor`] is lazily constructed on the worker's first `park` call,
-//! **on the worker thread itself**. This is required by
-//! `IORING_SETUP_SINGLE_ISSUER`: the kernel binds the ring's submitter at the
-//! first `io_uring_enter` call, so the ring must be constructed on the thread
-//! that will drive it.
-//!
-//! Once constructed, the [`Reactor`]'s ring fd and [`ExternalWaker`] are
-//! published into the shared [`UringHandle`] so other threads can target us.
-//! The reactor itself is published via the `LOCAL_REACTOR` thread-local using
-//! a [`LocalReactorGuard`]; this lets *other* workers route `MSG_RING` SQEs
-//! through their own rings.
+//! There is one shared ring for the whole runtime. Each worker owns a
+//! [`UringParker`] holding a shared [`UringHandle`]; on park, workers race
+//! for the ring via [`crate::runtime::io::uring_driver::GlobalRing`] (the
+//! stock mio `Parker` discipline): whoever wins drives the ring in
+//! `io_uring_enter` and drains completions, everyone else condvar-parks
+//! until woken. Cross-thread wakes reach a ring-driving worker through the
+//! ring's eventfd and a condvar-parked worker through its condvar.
 //!
 //! # Timer integration
 //!
-//! Hybrid park flow. When the runtime is
-//! built with `enable_uring_reactor()` but without `enable_alt_timer()` (the
-//! default since the `rt-alt-timer` feature gate landed), each worker still
-//! owns its own ring but shares the legacy single-mutex timer wheel. The
-//! parker computes its `io_uring_enter` timeout as `min(scheduler_timeout,
-//! time_until_next_timer)` via [`Self::compute_legacy_timer_duration`] before
-//! parking, then advances the wheel via [`Self::process_legacy_timer_after_park`]
-//! after wake. With `enable_alt_timer()` the hybrid hooks short-circuit on
-//! `is_traditional() == false` and wheel processing is left to the alt-timer
-//! hooks in [`super::worker::run`].
+//! When the runtime is built with `enable_uring_reactor()` but without
+//! `enable_alt_timer()` (the default), the ring shares the legacy
+//! single-mutex timer wheel. The ring holder computes its `io_uring_enter`
+//! timeout as `min(scheduler_timeout, time_until_next_timer)` via
+//! [`compute_legacy_timer_duration`] before parking, then advances the
+//! wheel via [`process_legacy_timer_after_park`] after wake. Condvar
+//! parkers leave timers to the holder.
 //!
-//! [`Parker`]: super::park::Parker
-//! [`Reactor`]: crate::runtime::io::uring_reactor::Reactor
-//! [`ExternalWaker`]: crate::runtime::io::uring_reactor::ExternalWaker
 //! [`UringHandle`]: crate::runtime::io::uring_driver::UringHandle
-//! [`LocalReactorGuard`]: crate::runtime::io::uring_driver::LocalReactorGuard
 
 use crate::loom::sync::Arc;
 use crate::runtime::driver;
 use crate::runtime::io::uring_driver::{
-    apply_pending_ops, clear_local_reactor, compute_legacy_timer_duration,
-    install_local_reactor_raw, process_legacy_timer_after_park, set_current_worker, UringHandle,
+    compute_legacy_timer_duration, process_legacy_timer_after_park, set_current_worker, UringHandle,
 };
-use crate::runtime::io::uring_reactor::Reactor;
 use crate::runtime::scheduler::multi_thread::park::HadDriver;
 
-use std::cell::RefCell;
 use std::time::Duration;
 
-// The `CURRENT_WORKER` thread-local these wrap moved to `uring_driver.rs`
+// The `CURRENT_WORKER` thread-local these wrap lives in `uring_driver.rs`
 // (it is consulted by `GlobalRing::push_op`, which must compile for
 // `rt`-only builds where this module does not exist). The multi-thread
 // worker code keeps addressing it through this module.
-//
-// `current_worker_index` has no multi-thread callers today — `unpark` no
-// longer self-short-circuits (see `UringUnparker::unpark`) and
-// `UringHandle::add_source` uses pure round-robin placement — but stays
-// re-exported for the planned task-local placement path documented on
-// `UringHandle::add_source`.
 #[allow(unused_imports)]
 pub(crate) use crate::runtime::io::uring_driver::{clear_current_worker, current_worker_index};
 
 /// Publish the current worker index from the worker's `run` entry point,
-/// before any task executes on this thread. Separate from the parker-side
-/// install because the parker runs its lazy init on the *first park*, which
-/// is too late for tasks that register fds during the pre-park burst at
-/// startup.
+/// before any task executes on this thread. `GlobalRing::push_op` reads it
+/// to tell worker pushers (whose own next park drains the op queue) from
+/// external pushers (which may need a kick).
 ///
 /// Paired with the `ClearUringTls` teardown guard in `worker.rs`, which
-/// already calls [`clear_current_worker`] on worker exit.
+/// calls [`clear_current_worker`] on worker exit.
 pub(crate) fn set_current_worker_early(idx: usize) {
     set_current_worker(idx);
 }
 
-/// Per-worker parker for the `io_uring` backend.
+/// Per-worker parker for the single-ring `io_uring` backend.
 ///
-/// Each [`UringParker`] is distinct and non-cloneable — worker threads own
-/// exclusive rings. Unparking is done via a separate [`UringUnparker`] that
-/// shares the [`UringHandle`] and the worker index.
+/// Cheap: just a worker index and a shared [`UringHandle`]. All ring state
+/// lives on the shared `GlobalRing` inside the handle.
 pub(crate) struct UringParker {
-    /// Zero-based worker index. Matches the slot in [`UringHandle::workers`].
+    /// Zero-based worker index. Selects this worker's park slot in the
+    /// shared `GlobalRing`.
     idx: usize,
 
-    /// Shared coordination handle.
+    /// Shared coordination handle (owns the one ring).
     handle: Arc<UringHandle>,
-
-    /// Lazily-constructed per-worker reactor.
-    ///
-    /// Wrapped in a [`Box`] for address stability — we install a
-    /// `*const RefCell<Reactor>` into the `LOCAL_REACTOR` thread-local, and
-    /// that pointer must remain valid until cleared. `Option` tracks the
-    /// lazy-init state.
-    ///
-    /// Access discipline: the worker thread takes `.borrow_mut()` during
-    /// `park`; other threads observing via `LOCAL_REACTOR` only do so from
-    /// contexts where the owning worker is **not** inside its own park
-    /// (either mid-task on a different worker, or inside the kernel via
-    /// `io_uring_enter` on this worker). The two time-windows are strictly
-    /// non-overlapping on the same thread, so `borrow_mut` never contends.
-    reactor: Option<Box<RefCell<Reactor>>>,
-
-    /// `true` once we have installed `reactor` into the thread-local
-    /// `LOCAL_REACTOR` slot on the worker thread. Tracked separately from
-    /// `reactor.is_some()` because the install happens on *the worker
-    /// thread*, which is not necessarily the thread that constructed the
-    /// `UringParker`. Clearing the TLS on `Drop` must only happen if we
-    /// actually installed it here.
-    tls_installed: bool,
 }
 
-/// Unparker counterpart to [`UringParker`]. Cheap to clone — just an `Arc`
-/// and a worker index.
+/// Unparker counterpart to [`UringParker`]. Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct UringUnparker {
     idx: usize,
@@ -120,16 +68,9 @@ pub(crate) struct UringUnparker {
 }
 
 impl UringParker {
-    /// Construct a parker for worker `idx`. The reactor is not built yet;
-    /// that happens on first `park` so it lands on the worker's own thread
-    /// (required by `IORING_SETUP_SINGLE_ISSUER`).
+    /// Construct a parker for worker `idx`.
     pub(crate) fn new(idx: usize, handle: Arc<UringHandle>) -> Self {
-        Self {
-            idx,
-            handle,
-            reactor: None,
-            tls_installed: false,
-        }
+        Self { idx, handle }
     }
 
     /// Cheap handle to wake this worker from another thread.
@@ -140,8 +81,7 @@ impl UringParker {
         }
     }
 
-    /// Shared [`UringHandle`] — used by `Handle::add_source` et al. to route
-    /// fd registrations.
+    /// Shared [`UringHandle`].
     #[allow(dead_code)]
     pub(crate) fn handle(&self) -> &Arc<UringHandle> {
         &self.handle
@@ -149,13 +89,7 @@ impl UringParker {
 
     /// Park the worker until woken.
     pub(crate) fn park(&mut self, driver: &driver::Handle) -> HadDriver {
-        if self.handle.global_ring().is_some() {
-            return self.park_global(driver, None);
-        }
-        let park_dur = self.compute_legacy_timer_duration(driver, None);
-        self.park_internal(park_dur);
-        self.process_legacy_timer_after_park(driver);
-        HadDriver::Yes
+        self.park_global(driver, None)
     }
 
     /// Park with a maximum duration.
@@ -164,37 +98,25 @@ impl UringParker {
         driver: &driver::Handle,
         duration: Duration,
     ) -> HadDriver {
-        if self.handle.global_ring().is_some() {
-            return self.park_global(driver, Some(duration));
-        }
-        let park_dur = self.compute_legacy_timer_duration(driver, Some(duration));
-        self.park_internal(park_dur);
-        self.process_legacy_timer_after_park(driver);
-        HadDriver::Yes
+        self.park_global(driver, Some(duration))
     }
 
-    /// Global-ring (`TOKIO_URING_GLOBAL=1`) park flow: race for the
-    /// shared ring, drive it if won, condvar-park otherwise — the stock
-    /// `Parker` discipline (see `GlobalRing`).
+    /// Race for the shared ring, drive it if won, condvar-park otherwise
+    /// (the stock `Parker` discipline; see `GlobalRing`).
     ///
     /// Timer split: the ring holder parks with the legacy-timer-min'd
     /// deadline and processes the wheel after waking (it is "the driver"
-    /// in the stock sense); condvar parkers use the raw scheduler
-    /// timeout and leave timers to the holder.
+    /// in the stock sense); condvar parkers use the raw scheduler timeout
+    /// and leave timers to the holder.
     fn park_global(&mut self, driver: &driver::Handle, duration: Option<Duration>) -> HadDriver {
-        let g = self
-            .handle
-            .global_ring()
-            .expect("park_global called without a global ring")
-            .clone();
-        let driver_duration = self.compute_legacy_timer_duration(driver, duration);
+        let g = Arc::clone(self.handle.global_ring());
+        let driver_duration = compute_legacy_timer_duration(driver, duration);
         let drove_ring = g.park_worker(self.idx, driver_duration, duration);
         // Release ScheduledIos queued for drop and advance the legacy
         // wheel. Both are cheap no-ops when there is nothing due, so we
-        // run them regardless of whether we actually held the ring —
-        // distinguishing would buy little and cost plumbing.
+        // run them regardless of whether we actually held the ring.
         self.handle.release_pending_registrations();
-        self.process_legacy_timer_after_park(driver);
+        process_legacy_timer_after_park(driver);
         // Report the stock parker's HadDriver distinction faithfully: a
         // condvar-parked (or notified-fast-path) worker did not hold the
         // driver, and saying it did makes the unstable
@@ -206,196 +128,27 @@ impl UringParker {
         }
     }
 
-    /// Hybrid park flow: legacy timer + uring I/O.
-    ///
-    /// Thin wrapper over the flavor-agnostic
-    /// [`compute_legacy_timer_duration`] in `uring_driver.rs` (hoisted
-    /// there so the current_thread park path shares one copy). See that
-    /// function for the min(scheduler, next-timer) rationale.
-    fn compute_legacy_timer_duration(
-        &self,
-        driver: &driver::Handle,
-        scheduler_timeout: Option<Duration>,
-    ) -> Option<Duration> {
-        compute_legacy_timer_duration(driver, scheduler_timeout)
-    }
+    /// Shutdown the parker. Nothing thread-local to tear down in
+    /// single-ring mode; the shared ring is dropped with the handle.
+    pub(crate) fn shutdown(&mut self, _driver: &driver::Handle) {}
 
-    /// Mirror of [`Self::compute_legacy_timer_duration`] for the post-park
-    /// path: process expired timers under the legacy flavor.
-    fn process_legacy_timer_after_park(&self, driver: &driver::Handle) {
-        process_legacy_timer_after_park(driver);
-    }
-
-    /// Shutdown the parker. Clears the TLS install first (un-publishing the
-    /// reactor), then drops the reactor itself. Idempotent.
-    ///
-    /// Must be called on the worker thread. In practice the `Drop` impl
-    /// also clears the TLS as a belt-and-braces measure.
-    pub(crate) fn shutdown(&mut self, _driver: &driver::Handle) {
-        if self.tls_installed {
-            clear_local_reactor();
-            clear_current_worker();
-            self.tls_installed = false;
-        }
-        self.reactor.take();
-    }
-
-    fn park_internal(&mut self, duration: Option<Duration>) {
-        // CRITICAL: publish ring_fd + external_waker *before* transitioning
-        // `park_state` to PARKED. An unparker that observes `park_state ==
-        // PARKED` will attempt to deliver a wake via those channels; if they
-        // are not yet published, the wake is silently dropped and the park
-        // below blocks forever.
-        //
-        // Lazy-init on this thread, the first time we park.
-        self.ensure_reactor_installed();
-
-        // Consume any pending notification without going to the kernel.
-        // It is critical that this happens *after* `ensure_reactor_installed`
-        // so that the two atomics (`ring_fd`, `external_waker`) are already
-        // visible by the time `park_state == PARKED` is observable.
-        if self.handle.begin_park(self.idx) {
-            // Even on the NOTIFIED fast path, we drain any fd (de)register
-            // ops that landed on our queue. Otherwise a burst of
-            // `Registration::new` followed immediately by an unpark would
-            // skip the kernel round-trip and leave `POLL_ADD_MULTI` SQEs
-            // un-submitted until the next real park.
-            self.drain_pending_ops_and_submit();
-            return;
-        }
-
-        // `reactor` is Some after `ensure_reactor_installed`.
-        let cell: &RefCell<Reactor> = self
-            .reactor
-            .as_deref()
-            .expect("reactor installed");
-        let mut reactor = cell.borrow_mut();
-
-        // Apply any fd registration / deregistration ops that peer threads
-        // queued for us. These become SQEs on our ring and flush together
-        // with the park's `submit_and_wait`.
-        let pending = self.handle.take_pending_ops(self.idx);
-        apply_pending_ops(&mut reactor, pending);
-
-        let result = match duration {
-            None => reactor.park(),
-            Some(dur) if dur.is_zero() => reactor.park_timeout(Duration::ZERO),
-            Some(dur) => reactor.park_timeout(dur),
-        };
-
-        // Park errors are treated as spurious — correctness does not depend
-        // on them, just liveness (another unpark will arrive).
-        let _ = result;
-
-        drop(reactor);
-
-        // Release any `ScheduledIo`s whose `Registration` was dropped while
-        // we were parked; we do it on the owning thread so the drop runs
-        // here (and so it interleaves naturally with the worker loop).
-        self.handle.release_pending_registrations();
-
-        self.handle.end_park(self.idx);
-    }
-
-    /// Fast-path variant used when `begin_park` consumed a NOTIFIED — we
-    /// skip the syscall but still need to flush any fd-registration ops
-    /// so they become visible to the kernel before we return to the task
-    /// loop.
-    fn drain_pending_ops_and_submit(&mut self) {
-        let pending = self.handle.take_pending_ops(self.idx);
-        if pending.is_empty() {
-            return;
-        }
-        if let Some(cell) = self.reactor.as_deref() {
-            let mut reactor = cell.borrow_mut();
-            apply_pending_ops(&mut reactor, pending);
-            // Non-blocking flush so the kernel sees the SQEs; we'll drain
-            // their completions on the next real park.
-            let _ = reactor.park_timeout(Duration::ZERO);
-        }
-    }
-
-    /// Build the reactor on the current thread (required for
-    /// `IORING_SETUP_SINGLE_ISSUER`) and then block until every sibling
-    /// worker has done the same. Intended to be called once, at the top of
-    /// the scheduler's worker entry point, before any task is polled.
-    ///
-    /// Without this, workers race to initialize their rings: worker 0 may
-    /// start polling tasks while worker 3's `io_uring_setup` is still in
-    /// progress. Tests that observe durations across workers (e.g.
-    /// `tcp_read_blocks_then_wakes`, which times a server's sleep from the
-    /// client's perspective) see the resulting wall-clock skew as spurious
-    /// failures. The startup barrier in [`UringHandle`] collapses that
-    /// skew to roughly the monotonic clock's resolution.
-    ///
-    /// `ensure_reactor_installed` remains callable from the lazy
-    /// first-park path so a parker that was never given an eager-init
-    /// opportunity (e.g. isolated unit tests that drive `park` directly)
-    /// still initializes correctly on first use.
+    /// Startup barrier. The one shared ring is built with the handle, so
+    /// there is no per-worker reactor to construct here; we only wait so
+    /// every worker starts polling at the same wall-clock moment (see the
+    /// `start_barrier` rationale on `UringHandle`).
     pub(crate) fn eager_init_and_sync(&mut self) {
-        // Global-ring mode has no per-worker reactor to build — the one
-        // shared ring was constructed with the handle. The startup
-        // barrier still applies (same cross-worker clock-skew rationale).
-        if self.handle.global_ring().is_none() {
-            self.ensure_reactor_installed();
-        }
         self.handle.wait_for_start();
-    }
-
-    /// Lazy-initialize the reactor and install it into the thread-local
-    /// `LOCAL_REACTOR` slot. Idempotent — subsequent calls are no-ops.
-    ///
-    /// Must be called on the worker thread that will drive the reactor.
-    fn ensure_reactor_installed(&mut self) {
-        if self.reactor.is_some() {
-            return;
-        }
-
-        let reactor = Reactor::new().expect(
-            "failed to construct per-worker io_uring Reactor; \
-             kernel must support io_uring with SINGLE_ISSUER + DEFER_TASKRUN \
-             (Linux 6.0+)",
-        );
-
-        // Publish ring_fd + external_waker so other threads can target us.
-        self.handle.register_worker(
-            self.idx,
-            reactor.ring_fd(),
-            reactor.external_waker(),
-            reactor.arm_table(),
-        );
-
-        let boxed = Box::new(RefCell::new(reactor));
-        let cell_ptr: *const RefCell<Reactor> = &*boxed;
-        self.reactor = Some(boxed);
-
-        // SAFETY: `cell_ptr` points into the `Box` owned by `self.reactor`.
-        // The `Box`'s address is stable for its lifetime. We clear the TLS
-        // slot in `shutdown` and in `Drop` before the Box is dropped, so
-        // the pointer never outlives the allocation.
-        unsafe {
-            install_local_reactor_raw(cell_ptr);
-        }
-        // Publish the worker index alongside the reactor pointer so that
-        // `UringHandle::add_source` can prefer this worker for fds being
-        // registered from tasks currently executing here. Paired with the
-        // `clear_current_worker` calls in `shutdown` / `Drop`.
-        set_current_worker(self.idx);
-        self.tls_installed = true;
     }
 }
 
 /// Converts an unwinding uring worker thread into a loud process abort.
 ///
 /// Armed on the worker's `run` stack (see `worker::run`) for the whole
-/// worker lifetime. A uring worker that dies by panic leaves a *deaf
-/// ring* behind: its registrations still point at a CQ nobody will ever
-/// drain, so sibling workers and `block_on` callers wait forever on
-/// wakes that cannot arrive. That failure mode is strictly worse than a
-/// crash — the ArmTable-exhaustion panic presented as a silent 3-hour
-/// bench hang (runs `d7800935`/`6c0fd25e`) before it was root-caused.
-/// There is no in-process recovery: ring registrations cannot be
-/// migrated off a dead worker's ring.
+/// worker lifetime. A uring worker that dies by panic while holding the
+/// ring leaves a deaf ring behind: registrations still point at a CQ
+/// nobody will drain, so sibling workers and `block_on` callers wait
+/// forever on wakes that cannot arrive. That failure mode is strictly
+/// worse than a crash.
 ///
 /// Task panics never reach this guard (the task harness catches them);
 /// only scheduler/driver invariant violations unwind through `run`.
@@ -408,8 +161,8 @@ impl Drop for AbortIfPanicking {
         if std::thread::panicking() {
             eprintln!(
                 "uring worker {} died by panic; aborting the process: \
-                 a dead worker's ring cannot be drained or migrated and \
-                 the runtime would otherwise hang silently",
+                 a dead worker holding the shared ring cannot be drained \
+                 and the runtime would otherwise hang silently",
                 self.worker,
             );
             std::process::abort();
@@ -417,46 +170,18 @@ impl Drop for AbortIfPanicking {
     }
 }
 
-impl Drop for UringParker {
-    fn drop(&mut self) {
-        // Belt-and-braces TLS clear. If `shutdown` ran, this is a no-op; if
-        // not, we clear on this thread. If the parker is being dropped on
-        // a different thread than it was installed on (not expected in
-        // normal runtime shutdown — workers drop their own parkers), the
-        // `clear_local_reactor` / `clear_current_worker` calls affect this
-        // thread's TLS, which is harmless because they were unset to begin
-        // with.
-        if self.tls_installed {
-            clear_local_reactor();
-            clear_current_worker();
-            self.tls_installed = false;
-        }
-    }
-}
-
 impl UringUnparker {
-    /// Unpark the associated worker. Fast path is an atomic flag flip; if
-    /// the worker was actually parked, a `MSG_RING` (from a worker-thread
-    /// caller) or `eventfd` (external) write delivers the wake.
+    /// Unpark the associated worker. Routes through `handle.unpark`, which
+    /// swaps the worker's park slot to `NOTIFIED` and only performs a
+    /// syscall / condvar notify when the worker was actually parked, so a
+    /// self-wake costs only an atomic swap.
     ///
     /// We always go through `handle.unpark`, even when the caller is the
-    /// target worker itself. The `handle.unpark` path swaps `park_state`
-    /// to `NOTIFIED` and only writes the eventfd / submits a `MSG_RING`
-    /// SQE when the previous state was `PARKED`, so the self-wake case
-    /// still costs only an atomic swap — never a syscall.
-    ///
-    /// An earlier version short-circuited on
-    /// `current_worker_index() == Some(self.idx)` under the assumption
-    /// that the worker was mid-task and would pick up whatever was just
-    /// pushed once control returned to the worker loop. That assumption
-    /// is unsound: `multi_thread::worker::transition_to_parked` calls
-    /// `notify_if_work_pending` → `notify_parked_local`, which can pop
-    /// the *calling* worker off the sleepers list and invoke its own
-    /// unparker. Short-circuiting there leaves `park_state == EMPTY`,
-    /// lets the imminent `begin_park` CAS succeed, the worker blocks in
-    /// `io_uring_enter`, and `num_searching` stays at 1 so subsequent
-    /// `notify_parked_remote` calls are skipped by
-    /// `notify_should_wakeup`. The runtime deadlocks.
+    /// target worker itself: short-circuiting on
+    /// `current_worker_index() == Some(self.idx)` is unsound, because
+    /// `transition_to_parked` can pop the calling worker off the sleepers
+    /// list and invoke its own unparker; skipping the state transition
+    /// there deadlocks the runtime.
     pub(crate) fn unpark(&self, _driver: &driver::Handle) {
         self.handle.unpark(self.idx);
     }
@@ -466,7 +191,6 @@ impl std::fmt::Debug for UringParker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UringParker")
             .field("idx", &self.idx)
-            .field("reactor_installed", &self.reactor.is_some())
             .finish_non_exhaustive()
     }
 }

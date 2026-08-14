@@ -195,25 +195,21 @@ impl CurrentThread {
                 .io
                 .clone_arc()
                 .map(crate::runtime::io::io_driver::IoDriver::from_legacy_mio),
-            // Uring on current_thread is ALWAYS forced global-ring mode
-            // with a single worker slot: the scheduler core migrates
-            // across `block_on` threads (only `LocalRuntime` is `!Send`,
-            // and even its core is driven through the same code), so a
-            // `SINGLE_ISSUER` per-worker ring would be bound to whichever
-            // thread parked first and break on the next core steal.
-            // `new_global` builds the one shared ring eagerly, here on
-            // the builder thread (legal: relaxed ring, no submitter
-            // binding). The env knob `TOKIO_URING_GLOBAL` plays no role.
+            // The uring driver is a single shared ring, driven by
+            // whichever thread parks first. On current_thread the
+            // scheduler core migrates across `block_on` threads, which is
+            // fine here precisely because the ring is not submitter-bound.
+            // The handle is built with a single worker slot.
             #[cfg(all(
                 tokio_unstable,
                 feature = "io-uring-reactor",
                 feature = "rt-multi-thread",
                 target_os = "linux",
             ))]
-            crate::runtime::IoFlavor::UringPerWorker => {
+            crate::runtime::IoFlavor::Uring => {
                 Some(crate::runtime::io::io_driver::IoDriver::from_uring(
                     std::sync::Arc::new(
-                        crate::runtime::io::uring_driver::UringHandle::new_global(1),
+                        crate::runtime::io::uring_driver::UringHandle::new(1),
                     ),
                 ))
             }
@@ -552,9 +548,7 @@ impl Context {
             ))]
             if let Some(uring) = handle.uring_handle() {
                 use crate::runtime::io::uring_driver as ud;
-                let g = uring
-                    .global_ring()
-                    .expect("current_thread uring handle is always global-ring mode");
+                let g = uring.global_ring();
                 let driver_duration = ud::compute_legacy_timer_duration(&handle.driver, duration);
                 // Worker slot 0: this scheduler has exactly one. The
                 // condvar arm inside `park_worker` is unreachable at

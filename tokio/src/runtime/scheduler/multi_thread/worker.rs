@@ -284,7 +284,7 @@ pub(super) fn create(
     ))]
     let uring_handle = match io_flavor {
         IoFlavor::Traditional => None,
-        IoFlavor::UringPerWorker => Some(std::sync::Arc::new(
+        IoFlavor::Uring => Some(std::sync::Arc::new(
             crate::runtime::io::uring_driver::UringHandle::new(size),
         )),
     };
@@ -301,7 +301,7 @@ pub(super) fn create(
                 feature = "rt-multi-thread",
                 target_os = "linux",
             ))]
-            IoFlavor::UringPerWorker => {
+            IoFlavor::Uring => {
                 let handle = std::sync::Arc::clone(
                     uring_handle.as_ref().expect("uring handle constructed above"),
                 );
@@ -375,7 +375,7 @@ pub(super) fn create(
             feature = "rt-multi-thread",
             target_os = "linux",
         ))]
-        IoFlavor::UringPerWorker => uring_handle.as_ref().map(|h| {
+        IoFlavor::Uring => uring_handle.as_ref().map(|h| {
             crate::runtime::io::io_driver::IoDriver::from_uring(std::sync::Arc::clone(h))
         }),
     };
@@ -630,7 +630,6 @@ fn run(worker: Arc<Worker>) {
     ))]
     impl Drop for ClearUringTls {
         fn drop(&mut self) {
-            crate::runtime::io::uring_driver::clear_local_reactor();
             crate::runtime::scheduler::multi_thread::uring_park::clear_current_worker();
         }
     }
@@ -641,7 +640,6 @@ fn run(worker: Arc<Worker>) {
         target_os = "linux",
     ))]
     {
-        crate::runtime::io::uring_driver::clear_local_reactor();
         crate::runtime::scheduler::multi_thread::uring_park::clear_current_worker();
     }
     #[cfg(all(
