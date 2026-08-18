@@ -93,6 +93,13 @@ impl Handle {
                 .as_ref()
                 .expect("A Tokio 1.x context was found, but IO is disabled. Call `enable_io` on the runtime builder to enable IO.")
         }
+
+        /// The backend-agnostic io driver `Registration` routes fd
+        /// registration and deregistration through; `None` iff io is
+        /// disabled. See `tokio/docs/io-driver-vtable.md`.
+        pub(crate) fn io_driver(&self) -> Option<&crate::runtime::io::io_driver::IoDriver> {
+            self.io.io_driver()
+        }
     }
 
     cfg_signal_internal_and_unix! {
@@ -132,6 +139,8 @@ impl Handle {
 // ===== io driver =====
 
 cfg_io_driver! {
+    use std::sync::Arc;
+
     pub(crate) type IoDriver = crate::runtime::io::Driver;
 
     #[derive(Debug)]
@@ -142,7 +151,26 @@ cfg_io_driver! {
 
     #[derive(Debug)]
     pub(crate) enum IoHandle {
-        Enabled(crate::runtime::io::Handle),
+        Enabled {
+            /// Concrete mio handle: the driver chain (park/shutdown) and
+            /// the signal/process drivers ride this directly.
+            //
+            // Arc so `io_driver` below can hold a second owning
+            // reference as its `Arc<dyn IoDriverBackend>`. The Arc
+            // replaces the by-value `Handle`, whose own innards are
+            // already shared, so clone cost is unchanged in practice.
+            // `std::sync::Arc` on purpose: the io driver is never
+            // enabled under loom, and the std Arc coerces to
+            // `Arc<dyn IoDriverBackend>`.
+            handle: Arc<crate::runtime::io::Handle>,
+
+            /// Backend-agnostic seam `Registration` routes through
+            /// instead of reaching into the concrete handle. Same
+            /// backend as `handle`, held pre-erased so the
+            /// per-registration path is a plain field access. See
+            /// `tokio/docs/io-driver-vtable.md`.
+            io_driver: crate::runtime::io::io_driver::IoDriver,
+        },
         Disabled(UnparkThread),
     }
 
@@ -152,11 +180,16 @@ cfg_io_driver! {
 
         let ret = if enabled {
             let (io_driver, io_handle) = crate::runtime::io::Driver::new(nevents)?;
+            let io_handle = Arc::new(io_handle);
 
             let (signal_driver, signal_handle) = create_signal_driver(io_driver, &io_handle)?;
             let process_driver = create_process_driver(signal_driver);
 
-            (IoStack::Enabled(process_driver), IoHandle::Enabled(io_handle), signal_handle)
+            let io_handle = IoHandle::Enabled {
+                io_driver: crate::runtime::io::io_driver::IoDriver::from_mio(Arc::clone(&io_handle)),
+                handle: io_handle,
+            };
+            (IoStack::Enabled(process_driver), io_handle, signal_handle)
         } else {
             let park_thread = ParkThread::new();
             let unpark_thread = park_thread.unpark();
@@ -192,14 +225,22 @@ cfg_io_driver! {
     impl IoHandle {
         pub(crate) fn unpark(&self) {
             match self {
-                IoHandle::Enabled(handle) => handle.unpark(),
+                IoHandle::Enabled { handle, .. } => handle.unpark(),
                 IoHandle::Disabled(handle) => handle.unpark(),
             }
         }
 
         pub(crate) fn as_ref(&self) -> Option<&crate::runtime::io::Handle> {
             match self {
-                IoHandle::Enabled(v) => Some(v),
+                IoHandle::Enabled { handle, .. } => Some(handle),
+                IoHandle::Disabled(..) => None,
+            }
+        }
+
+        /// The backend-agnostic io driver, `None` iff io is disabled.
+        pub(crate) fn io_driver(&self) -> Option<&crate::runtime::io::io_driver::IoDriver> {
+            match self {
+                IoHandle::Enabled { io_driver, .. } => Some(io_driver),
                 IoHandle::Disabled(..) => None,
             }
         }

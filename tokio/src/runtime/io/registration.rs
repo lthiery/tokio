@@ -1,13 +1,97 @@
 #![cfg_attr(not(feature = "net"), allow(dead_code))]
 
 use crate::io::interest::Interest;
-use crate::runtime::io::{Direction, Handle, ReadyEvent, ScheduledIo};
+use crate::runtime::io::{Direction, ReadyEvent, ScheduledIo};
 use crate::runtime::scheduler;
 
 use mio::event::Source;
 use std::io;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
+
+/// Source bound used by [`Registration`] and the `IoDriver` seam.
+///
+/// The seam's register/deregister methods type-erase the I/O source
+/// to `&mut dyn RegistrationSource`. The mio backend only uses
+/// the [`mio::event::Source`] supertrait. Fd-keyed backends (an
+/// `io_uring` readiness reactor submits `POLL_ADD_MULTI` keyed on the
+/// raw fd, without retaining the `Source` reference) additionally need
+/// the underlying fd, exposed through [`registration_raw_fd`].
+///
+/// The accessor returns `Option<RawFd>` because not every source is
+/// fd-backed: FreeBSD's `poll_aio` source wraps kernel AIO completion
+/// and returns `None`. Fd-keyed backends must fail registration on
+/// `None`; the mio backend never calls the accessor.
+///
+/// The fd is exposed via a trait method rather than an [`AsRawFd`]
+/// supertrait bound because `mio::unix::SourceFd<'_>` (used by
+/// `AsyncFd`) does not implement `AsRawFd` even though it trivially
+/// holds a `RawFd`. A hand-written impl below plugs that hole.
+///
+/// On non-unix targets the trait is a blanket renaming of
+/// [`mio::event::Source`] with no additional requirements.
+///
+/// [`registration_raw_fd`]: RegistrationSource::registration_raw_fd
+/// [`AsRawFd`]: std::os::fd::AsRawFd
+pub(crate) trait RegistrationSource: Source {
+    /// The raw fd backing this source, if it is fd-backed.
+    ///
+    /// Only fd-keyed backends read this; the mio backend
+    /// registers through the `Source` supertrait.
+    #[cfg(target_family = "unix")]
+    #[allow(dead_code)]
+    fn registration_raw_fd(&self) -> Option<std::os::fd::RawFd>;
+}
+
+// We deliberately avoid a blanket `impl<T: Source + AsRawFd>` here because it
+// would conflict (coherence-wise) with a hand-written impl for
+// `mio::unix::SourceFd<'_>`: the compiler notes that an upstream crate could
+// add an `AsRawFd` impl for `SourceFd<'_>` in the future. Instead, we
+// enumerate the concrete types Tokio actually wraps with `PollEvented` /
+// `Registration`.
+#[cfg(target_family = "unix")]
+mod registration_source_impls {
+    use super::RegistrationSource;
+    #[cfg(feature = "net")]
+    use std::os::fd::AsRawFd;
+    use std::os::fd::RawFd;
+
+    #[cfg(feature = "net")]
+    macro_rules! impl_registration_source_via_asrawfd {
+        ($($ty:ty),* $(,)?) => {$(
+            impl RegistrationSource for $ty {
+                fn registration_raw_fd(&self) -> Option<RawFd> {
+                    Some(AsRawFd::as_raw_fd(self))
+                }
+            }
+        )*};
+    }
+
+    // mio::net::* types used by tokio::net.
+    #[cfg(feature = "net")]
+    impl_registration_source_via_asrawfd! {
+        mio::net::TcpStream,
+        mio::net::TcpListener,
+        mio::net::UdpSocket,
+        mio::net::UnixStream,
+        mio::net::UnixListener,
+        mio::net::UnixDatagram,
+        mio::unix::pipe::Sender,
+        mio::unix::pipe::Receiver,
+    }
+
+    // Hand-written impl for `mio::unix::SourceFd<'_>`, used by `AsyncFd`.
+    // `SourceFd` does not implement `AsRawFd`, but holds a `&RawFd` directly.
+    impl RegistrationSource for mio::unix::SourceFd<'_> {
+        fn registration_raw_fd(&self) -> Option<RawFd> {
+            Some(*self.0)
+        }
+    }
+}
+
+// Non-unix builds: no fd accessor, just a blanket rename of `Source`.
+#[cfg(not(target_family = "unix"))]
+impl<T: Source> RegistrationSource for T {}
 
 cfg_io_driver! {
     /// Associates an I/O resource with the reactor instance that drives it.
@@ -71,11 +155,22 @@ impl Registration {
     /// - `Err` if an error was encountered during registration
     #[track_caller]
     pub(crate) fn new_with_interest_and_handle(
-        io: &mut impl Source,
+        io: &mut impl RegistrationSource,
         interest: Interest,
         handle: scheduler::Handle,
     ) -> io::Result<Registration> {
-        let shared = handle.driver().io().add_source(io, interest)?;
+        // Route through the backend-agnostic `IoDriver` seam. With the
+        // mio backend (the only one today) this performs
+        // exactly the work `Handle::add_source` used to: allocate a
+        // `ScheduledIo`, link it into the registration set, register the
+        // source with the `mio::Registry`. The panic when io is disabled
+        // is unchanged (message and `#[track_caller]` location).
+        let driver = handle.driver().io_driver().expect(
+            "A Tokio 1.x context was found, but IO is disabled. \
+             Call `enable_io` on the runtime builder to enable IO.",
+        );
+        let shared = driver.allocate_scheduled_io();
+        driver.register_local(&shared, io, interest)?;
 
         Ok(Registration { handle, shared })
     }
@@ -96,8 +191,13 @@ impl Registration {
     /// no longer result in notifications getting sent for this registration.
     ///
     /// `Err` is returned if an error is encountered.
-    pub(crate) fn deregister(&mut self, io: &mut impl Source) -> io::Result<()> {
-        self.handle().deregister_source(&self.shared, io)
+    pub(crate) fn deregister(&mut self, io: &mut impl RegistrationSource) -> io::Result<()> {
+        let driver = self
+            .handle
+            .driver()
+            .io_driver()
+            .expect("io driver present: this registration was created through it");
+        driver.deregister(&self.shared, io)
     }
 
     pub(crate) fn clear_readiness(&self, event: ReadyEvent) {
@@ -233,9 +333,6 @@ impl Registration {
         }
     }
 
-    fn handle(&self) -> &Handle {
-        self.handle.driver().io()
-    }
 }
 
 impl Drop for Registration {

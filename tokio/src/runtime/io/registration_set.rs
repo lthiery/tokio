@@ -53,7 +53,18 @@ impl RegistrationSet {
         self.num_pending_release.load(Acquire) != 0
     }
 
-    pub(super) fn allocate(&self, synced: &mut Synced) -> io::Result<Arc<ScheduledIo>> {
+    /// Track an externally-allocated `Arc<ScheduledIo>` in this set.
+    ///
+    /// The `Arc<ScheduledIo>` is produced by the `IoDriver` vtable's
+    /// `allocate_scheduled_io` shim (an infallible `Arc::new`) and
+    /// linked into the set at `register_local` time. Keeping the
+    /// shutdown check on the linking step (rather than on the
+    /// `Arc::new`) lets the vtable's allocation hook stay infallible.
+    pub(super) fn allocate_existing(
+        &self,
+        synced: &mut Synced,
+        scheduled_io: &Arc<ScheduledIo>,
+    ) -> io::Result<()> {
         if synced.is_shutdown {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -61,12 +72,10 @@ impl RegistrationSet {
             ));
         }
 
-        let ret = Arc::new(ScheduledIo::default());
-
         // Push a ref into the list of all resources.
-        synced.registrations.push_front(ret.clone());
+        synced.registrations.push_front(scheduled_io.clone());
 
-        Ok(ret)
+        Ok(())
     }
 
     // Returns `true` if the caller should unblock the I/O driver to purge

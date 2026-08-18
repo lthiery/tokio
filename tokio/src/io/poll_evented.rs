@@ -2,7 +2,7 @@ use crate::io::interest::Interest;
 use crate::runtime::io::Registration;
 use crate::runtime::scheduler;
 
-use mio::event::Source;
+use crate::runtime::io::registration::RegistrationSource;
 use std::fmt;
 use std::io;
 use std::ops::Deref;
@@ -63,7 +63,7 @@ cfg_io_driver! {
     /// [`clear_readiness`]: Registration::clear_readiness
     /// [`poll_read_ready`]: Registration::poll_read_ready
     /// [`poll_write_ready`]: Registration::poll_write_ready
-    pub(crate) struct PollEvented<E: Source> {
+    pub(crate) struct PollEvented<E: RegistrationSource> {
         io: Option<E>,
         registration: Registration,
     }
@@ -71,7 +71,7 @@ cfg_io_driver! {
 
 // ===== impl PollEvented =====
 
-impl<E: Source> PollEvented<E> {
+impl<E: RegistrationSource> PollEvented<E> {
     /// Creates a new `PollEvented` associated with the default reactor.
     ///
     /// The returned `PollEvented` has readable and writable interests. For more control, use
@@ -156,7 +156,7 @@ feature! {
     use crate::io::ReadBuf;
     use std::task::{Context, Poll};
 
-    impl<E: Source> PollEvented<E> {
+    impl<E: RegistrationSource> PollEvented<E> {
         // Safety: The caller must ensure that `E` can read into uninitialized memory
         pub(crate) unsafe fn poll_read<'a>(
             &'a self,
@@ -291,11 +291,11 @@ feature! {
     }
 }
 
-impl<E: Source> UnwindSafe for PollEvented<E> {}
+impl<E: RegistrationSource> UnwindSafe for PollEvented<E> {}
 
-impl<E: Source> RefUnwindSafe for PollEvented<E> {}
+impl<E: RegistrationSource> RefUnwindSafe for PollEvented<E> {}
 
-impl<E: Source> Deref for PollEvented<E> {
+impl<E: RegistrationSource> Deref for PollEvented<E> {
     type Target = E;
 
     fn deref(&self) -> &E {
@@ -303,13 +303,13 @@ impl<E: Source> Deref for PollEvented<E> {
     }
 }
 
-impl<E: Source + fmt::Debug> fmt::Debug for PollEvented<E> {
+impl<E: RegistrationSource + fmt::Debug> fmt::Debug for PollEvented<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PollEvented").field("io", &self.io).finish()
     }
 }
 
-impl<E: Source> Drop for PollEvented<E> {
+impl<E: RegistrationSource> Drop for PollEvented<E> {
     fn drop(&mut self) {
         if let Some(mut io) = self.io.take() {
             // Ignore errors

@@ -272,25 +272,36 @@ impl Handle {
         self.waker.wake().expect("failed to wake I/O driver");
     }
 
-    /// Registers an I/O resource with the reactor for a given `mio::Ready` state.
+    /// Registers an I/O resource with the reactor for a given `mio::Ready`
+    /// state.
     ///
-    /// The registration token is returned.
-    pub(super) fn add_source(
+    /// Sibling of the old `add_source` used by the `IoDriver` vtable
+    /// path: the caller has already produced an `Arc<ScheduledIo>` (via
+    /// the vtable's infallible `allocate_scheduled_io` shim) and asks the
+    /// handle to link it into the registration set and register
+    /// `source`/`interest` with the kernel poller.
+    ///
+    /// On registry failure, the just-linked `ScheduledIo` is unlinked
+    /// before returning the error — the same
+    /// allocate-then-unlink-on-failure shape `add_source` had.
+    pub(super) fn register_existing<S>(
         &self,
-        source: &mut impl mio::event::Source,
+        shared: &Arc<ScheduledIo>,
+        source: &mut S,
         interest: Interest,
-    ) -> io::Result<Arc<ScheduledIo>> {
-        let scheduled_io = self.registrations.allocate(&mut self.synced.lock())?;
-        let token = scheduled_io.token();
+    ) -> io::Result<()>
+    where
+        S: mio::event::Source + ?Sized,
+    {
+        self.registrations
+            .allocate_existing(&mut self.synced.lock(), shared)?;
+        let token = shared.token();
 
         // we should remove the `scheduled_io` from the `registrations` set if registering
         // the `source` with the OS fails. Otherwise it will leak the `scheduled_io`.
         if let Err(e) = self.registry.register(source, token, interest.to_mio()) {
-            // safety: `scheduled_io` is part of the `registrations` set.
-            unsafe {
-                self.registrations
-                    .remove(&mut self.synced.lock(), &scheduled_io)
-            };
+            // safety: `shared` was just linked into the `registrations` set.
+            unsafe { self.registrations.remove(&mut self.synced.lock(), shared) };
 
             return Err(e);
         }
@@ -298,15 +309,22 @@ impl Handle {
         // TODO: move this logic to `RegistrationSet` and use a `CountedLinkedList`
         self.metrics.incr_fd_count();
 
-        Ok(scheduled_io)
+        Ok(())
     }
 
     /// Deregisters an I/O resource from the reactor.
-    pub(super) fn deregister_source(
+    ///
+    /// Generic over `S: Source + ?Sized` so the `IoDriver` vtable's
+    /// type-erased `&mut dyn RegistrationSource` routes through without
+    /// a coercion.
+    pub(super) fn deregister_source<S>(
         &self,
         registration: &Arc<ScheduledIo>,
-        source: &mut impl Source,
-    ) -> io::Result<()> {
+        source: &mut S,
+    ) -> io::Result<()>
+    where
+        S: Source + ?Sized,
+    {
         // Deregister the source with the OS poller **first**
         // Cleanup ALWAYS happens
         let os_result = self.registry.deregister(source);

@@ -61,6 +61,12 @@ impl AsRawFd for Pidfd {
     }
 }
 
+impl crate::runtime::io::registration::RegistrationSource for Pidfd {
+    fn registration_raw_fd(&self) -> Option<RawFd> {
+        Some(self.as_raw_fd())
+    }
+}
+
 impl Source for Pidfd {
     fn register(
         &mut self,

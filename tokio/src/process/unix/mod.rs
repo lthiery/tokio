@@ -246,6 +246,12 @@ pub(crate) fn convert_to_stdio(io: ChildStdio) -> io::Result<Stdio> {
     convert_to_blocking_file(io).map(Stdio::from)
 }
 
+impl crate::runtime::io::registration::RegistrationSource for Pipe {
+    fn registration_raw_fd(&self) -> Option<RawFd> {
+        Some(self.as_raw_fd())
+    }
+}
+
 impl Source for Pipe {
     fn register(
         &mut self,
