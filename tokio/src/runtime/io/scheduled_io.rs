@@ -105,6 +105,35 @@ pub(crate) struct ScheduledIo {
     readiness: AtomicUsize,
 
     waiters: Mutex<Waiters>,
+
+    /// Slab key assigned by the io_uring [`Reactor`] when this
+    /// `ScheduledIo` is registered with the uring backend. `u32::MAX`
+    /// means "not registered with the uring reactor" (or registered
+    /// with the mio backend).
+    ///
+    /// The kernel never sees a `ScheduledIo` pointer with the uring
+    /// backend; CQE `user_data` carries an encoded `(variant, gen, key)`
+    /// tuple and this key is the reactor's internal lookup token.
+    ///
+    /// Both writes (`Reactor::register`) and reads
+    /// (`Reactor::deregister`) happen on the ring-holding thread, so
+    /// `Relaxed` ordering is sufficient.
+    ///
+    /// [`Reactor`]: crate::runtime::io::uring_reactor::Reactor
+    // The reader (`Reactor` via the driver integration) lands in the
+    // next commit.
+    #[allow(dead_code)]
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(super) uring_slab_key: std::sync::atomic::AtomicU32,
+
+    /// Generation counter stamped at uring registration time. Combined
+    /// with `uring_slab_key` in the CQE `user_data` so stale CQEs and
+    /// stale deregister requests (slab slot already recycled) are
+    /// detected by mismatch. `u32::MAX` means "not registered with the
+    /// uring reactor". Same ordering argument as `uring_slab_key`.
+    #[allow(dead_code)]
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(super) uring_gen: std::sync::atomic::AtomicU32,
 }
 
 #[derive(Debug, Default)]
@@ -179,11 +208,29 @@ impl Default for ScheduledIo {
             linked_list_pointers: UnsafeCell::new(linked_list::Pointers::new()),
             readiness: AtomicUsize::new(0),
             waiters: Mutex::new(Waiters::default()),
+            #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+            uring_slab_key: std::sync::atomic::AtomicU32::new(u32::MAX),
+            #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+            uring_gen: std::sync::atomic::AtomicU32::new(u32::MAX),
         }
     }
 }
 
 impl ScheduledIo {
+    /// Current `(slab_key, gen)` uring registration identity. Read at
+    /// pending-op drain time by the ring holder's `Deregister` handler;
+    /// reading at queue time instead would race with a still-queued
+    /// `Register` on the same FIFO and observe `u32::MAX`.
+    #[allow(dead_code)] // caller (pending-op drain) lands in the next commit
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(crate) fn uring_slab_identity(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering;
+        (
+            self.uring_slab_key.load(Ordering::Relaxed),
+            self.uring_gen.load(Ordering::Relaxed),
+        )
+    }
+
     pub(crate) fn token(&self) -> mio::Token {
         mio::Token(super::EXPOSE_IO.expose_provenance(self))
     }

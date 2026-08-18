@@ -23,5 +23,17 @@ use metrics::IoDriverMetrics;
 // `tokio/docs/io-driver-vtable.md`.
 pub(crate) mod io_driver;
 
+cfg_io_uring_reactor! {
+    // Experimental single shared io_uring readiness reactor, an
+    // alternative backend behind the `IoDriverBackend` seam. The
+    // scheduler-facing driver/parker integration lands in the next
+    // commit; until then the modules have no callers outside their
+    // unit tests, hence the allow.
+    #[allow(dead_code)]
+    pub(crate) mod uring_arm_table;
+    #[allow(dead_code)]
+    pub(crate) mod uring_reactor;
+}
+
 use crate::util::ptr_expose::PtrExposeDomain;
 static EXPOSE_IO: PtrExposeDomain<ScheduledIo> = PtrExposeDomain::new();
