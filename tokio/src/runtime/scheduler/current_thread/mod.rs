@@ -465,6 +465,38 @@ impl Context {
         duration: Option<Duration>,
     ) -> Box<Core> {
         let (core, ()) = self.enter(core, || {
+            // Uring backend: the driver stack (mio/signal/process + timer)
+            // is never parked; the shared ring is the wake source, matching
+            // the multi-thread arm where the stock `Parker` is bypassed.
+            // Timers use the same hybrid flow as
+            // `uring_park::UringParker::park_global`, which this mirrors:
+            // fold the traditional wheel's next deadline into the ring
+            // timeout before parking, advance the wheel after waking.
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt",
+                target_os = "linux",
+            ))]
+            if let Some(uring) = handle.driver.uring_handle() {
+                use crate::runtime::io::uring_driver as ud;
+
+                let driver_duration =
+                    ud::compute_traditional_timer_duration(&handle.driver, duration);
+                // Worker slot 0: this scheduler has exactly one. The
+                // condvar arm inside `park_worker` is unreachable at one
+                // slot: only the sole core holder ever calls `park_worker`,
+                // and nothing else holds the reactor `TryLock` outside that
+                // call (non-core `block_on` threads park on the scheduler's
+                // `Notify`, never on the ring; external `push_op` callers
+                // queue and wake without taking the lock).
+                uring.global_ring().park_worker(0, driver_duration, duration);
+                uring.release_pending_registrations();
+                ud::process_traditional_timer_after_park(&handle.driver);
+                self.defer.wake();
+                return;
+            }
+
             match duration {
                 Some(dur) => driver.park_timeout(&handle.driver, dur),
                 None => driver.park(&handle.driver),
@@ -621,6 +653,31 @@ impl Handle {
         dump::Dump::new(traces)
     }
 
+    /// Wake whatever the core holder is parked on. Under the mio backend
+    /// that is the shared driver stack (mio waker plus timer bookkeeping);
+    /// under the uring backend the driver stack is never parked, so the
+    /// wake must target the shared ring's park-state machine instead, the
+    /// exact analog of the multi-thread arm routing remote wakes through
+    /// `UringUnparker` rather than `driver::Handle::unpark`. Skipping the
+    /// time handle's unpark is deliberate: the hybrid park flow re-reads
+    /// the wheel minimum on every pass, so it has no wake bookkeeping to
+    /// update.
+    fn unpark_driver(&self) {
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt",
+            target_os = "linux",
+        ))]
+        if let Some(uring) = self.driver.uring_handle() {
+            // Slot 0: the scheduler's one worker. NOTIFIED-swap; the
+            // eventfd fires only if the holder is blocked in the ring.
+            uring.unpark(0);
+            return;
+        }
+        self.driver.unpark();
+    }
+
     fn next_remote_task(&self) -> Option<Notified> {
         self.shared.inject.pop()
     }
@@ -732,7 +789,7 @@ impl Schedule for Arc<Handle> {
 
                 // Schedule the task
                 self.shared.inject.push(task);
-                self.driver.unpark();
+                self.unpark_driver();
             }
         });
     }
@@ -793,7 +850,7 @@ impl Wake for Handle {
             context::with_scheduler(|maybe_cx| match maybe_cx {
                 Some(CurrentThread(cx)) if Arc::ptr_eq(arc_self, &cx.handle) => {}
                 _ => {
-                    arc_self.driver.unpark();
+                    arc_self.unpark_driver();
                 }
             });
         }
