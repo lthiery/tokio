@@ -30,6 +30,14 @@ cfg_io_uring_reactor! {
     pub(crate) mod uring_arm_table;
     pub(crate) mod uring_driver;
     pub(crate) mod uring_reactor;
+
+    // The reactor-side slab for the in-tree `tokio::fs` io_uring ops
+    // (`runtime::driver::op`), so a uring-reactor runtime routes fs
+    // completions onto the one shared ring instead of the fs
+    // side-driver's separate ring. The ops themselves need the `fs`
+    // feature (`io-uring-reactor` implies `io-uring` but not `fs`).
+    #[cfg(feature = "fs")]
+    pub(crate) mod uring_fs_ops;
 }
 
 use crate::util::ptr_expose::PtrExposeDomain;
