@@ -174,6 +174,18 @@ impl IoDriver {
     pub(crate) fn from_mio(handle: Arc<MioHandle>) -> Self {
         Self { backend: handle }
     }
+
+    /// Construct an `IoDriver` from the shared uring backend handle
+    /// (`impl IoDriverBackend for UringHandle` lives in `uring_driver.rs`).
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt",
+        target_os = "linux",
+    ))]
+    pub(crate) fn from_uring(handle: Arc<crate::runtime::io::uring_driver::UringHandle>) -> Self {
+        Self { backend: handle }
+    }
 }
 
 // =====================================================================

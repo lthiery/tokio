@@ -152,6 +152,16 @@ pub struct Builder {
 
     timer_flavor: TimerFlavor,
 
+    /// When true, drive io through the shared io_uring reactor instead of
+    /// mio (set by [`Builder::enable_uring_reactor`]).
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt",
+        target_os = "linux",
+    ))]
+    io_uring_reactor: bool,
+
     /// Whether or not to enable eager hand-off for the I/O and time drivers (in
     /// `tokio_unstable`).
     enable_eager_driver_handoff: bool,
@@ -367,6 +377,14 @@ impl Builder {
 
             timer_flavor: TimerFlavor::Traditional,
 
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt",
+                target_os = "linux",
+            ))]
+            io_uring_reactor: false,
+
             // Eager driver handoff is disabled by default.
             enable_eager_driver_handoff: false,
 
@@ -448,6 +466,53 @@ impl Builder {
     pub fn enable_alt_timer(&mut self) -> &mut Self {
         self.enable_time();
         self.timer_flavor = TimerFlavor::Alternative;
+        self
+    }
+
+    /// Enables the experimental `io_uring` readiness reactor, replacing
+    /// mio/epoll as the runtime's I/O driver.
+    ///
+    /// The runtime builds one shared ring. On the multi-thread scheduler,
+    /// workers race to drive it when they park (the same discipline the
+    /// shared mio driver uses); wakes from other threads reach a
+    /// ring-driving worker through an eventfd. On the current-thread
+    /// scheduler (including [`LocalRuntime`] via [`Builder::build_local`])
+    /// the ring is driven by whichever thread holds the scheduler core;
+    /// the core, and with it the ring-driving duty, may migrate across
+    /// `block_on` callers.
+    ///
+    /// This option implicitly enables I/O and time. Timers keep the
+    /// default single-mutex wheel via a hybrid park flow: the ring holder
+    /// folds the wheel's next deadline into its `io_uring_enter` timeout
+    /// and advances the wheel after waking.
+    ///
+    /// Signal and process listening are not supported on these runtimes:
+    /// using `tokio::signal` or `tokio::process` resources panics
+    /// deterministically at the point of use.
+    ///
+    /// Requires a Linux kernel with multishot poll support (5.13+);
+    /// [`Builder::build`] returns an error if the kernel lacks it.
+    ///
+    /// [`LocalRuntime`]: crate::runtime::LocalRuntime
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt",
+        target_os = "linux",
+    ))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt",
+            target_os = "linux",
+        )))
+    )]
+    pub fn enable_uring_reactor(&mut self) -> &mut Self {
+        self.enable_io();
+        self.enable_time();
+        self.io_uring_reactor = true;
         self
     }
 
@@ -1197,6 +1262,23 @@ impl Builder {
             start_paused: self.start_paused,
             nevents: self.nevents,
             timer_flavor: self.timer_flavor,
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt",
+                target_os = "linux",
+            ))]
+            uring_worker_slots: if self.io_uring_reactor {
+                Some(match self.kind {
+                    Kind::CurrentThread => 1,
+                    #[cfg(feature = "rt-multi-thread")]
+                    Kind::MultiThread => {
+                        self.worker_threads.unwrap_or_else(crate::loom::sys::num_cpus)
+                    }
+                })
+            } else {
+                None
+            },
         }
     }
 

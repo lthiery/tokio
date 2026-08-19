@@ -41,11 +41,22 @@ pub(crate) struct Cfg {
     pub(crate) start_paused: bool,
     pub(crate) nevents: usize,
     pub(crate) timer_flavor: crate::runtime::TimerFlavor,
+
+    /// `Some(n)`: drive io through the shared uring reactor, built with
+    /// `n` worker park slots (the multi-thread worker count, or 1 for
+    /// current_thread). `None`: the mio backend (the default).
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt",
+        target_os = "linux",
+    ))]
+    pub(crate) uring_worker_slots: Option<usize>,
 }
 
 impl Driver {
     pub(crate) fn new(cfg: Cfg) -> io::Result<(Self, Handle)> {
-        let (io_stack, io_handle, signal_handle) = create_io_stack(cfg.enable_io, cfg.nevents)?;
+        let (io_stack, io_handle, signal_handle) = create_io_stack(&cfg)?;
 
         let clock = create_clock(cfg.enable_pause_time, cfg.start_paused);
 
@@ -122,6 +133,19 @@ impl Handle {
     cfg_signal_internal_and_unix! {
         #[track_caller]
         pub(crate) fn signal(&self) -> &crate::runtime::signal::Handle {
+            // The uring flavor builds the signal driver machinery but
+            // withholds the handle (see `create_io_stack`): the mio
+            // driver it feeds is never polled, so exposing it would mean
+            // signals silently never fire.
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt",
+                target_os = "linux",
+            ))]
+            if self.signal.is_none() && self.io.uring_handle().is_some() {
+                panic!("signal and process listening are not supported on runtimes using the io_uring reactor");
+            }
             self.signal
                 .as_ref()
                 .expect("there is no signal driver running, must be called from the context of Tokio runtime")
@@ -221,16 +245,49 @@ cfg_io_driver! {
         Disabled(UnparkThread),
     }
 
-    fn create_io_stack(enabled: bool, nevents: usize) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
+    fn create_io_stack(cfg: &Cfg) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
         #[cfg(loom)]
-        assert!(!enabled);
+        assert!(!cfg.enable_io);
 
-        let ret = if enabled {
-            let (io_driver, io_handle) = crate::runtime::io::Driver::new(nevents)?;
+        let ret = if cfg.enable_io {
+            let (io_driver, io_handle) = crate::runtime::io::Driver::new(cfg.nevents)?;
             let io_handle = Arc::new(io_handle);
 
             let (signal_driver, signal_handle) = create_signal_driver(io_driver, &io_handle)?;
             let process_driver = create_process_driver(signal_driver);
+
+            // Uring backend selection. The mio driver and the
+            // signal/process chain above are still built (the `IoStack`
+            // type chain requires them) but the runtime never parks them:
+            // worker parkers and the current_thread park path drive the
+            // shared ring instead. The signal handle is deliberately
+            // withheld so `tokio::signal` / `tokio::process` use fails
+            // deterministically at the existing "no signal driver" panic
+            // (with a uring-specific message, see `Handle::signal`),
+            // rather than silently never firing off a driver nobody
+            // polls.
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt",
+                target_os = "linux",
+            ))]
+            if let Some(slots) = cfg.uring_worker_slots {
+                let uring =
+                    Arc::new(crate::runtime::io::uring_driver::UringHandle::new(slots)?);
+                let io_handle = IoHandle::Enabled {
+                    io_driver: crate::runtime::io::io_driver::IoDriver::from_uring(
+                        Arc::clone(&uring),
+                    ),
+                    handle: io_handle,
+                    uring: Some(uring),
+                };
+                return Ok((
+                    IoStack::Enabled(process_driver),
+                    io_handle,
+                    SignalHandle::default(),
+                ));
+            }
 
             let io_handle = IoHandle::Enabled {
                 io_driver: crate::runtime::io::io_driver::IoDriver::from_mio(Arc::clone(&io_handle)),
@@ -324,7 +381,7 @@ cfg_not_io_driver! {
     #[derive(Debug)]
     pub(crate) struct IoStack(ParkThread);
 
-    fn create_io_stack(_enabled: bool, _nevents: usize) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
+    fn create_io_stack(_cfg: &Cfg) -> io::Result<(IoStack, IoHandle, SignalHandle)> {
         let park_thread = ParkThread::new();
         let unpark_thread = park_thread.unpark();
         Ok((IoStack(park_thread), unpark_thread, Default::default()))
