@@ -100,6 +100,23 @@ impl Handle {
         pub(crate) fn io_driver(&self) -> Option<&crate::runtime::io::io_driver::IoDriver> {
             self.io.io_driver()
         }
+
+        /// The shared uring backend handle, `None` unless this runtime
+        /// drives io through the uring reactor. Parker construction
+        /// (`multi_thread::worker::create`) and timer-insert wakes
+        /// (`time::Handle::unpark_for_insert`) route through this;
+        /// fd registration goes through [`Self::io_driver`] instead.
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt",
+            target_os = "linux",
+        ))]
+        pub(crate) fn uring_handle(
+            &self,
+        ) -> Option<&std::sync::Arc<crate::runtime::io::uring_driver::UringHandle>> {
+            self.io.uring_handle()
+        }
     }
 
     cfg_signal_internal_and_unix! {
@@ -128,6 +145,19 @@ impl Handle {
             F: FnOnce(Option<&crate::runtime::time::Handle>) -> R,
         {
             f(self.time.as_ref())
+        }
+
+        /// Non-panicking accessor for the time driver handle. Used by the
+        /// uring parker to drive the traditional timer wheel from outside
+        /// the regular `Driver::park_internal` path.
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt",
+            target_os = "linux",
+        ))]
+        pub(crate) fn time_handle_opt(&self) -> Option<&crate::runtime::time::Handle> {
+            self.time.as_ref()
         }
 
         pub(crate) fn clock(&self) -> &Clock {
@@ -170,6 +200,23 @@ cfg_io_driver! {
             /// per-registration path is a plain field access. See
             /// `tokio/docs/io-driver-vtable.md`.
             io_driver: crate::runtime::io::io_driver::IoDriver,
+
+            /// The shared uring backend handle, `Some` iff the runtime
+            /// was built with the io_uring reactor selected. Held
+            /// concrete (not through `io_driver`) because parker
+            /// construction and timer-insert wakes need uring-specific
+            /// surface (`UringParker::new`, `unpark_for_timer`) that
+            /// the registration seam deliberately does not carry.
+            ///
+            /// Always `None` today: the selection plumbing that builds
+            /// a uring-flavored stack lands with the builder knob.
+            #[cfg(all(
+                tokio_unstable,
+                feature = "io-uring-reactor",
+                feature = "rt",
+                target_os = "linux",
+            ))]
+            uring: Option<Arc<crate::runtime::io::uring_driver::UringHandle>>,
         },
         Disabled(UnparkThread),
     }
@@ -188,6 +235,13 @@ cfg_io_driver! {
             let io_handle = IoHandle::Enabled {
                 io_driver: crate::runtime::io::io_driver::IoDriver::from_mio(Arc::clone(&io_handle)),
                 handle: io_handle,
+                #[cfg(all(
+                    tokio_unstable,
+                    feature = "io-uring-reactor",
+                    feature = "rt",
+                    target_os = "linux",
+                ))]
+                uring: None,
             };
             (IoStack::Enabled(process_driver), io_handle, signal_handle)
         } else {
@@ -241,6 +295,23 @@ cfg_io_driver! {
         pub(crate) fn io_driver(&self) -> Option<&crate::runtime::io::io_driver::IoDriver> {
             match self {
                 IoHandle::Enabled { io_driver, .. } => Some(io_driver),
+                IoHandle::Disabled(..) => None,
+            }
+        }
+
+        /// The shared uring backend handle, `None` unless this runtime
+        /// drives io through the uring reactor.
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt",
+            target_os = "linux",
+        ))]
+        pub(crate) fn uring_handle(
+            &self,
+        ) -> Option<&Arc<crate::runtime::io::uring_driver::UringHandle>> {
+            match self {
+                IoHandle::Enabled { uring, .. } => uring.as_ref(),
                 IoHandle::Disabled(..) => None,
             }
         }

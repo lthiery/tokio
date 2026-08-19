@@ -22,8 +22,10 @@ mod wheel;
 use super::time_alt;
 
 use crate::loom::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+use crate::loom::sync::atomic::AtomicU64;
 use crate::loom::sync::Mutex;
-use crate::runtime::driver::{self, IoHandle, IoStack};
+use crate::runtime::driver::{self, IoStack};
 use crate::time::error::Error;
 use crate::time::{Clock, Duration};
 use crate::util::WakeList;
@@ -100,6 +102,28 @@ enum Inner {
         /// True if the driver is being shutdown.
         is_shutdown: AtomicBool,
 
+        /// Lock-free mirror of `state.next_wake`.
+        ///
+        /// Holds the earliest pending tick known to the wheel, or
+        /// [`NO_TIMER`] (= `u64::MAX`) when no timer is registered.
+        ///
+        /// Updated under the `state` mutex by every code path that also
+        /// writes `lock.next_wake` (`Driver::park_internal`,
+        /// `Handle::next_wake_tick`, `Handle::process_at_time`).
+        ///
+        /// The io-uring parker reads it without the mutex on its pre-park
+        /// (`next_wake_tick`) and post-park (`parker_process`) hot paths,
+        /// skipping the wheel walk entirely when no timer is registered.
+        /// The cached value is conservative: never larger than any
+        /// actually-pending deadline, so observing [`NO_TIMER`] safely
+        /// means "wheel empty" (a concurrent registrar lowers it under
+        /// the mutex and unparks afterwards).
+        ///
+        /// The wheel cannot represent ticks beyond `1 << 36`, so
+        /// `u64::MAX` cannot alias a real deadline.
+        #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+        next_wake_atomic: AtomicU64,
+
         // When `true`, a call to `park_timeout` should immediately return and time
         // should not advance. One reason for this to be `true` is if the task
         // passed to `Runtime::block_on` called `task::yield_now()`.
@@ -135,6 +159,17 @@ struct InnerState {
     wheel: wheel::Wheel,
 }
 
+/// Sentinel for `Inner::next_wake_atomic` indicating no registered timer.
+#[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+const NO_TIMER: u64 = u64::MAX;
+
+/// Converts an `Option<u64>` next-wake tick into the atomic encoding.
+#[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+#[inline]
+fn next_wake_to_atomic(next_wake: Option<u64>) -> u64 {
+    next_wake.unwrap_or(NO_TIMER)
+}
+
 // ===== impl Driver =====
 
 impl Driver {
@@ -153,6 +188,8 @@ impl Driver {
                     wheel: wheel::Wheel::new(),
                 }),
                 is_shutdown: AtomicBool::new(false),
+                #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+                next_wake_atomic: AtomicU64::new(NO_TIMER),
 
                 #[cfg(feature = "test-util")]
                 did_wake: AtomicBool::new(false),
@@ -219,6 +256,13 @@ impl Driver {
         let next_wake = lock.wheel.next_expiration_time();
         lock.next_wake =
             next_wake.map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
+        // Mirror to the lock-free cache so io-uring fast-path readers
+        // observe the same value without taking the mutex.
+        #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+        handle
+            .inner
+            .next_wake_atomic()
+            .store(next_wake_to_atomic(next_wake), Ordering::Release);
 
         drop(lock);
 
@@ -293,6 +337,53 @@ impl Handle {
         self.process_at_time(now);
     }
 
+    /// Wrapper around [`Handle::process`] used by the io-uring parker.
+    ///
+    /// In the mio park path the time driver wraps the `IoStack`, so
+    /// `Driver::park_internal` advances the wheel around the mio poll.
+    /// The io-uring parker bypasses that wrapper (the ring holder blocks
+    /// in `submit_and_wait`), so the parker advances the wheel itself
+    /// through this entry point.
+    ///
+    /// Lock-free empty-wheel fast path: if no timer is registered this
+    /// returns without the mutex or the wheel walk, so timer-free
+    /// workloads pay nothing per park.
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(crate) fn parker_process(&self, clock: &Clock) {
+        if self.inner.next_wake_atomic().load(Ordering::Acquire) == NO_TIMER {
+            return;
+        }
+        self.process(clock);
+    }
+
+    /// Returns the absolute tick of the next pending timer, or `None` if
+    /// no timers are registered. The io-uring parker uses this to compute
+    /// its poll timeout (`min(io_timeout, time_timeout)`).
+    ///
+    /// Mirrors the pre-park logic in `Driver::park_internal`: queries the
+    /// wheel directly (so newly-registered timers not yet processed are
+    /// seen) and republishes the result into `lock.next_wake` so timer
+    /// registrations keep their `when < next_wake -> unpark`
+    /// short-circuit.
+    ///
+    /// On the empty-wheel fast path this is wait-free (one `Acquire`
+    /// load); the non-empty path locks and re-derives from the wheel.
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(crate) fn next_wake_tick(&self) -> Option<u64> {
+        if self.inner.next_wake_atomic().load(Ordering::Acquire) == NO_TIMER {
+            return None;
+        }
+        let mut lock = self.inner.lock();
+        let next_wake = lock.wheel.next_expiration_time();
+        lock.next_wake =
+            next_wake.map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
+        // Refresh the lock-free mirror from the authoritative wheel state.
+        self.inner
+            .next_wake_atomic()
+            .store(next_wake_to_atomic(next_wake), Ordering::Release);
+        next_wake
+    }
+
     pub(self) fn process_at_time(&self, mut now: u64) {
         let mut waker_list = WakeList::new();
 
@@ -326,10 +417,14 @@ impl Handle {
             }
         }
 
-        lock.next_wake = lock
-            .wheel
-            .poll_at()
+        let next_wake_tick = lock.wheel.poll_at();
+        lock.next_wake = next_wake_tick
             .map(|t| NonZeroU64::new(t).unwrap_or_else(|| NonZeroU64::new(1).unwrap()));
+        // Mirror to the lock-free cache for io-uring readers.
+        #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+        self.inner
+            .next_wake_atomic()
+            .store(next_wake_to_atomic(next_wake_tick), Ordering::Release);
 
         drop(lock);
 
@@ -389,6 +484,31 @@ impl Handle {
         }
     }
 
+    /// Wake a parker that will honor a timer insert that just lowered the
+    /// wheel minimum.
+    ///
+    /// The traditional path routes this to the mio `IoHandle`: the thread
+    /// currently driving the shared mio driver wakes, re-reads
+    /// `next_wake`, and re-parks with the new deadline. A uring-flavored
+    /// runtime never polls that mio driver, so the wake would land on a
+    /// parker nobody parks on and vanish; on a quiet runtime the timer
+    /// then never fires. Route to the uring handle instead; every uring
+    /// park re-reads the wheel minimum before blocking, so one woken
+    /// worker suffices.
+    fn unpark_for_insert(driver: &driver::Handle) {
+        #[cfg(all(
+            tokio_unstable,
+            feature = "io-uring-reactor",
+            feature = "rt",
+            target_os = "linux",
+        ))]
+        if let Some(uring) = driver.uring_handle() {
+            uring.unpark_for_timer();
+            return;
+        }
+        driver.io.unpark();
+    }
+
     /// Removes and re-adds an entry to the driver.
     ///
     /// SAFETY: The timer must be either unregistered, or registered with this
@@ -397,7 +517,7 @@ impl Handle {
     /// the `TimerEntry`)
     pub(self) unsafe fn reregister(
         &self,
-        unpark: &IoHandle,
+        driver: &driver::Handle,
         new_tick: u64,
         entry: NonNull<TimerShared>,
     ) {
@@ -423,11 +543,32 @@ impl Handle {
                 // the timer entry.
                 match unsafe { lock.wheel.insert(entry) } {
                     Ok(when) => {
-                        if lock
+                        let need_unpark = lock
                             .next_wake
-                            .map_or(true, |next_wake| when < next_wake.get())
-                        {
-                            unpark.unpark();
+                            .map_or(true, |next_wake| when < next_wake.get());
+                        if need_unpark {
+                            // The new entry is earlier than any cached
+                            // wake; refresh both the mutex-protected and
+                            // lock-free copies so the uring parker (and
+                            // any subsequent `add_entry` short-circuit)
+                            // sees the new minimum before the wake below
+                            // lands.
+                            #[cfg(all(
+                                tokio_unstable,
+                                feature = "io-uring-reactor",
+                                feature = "rt",
+                                target_os = "linux",
+                            ))]
+                            {
+                                lock.next_wake = Some(
+                                    NonZeroU64::new(when)
+                                        .unwrap_or_else(|| NonZeroU64::new(1).unwrap()),
+                                );
+                                self.inner
+                                    .next_wake_atomic()
+                                    .store(when, Ordering::Release);
+                            }
+                            Self::unpark_for_insert(driver);
                         }
 
                         None
@@ -469,6 +610,21 @@ impl Inner {
             Inner::Traditional { state, .. } => state.lock(),
             #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
             Inner::Alternative { .. } => unreachable!("unreachable in alternative timer"),
+        }
+    }
+
+    /// Returns the lock-free next-wake mirror. See the field doc on
+    /// `Inner::Traditional::next_wake_atomic` for semantics.
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    fn next_wake_atomic(&self) -> &AtomicU64 {
+        match self {
+            Inner::Traditional {
+                next_wake_atomic, ..
+            } => next_wake_atomic,
+            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+            Inner::Alternative { .. } => {
+                unreachable!("alternative timer does not use next_wake_atomic")
+            }
         }
     }
 

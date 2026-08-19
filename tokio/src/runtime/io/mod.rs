@@ -32,6 +32,8 @@ cfg_io_uring_reactor! {
     #[allow(dead_code)]
     pub(crate) mod uring_arm_table;
     #[allow(dead_code)]
+    pub(crate) mod uring_driver;
+    #[allow(dead_code)]
     pub(crate) mod uring_reactor;
 }
 

@@ -18,6 +18,20 @@ impl Handle {
         self.inner.is_shutdown()
     }
 
+    /// True if this handle is using the traditional single-mutex timer
+    /// wheel.
+    /// Used by the uring parker to decide whether it has to drive the
+    /// wheel itself; the alternative flavor manages per-worker wheels
+    /// inside the worker loop and does not need parker involvement.
+    #[cfg(all(tokio_unstable, feature = "io-uring-reactor", feature = "rt", target_os = "linux"))]
+    pub(crate) fn is_traditional(&self) -> bool {
+        match self.inner {
+            super::Inner::Traditional { .. } => true,
+            #[cfg(all(tokio_unstable, feature = "rt-multi-thread"))]
+            super::Inner::Alternative { .. } => false,
+        }
+    }
+
     /// Track that the driver is being unparked
     pub(crate) fn unpark(&self) {
         #[cfg(feature = "test-util")]

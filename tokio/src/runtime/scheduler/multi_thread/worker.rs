@@ -59,7 +59,8 @@
 use crate::loom::sync::{Arc, Mutex};
 use crate::runtime;
 use crate::runtime::scheduler::multi_thread::{
-    idle, park, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, Unparker,
+    idle, park, queue, Counters, Handle, Idle, Overflow, Parker, Stats, TraceStatus, WorkerParker,
+    WorkerUnparker,
 };
 use crate::runtime::scheduler::{inject, Defer, Lock};
 use crate::runtime::task::OwnedTasks;
@@ -153,7 +154,7 @@ struct Core {
     ///
     /// Stored in an `Option` as the parker is added / removed to make the
     /// borrow checker happy.
-    park: Option<Parker>,
+    park: Option<WorkerParker>,
 
     /// Per-worker runtime stats
     stats: Stats,
@@ -236,7 +237,7 @@ struct Remote {
     pub(super) steal: queue::Steal<Arc<Handle>>,
 
     /// Unparks the associated worker thread
-    unpark: Unparker,
+    unpark: WorkerUnparker,
 }
 
 /// Thread-local context
@@ -269,6 +270,29 @@ type Notified = task::Notified<Arc<Handle>>;
 /// improvements.
 const MAX_LIFO_POLLS_PER_TICK: usize = 3;
 
+/// Build worker `idx`'s parker: a uring parker when the runtime's io
+/// driver carries the shared uring ring, the traditional shared-driver
+/// parker otherwise. Parameters are underscore-named because the
+/// traditional arm uses neither.
+fn new_worker_parker(
+    _idx: usize,
+    park: &Parker,
+    _driver_handle: &driver::Handle,
+) -> WorkerParker {
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    if let Some(handle) = _driver_handle.uring_handle() {
+        use crate::runtime::scheduler::multi_thread::uring_park::UringParker;
+        return WorkerParker::Uring(UringParker::new(_idx, std::sync::Arc::clone(handle)));
+    }
+
+    WorkerParker::Traditional(park.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create(
     size: usize,
@@ -285,11 +309,11 @@ pub(super) fn create(
     let mut worker_metrics = Vec::with_capacity(size);
 
     // Create the local queues
-    for _ in 0..size {
+    for worker_idx in 0..size {
         let (steal, run_queue) = queue::local();
 
-        let park = park.clone();
-        let unpark = park.unpark();
+        let park = new_worker_parker(worker_idx, &park, &driver_handle);
+        let unpark = park.unparker();
         let metrics = WorkerMetrics::from_config(&config);
         let stats = Stats::new(&metrics);
 
@@ -537,12 +561,97 @@ fn run(worker: Arc<Worker>) {
     #[cfg(debug_assertions)]
     let _abort_on_panic = AbortOnPanic;
 
+    // Multi-thread workers are hosted on threads from the global blocking
+    // pool (`runtime::spawn_blocking`), which are reused across runtimes.
+    // Uring workers publish their index into the `CURRENT_WORKER`
+    // thread-local, and `core.shutdown()` may run on a *different* worker
+    // thread (see `Handle::shutdown_core`, which drains all cores on the
+    // last worker to exit), so the published index can outlive the runtime
+    // that installed it. Clear at entry and exit so a recycled blocking
+    // thread never sees a stale index from a prior tenant.
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    struct ClearUringTls;
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    impl Drop for ClearUringTls {
+        fn drop(&mut self) {
+            crate::runtime::scheduler::multi_thread::uring_park::clear_current_worker();
+        }
+    }
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    crate::runtime::scheduler::multi_thread::uring_park::clear_current_worker();
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    let _clear_uring_tls = ClearUringTls;
+
     // Acquire a core. If this fails, then another thread is running this
     // worker and there is nothing further to do.
-    let core = match worker.core.take() {
+    let mut core = match worker.core.take() {
         Some(core) => core,
         None => return,
     };
+
+    #[cfg(all(
+        tokio_unstable,
+        feature = "io-uring-reactor",
+        feature = "rt-multi-thread",
+        target_os = "linux",
+    ))]
+    let _abort_if_panicking = if core.park.as_ref().is_some_and(WorkerParker::is_uring) {
+        // Publish the worker index into `CURRENT_WORKER` *before* any task
+        // runs on this thread. `GlobalRing::push_op` reads it to decide
+        // whether a pushed op needs a wake-up kick; installing it lazily
+        // (say, inside the parker) would misclassify ops pushed by tasks
+        // that register fds before the worker's first park, common at
+        // startup. Only uring workers publish: a traditional worker is
+        // never a drain candidate for any ring, so leaving the slot
+        // `None` keeps `push_op`'s classification accurate when both
+        // runtime flavors coexist in one process. The `ClearUringTls`
+        // guard above covers the teardown side.
+        crate::runtime::scheduler::multi_thread::uring_park::set_current_worker_early(
+            worker.index,
+        );
+
+        // A uring worker that dies by unwind leaves a deaf ring behind
+        // and the runtime hangs instead of failing; abort loudly instead.
+        // Armed for the whole worker lifetime; task panics are caught by
+        // the task harness and never unwind through here. See
+        // `AbortIfPanicking`'s docs for the full rationale.
+        Some(
+            crate::runtime::scheduler::multi_thread::uring_park::AbortIfPanicking {
+                worker: worker.index,
+            },
+        )
+    } else {
+        None
+    };
+
+    // Eager per-worker startup. For the uring flavor this waits on a
+    // per-runtime barrier until every sibling worker has also reached this
+    // point, synchronizing the "starting line" so cross-worker duration
+    // measurements aren't skewed by which worker finished its cold-start
+    // first. For the traditional mio/epoll flavor this is a no-op.
+    if let Some(parker) = core.park.as_mut() {
+        parker.eager_startup_sync();
+    }
 
     worker.handle.shared.worker_metrics[worker.index].set_thread_id(thread::current().id());
 
