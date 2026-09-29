@@ -163,8 +163,12 @@ impl TcpStream {
         }
     }
 
+    /// Wraps a connected or connecting socket. The socket is registered with
+    /// the I/O driver on its first use (see `PollEvented::new_deferred`), from
+    /// the task that makes it.
+    #[track_caller]
     pub(crate) fn new(connected: mio::net::TcpStream) -> io::Result<TcpStream> {
-        let io = PollEvented::new(connected)?;
+        let io = PollEvented::new_deferred(connected, Ready::EMPTY)?;
         Ok(TcpStream { io })
     }
 
@@ -172,12 +176,8 @@ impl TcpStream {
     /// its first read and write try the socket instead of waiting for the
     /// driver's first event (see `Registration::assume_ready`).
     pub(crate) fn new_accepted(connected: mio::net::TcpStream) -> io::Result<TcpStream> {
-        let stream = TcpStream::new(connected)?;
-        stream
-            .io
-            .registration()
-            .assume_ready(Ready::READABLE | Ready::WRITABLE);
-        Ok(stream)
+        let io = PollEvented::new_deferred(connected, Ready::READABLE | Ready::WRITABLE)?;
+        Ok(TcpStream { io })
     }
 
     /// Creates new `TcpStream` from a `std::net::TcpStream`.
@@ -221,13 +221,18 @@ impl TcpStream {
     /// The runtime is usually set implicitly when this function is called
     /// from a future driven by a tokio runtime, otherwise runtime can be set
     /// explicitly with [`Runtime::enter`](crate::runtime::Runtime::enter) function.
+    ///
+    /// # Registration
+    ///
+    /// The stream is registered with that runtime's I/O driver on its first
+    /// use, not by this function. An error registering it is returned by the
+    /// first read, write, or readiness call.
     #[track_caller]
     pub fn from_std(stream: std::net::TcpStream) -> io::Result<TcpStream> {
         check_socket_for_blocking(&stream)?;
 
         let io = mio::net::TcpStream::from_std(stream);
-        let io = PollEvented::new(io)?;
-        Ok(TcpStream { io })
+        TcpStream::new(io)
     }
 
     /// Turns a [`tokio::net::TcpStream`] into a [`std::net::TcpStream`].
