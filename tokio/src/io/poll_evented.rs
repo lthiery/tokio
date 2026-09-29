@@ -124,6 +124,49 @@ impl<E: Source> PollEvented<E> {
         })
     }
 
+    /// Creates a new `PollEvented` associated with the default reactor, with
+    /// readable and writable interests, that registers `io` with the reactor
+    /// on its first use instead of now.
+    ///
+    /// The first readiness poll or `try_*` call registers the resource, from
+    /// the task that makes it; registration errors are returned by that call.
+    /// A `PollEvented` that is never used is never registered. `assume_ready`
+    /// is applied once registered, so the first operation tries the resource
+    /// instead of waiting for the driver's first event.
+    ///
+    /// On Windows, mio needs the source by `&mut` to register it, so this
+    /// registers now, like [`Self::new`].
+    ///
+    /// # Panics
+    ///
+    /// Like [`Self::new`], panics if thread-local runtime is not set or has
+    /// no I/O driver.
+    #[cfg(all(unix, feature = "net"))]
+    #[track_caller]
+    pub(crate) fn new_deferred(io: E, assume_ready: crate::io::Ready) -> io::Result<Self>
+    where
+        E: std::os::unix::io::AsRawFd,
+    {
+        let registration = Registration::deferred(
+            io.as_raw_fd(),
+            Interest::READABLE | Interest::WRITABLE,
+            assume_ready,
+            scheduler::Handle::current(),
+        );
+        Ok(Self {
+            io: Some(io),
+            registration,
+        })
+    }
+
+    #[cfg(all(not(unix), feature = "net"))]
+    #[track_caller]
+    pub(crate) fn new_deferred(io: E, assume_ready: crate::io::Ready) -> io::Result<Self> {
+        let this = Self::new(io)?;
+        this.registration.assume_ready(assume_ready);
+        Ok(this)
+    }
+
     /// Returns a reference to the registration.
     #[cfg(any(feature = "net", all(feature = "process", target_os = "linux")))]
     pub(crate) fn registration(&self) -> &Registration {
