@@ -129,8 +129,9 @@ fn later_reads_after_runtime_drop_report_shutdown() {
         .build()
         .unwrap();
     let (mut s, _c) = rt.block_on(accepted_with(b"hello"));
+    assert_eq!(rt.block_on(s.read(&mut [0u8; 2])).unwrap(), 2);
     drop(rt);
-    assert_eq!(s.try_read(&mut [0u8; 5]).unwrap(), 5);
+    assert_eq!(s.try_read(&mut [0u8; 5]).unwrap(), 3);
     // This read finds nothing and clears readiness after shutdown; the
     // shutdown bit must survive that or the read below would hang.
     let _ = s.try_read(&mut [0u8; 5]);
