@@ -10,6 +10,9 @@
 //! (default 4) pinned to `TOKIO_BENCH_CLIENT_CPUS`, one task per connection;
 //! `TOKIO_BENCH_CONNS` connections (default 64), each doing
 //! `TOKIO_BENCH_ROUNDS` 64-byte round trips per iteration (default 100).
+//! `TOKIO_BENCH_CONNECT_PAR` connections are opened at a time (default 1, so
+//! the server sees a trickle of accepts; set it to the connection count for
+//! one burst).
 //!
 //! - `echo/steady`: connections are made once; an iteration is all of them
 //!   doing their rounds concurrently.
@@ -188,12 +191,25 @@ async fn all_rounds(streams: Vec<TcpStream>, n: usize) -> Vec<TcpStream> {
     out
 }
 
+/// Connects `n` streams, `TOKIO_BENCH_CONNECT_PAR` at a time (default 1: a
+/// trickle of accepts on the server; `n`: one burst).
 async fn connect_all(addr: SocketAddr, n: usize) -> Vec<TcpStream> {
+    let par = env_usize("TOKIO_BENCH_CONNECT_PAR", 1).max(1);
     let mut v = Vec::with_capacity(n);
-    for _ in 0..n {
-        let s = TcpStream::connect(addr).await.unwrap();
-        s.set_nodelay(true).unwrap();
-        v.push(s);
+    while v.len() < n {
+        let batch = par.min(n - v.len());
+        let handles: Vec<_> = (0..batch)
+            .map(|_| {
+                tokio::spawn(async move {
+                    let s = TcpStream::connect(addr).await.unwrap();
+                    s.set_nodelay(true).unwrap();
+                    s
+                })
+            })
+            .collect();
+        for h in handles {
+            v.push(h.await.unwrap());
+        }
     }
     v
 }
