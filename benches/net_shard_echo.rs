@@ -22,6 +22,12 @@
 //! Placement policy comes from the runtime's env knobs (`TOKIO_EAGER_TCP`,
 //! `TOKIO_IO_SHARD_LOCAL`); the per-case `io_shard_poll_stats` line shows
 //! how many readiness polls ran on a worker of the source's shard group.
+//!
+//! With `TOKIO_BENCH_WL=1` (needs `--cfg tokio_unstable` and the
+//! `worker-local` feature) the accept loop hands each connection to a worker
+//! round-robin with `run_on_worker` and serves it as a worker-local task, so
+//! the task has a fixed home and its first poll, hence its registration,
+//! happens there.
 
 #![cfg(unix)]
 
@@ -125,13 +131,34 @@ async fn serve(mut s: TcpStream) {
 fn start_server(rt: &Runtime) -> SocketAddr {
     let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
     let addr = listener.local_addr().unwrap();
+    let wl = env_usize("TOKIO_BENCH_WL", 0) == 1;
+    let workers = env_usize("TOKIO_BENCH_WORKERS", 8);
     rt.spawn(async move {
+        let mut next = 0usize;
         loop {
             let (s, _) = listener.accept().await.unwrap();
-            tokio::spawn(serve(s));
+            if wl {
+                place_worker_local(s, next % workers);
+                next += 1;
+            } else {
+                tokio::spawn(serve(s));
+            }
         }
     });
     addr
+}
+
+/// Serves `s` as a worker-local task on worker `index`.
+#[cfg(tokio_unstable)]
+fn place_worker_local(s: TcpStream, index: usize) {
+    tokio::task::run_on_worker(index, move || {
+        tokio::task::spawn_worker_local(serve(s));
+    });
+}
+
+#[cfg(not(tokio_unstable))]
+fn place_worker_local(_s: TcpStream, _index: usize) {
+    panic!("TOKIO_BENCH_WL=1 needs a build with --cfg tokio_unstable");
 }
 
 /// A client runtime driven from its own thread; `run` executes a job on it
