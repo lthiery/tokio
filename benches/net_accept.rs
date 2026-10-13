@@ -55,11 +55,30 @@ fn rt_current_thread() -> Runtime {
 }
 
 fn rt_multi_thread(workers: usize) -> Runtime {
+    // EXPERIMENT: `TOKIO_BENCH_IO_SHARDS` sets the shard count explicitly
+    // (the `TOKIO_IO_SHARDS` env default keeps small runtimes at one shard).
+    let shards = std::env::var("TOKIO_BENCH_IO_SHARDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     runtime::Builder::new_multi_thread()
         .worker_threads(workers)
+        .io_shards(shards)
         .enable_io()
         .build()
         .unwrap()
+}
+
+/// EXPERIMENT: placement accounting for the case just run.
+fn report(name: &str, rt: &Runtime) {
+    let [same, other, off] = rt.metrics().io_shard_poll_stats();
+    let total = (same + other + off).max(1);
+    eprintln!(
+        "  {name}: io_shard_poll_stats same={same} other={other} off_worker={off} \
+         (other/total {:.1}%) registered_per_shard={:?}",
+        100.0 * other as f64 / total as f64,
+        rt.metrics().io_shard_registered(),
+    );
 }
 
 fn block_on(c: &mut Criterion, name: &str, rt: Runtime) {
@@ -78,6 +97,7 @@ fn block_on(c: &mut Criterion, name: &str, rt: Runtime) {
             BatchSize::PerIteration,
         )
     });
+    report(name, &rt);
 }
 
 /// Runs `iters` connections in batches of `BATCH`: the clients for a batch are
@@ -108,6 +128,7 @@ where
             total
         })
     });
+    report(name, &rt);
 }
 
 async fn serial_task(listener: Arc<TcpListener>, n: u64) {

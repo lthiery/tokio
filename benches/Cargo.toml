@@ -116,5 +116,10 @@ name = "net_accept"
 path = "net_accept.rs"
 harness = false
 
+[[bench]]
+name = "net_shard_echo"
+path = "net_shard_echo.rs"
+harness = false
+
 [lints]
 workspace = true

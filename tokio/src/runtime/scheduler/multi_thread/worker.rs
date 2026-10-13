@@ -288,6 +288,16 @@ pub(super) fn create(
     let num_groups = parkers.len().max(1);
     debug_assert!(num_groups <= size.max(1));
 
+    // EXPERIMENT: let the I/O driver map a registering worker to its shard.
+    #[cfg(any(
+        feature = "net",
+        all(unix, feature = "process"),
+        all(unix, feature = "signal"),
+    ))]
+    if let Some(io) = driver_handle.io.as_ref() {
+        io.set_num_workers(size);
+    }
+
     // Create the local queues
     for index in 0..size {
         let (steal, run_queue) = queue::local();

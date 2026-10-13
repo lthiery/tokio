@@ -147,6 +147,13 @@ impl<E: Source> PollEvented<E> {
     where
         E: std::os::unix::io::AsRawFd,
     {
+        // EXPERIMENT: `TOKIO_EAGER_TCP=1` restores registration at
+        // construction, for A/B runs from one binary.
+        if eager_override() {
+            let this = Self::new(io)?;
+            this.registration.assume_ready(assume_ready);
+            return Ok(this);
+        }
         let registration = Registration::deferred(
             io.as_raw_fd(),
             Interest::READABLE | Interest::WRITABLE,
@@ -359,4 +366,11 @@ impl<E: Source> Drop for PollEvented<E> {
             let _ = self.registration.deregister(&mut io);
         }
     }
+}
+
+/// EXPERIMENT: see `PollEvented::new_deferred`.
+#[cfg(all(unix, feature = "net"))]
+fn eager_override() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TOKIO_EAGER_TCP").is_some_and(|v| v == "1"))
 }

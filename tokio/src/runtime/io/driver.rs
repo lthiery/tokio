@@ -79,6 +79,19 @@ pub(crate) struct Handle {
     /// Round-robin cursor for new sources.
     next_shard: std::sync::atomic::AtomicUsize,
 
+    /// EXPERIMENT: number of scheduler workers, set by the multi-thread
+    /// scheduler at construction; 0 when unknown. With
+    /// `TOKIO_IO_SHARD_LOCAL=1`, a source registered from a worker goes to
+    /// that worker's group's shard instead of round-robin.
+    num_workers: std::sync::atomic::AtomicUsize,
+
+    /// EXPERIMENT: readiness polls by placement of the polling worker relative
+    /// to the source's shard: [same group, other group, not on a worker].
+    pub(crate) shard_poll_stats: [std::sync::atomic::AtomicU64; 3],
+
+    /// EXPERIMENT: sources registered per shard.
+    pub(crate) shard_registered: Box<[std::sync::atomic::AtomicU64]>,
+
     pub(crate) metrics: IoDriverMetrics,
 
     #[cfg(all(
@@ -190,6 +203,15 @@ impl Driver {
         let handle = Handle {
             shards: shards.into_boxed_slice(),
             next_shard: std::sync::atomic::AtomicUsize::new(0),
+            num_workers: std::sync::atomic::AtomicUsize::new(0),
+            shard_poll_stats: [
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+            ],
+            shard_registered: (0..num_shards)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
             metrics: IoDriverMetrics::default(),
             #[cfg(all(
                 tokio_unstable,
@@ -392,15 +414,58 @@ impl Handle {
         &self.shards[0].registry
     }
 
-    /// Picks the shard for a new source, round-robin.
+    /// Picks the shard for a new source: the current worker's group's shard
+    /// when `TOKIO_IO_SHARD_LOCAL=1` and registering from a worker, else
+    /// round-robin.
     fn pick_shard(&self) -> usize {
         let n = self.shards.len();
         if n == 1 {
             return 0;
         }
+        if shard_local_enabled() {
+            if let Some(shard) = self.shard_of_current_worker() {
+                return shard;
+            }
+        }
         self.next_shard
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             % n
+    }
+
+    /// EXPERIMENT: records how many scheduler workers drive this handle.
+    pub(crate) fn set_num_workers(&self, n: usize) {
+        self.num_workers
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// EXPERIMENT: the shard of the group the current worker belongs to, by
+    /// the same contiguous split the scheduler uses, or `None` off a worker
+    /// or when the worker count is unknown.
+    pub(crate) fn shard_of_current_worker(&self) -> Option<usize> {
+        let size = self.num_workers.load(std::sync::atomic::Ordering::Relaxed);
+        if size == 0 {
+            return None;
+        }
+        #[cfg(feature = "rt")]
+        {
+            let w = crate::runtime::context::worker_index()?;
+            if w >= size {
+                return None;
+            }
+            return Some(w * self.shards.len() / size);
+        }
+        #[cfg(not(feature = "rt"))]
+        None
+    }
+
+    /// EXPERIMENT: counts a readiness poll of a source on `shard`.
+    pub(crate) fn record_poll(&self, shard: usize) {
+        let i = match self.shard_of_current_worker() {
+            Some(s) if s == shard => 0,
+            Some(_) => 1,
+            None => 2,
+        };
+        self.shard_poll_stats[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Registers an I/O resource with the reactor for a given `mio::Ready` state.
@@ -413,6 +478,7 @@ impl Handle {
     ) -> io::Result<Arc<ScheduledIo>> {
         let shard_idx = self.pick_shard();
         let shard = &self.shards[shard_idx];
+        self.shard_registered[shard_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let scheduled_io = shard
             .registrations
             .allocate(&mut shard.synced.lock(), shard_idx)?;
@@ -527,4 +593,12 @@ mod tests {
         }
         handle.shards[0].release_pending_registrations();
     }
+}
+
+
+/// EXPERIMENT: `TOKIO_IO_SHARD_LOCAL=1` places new sources on the registering
+/// worker's shard.
+fn shard_local_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TOKIO_IO_SHARD_LOCAL").is_some_and(|v| v == "1"))
 }
