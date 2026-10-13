@@ -1151,15 +1151,18 @@ impl Context {
         };
 
         // With several I/O shards, poll them before parking (`Parker::sweep`).
-        // If that woke tasks into our queue, which was empty when we decided
-        // to park, don't block; `transition_from_parked` picks them up.
+        // If that woke tasks into our queues, which were empty when we decided
+        // to park, don't block; `transition_from_parked` picks them up. This
+        // must see worker-local work too: a readiness event for one of this
+        // worker's worker-local tasks lands in its queue without an unpark,
+        // and a standby park below has no timeout.
         let driver = &self.worker.handle.driver;
         let tick = duration.as_ref().is_some_and(Duration::is_zero);
         let helped = park.sweep(driver, tick, || {
             self.core
                 .borrow()
                 .as_ref()
-                .is_some_and(|core| core.has_tasks())
+                .is_some_and(|core| core.has_any_work(&self.worker))
         });
 
         // Park thread
