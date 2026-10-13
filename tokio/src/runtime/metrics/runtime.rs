@@ -22,6 +22,50 @@ pub struct RuntimeMetrics {
 }
 
 impl RuntimeMetrics {
+    /// EXPERIMENT: readiness polls by placement of the polling worker
+    /// relative to the source's I/O shard: `[same group, other group,
+    /// not on a worker]`.
+    #[doc(hidden)]
+    #[cfg(any(
+        feature = "net",
+        all(unix, feature = "process"),
+        all(unix, feature = "signal"),
+    ))]
+    pub fn io_shard_poll_stats(&self) -> [u64; 3] {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.handle
+            .inner
+            .driver()
+            .io
+            .as_ref()
+            .map(|io| {
+                [
+                    io.shard_poll_stats[0].load(Relaxed),
+                    io.shard_poll_stats[1].load(Relaxed),
+                    io.shard_poll_stats[2].load(Relaxed),
+                ]
+            })
+            .unwrap_or([0; 3])
+    }
+
+    /// EXPERIMENT: sources registered on each I/O shard.
+    #[doc(hidden)]
+    #[cfg(any(
+        feature = "net",
+        all(unix, feature = "process"),
+        all(unix, feature = "signal"),
+    ))]
+    pub fn io_shard_registered(&self) -> Vec<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.handle
+            .inner
+            .driver()
+            .io
+            .as_ref()
+            .map(|io| io.shard_registered.iter().map(|c| c.load(Relaxed)).collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn new(handle: Handle) -> RuntimeMetrics {
         RuntimeMetrics { handle }
     }
