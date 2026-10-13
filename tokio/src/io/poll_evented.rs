@@ -144,20 +144,28 @@ impl<E: Source> PollEvented<E> {
     /// no I/O driver.
     #[cfg(feature = "net")]
     #[track_caller]
-    pub(crate) fn new_deferred(io: E, assume_ready: crate::io::Ready) -> Self
+    pub(crate) fn new_deferred(io: E, assume_ready: crate::io::Ready) -> io::Result<Self>
     where
         E: SharedSource + Sync,
     {
+        // EXPERIMENT: `TOKIO_EAGER_TCP=1` restores registration at
+        // construction, for A/B runs from one binary; the `Result` is for
+        // that path.
+        if eager_override() {
+            let this = Self::new(io)?;
+            this.registration.assume_ready(assume_ready);
+            return Ok(this);
+        }
         let registration = Registration::deferred(
             Interest::READABLE | Interest::WRITABLE,
             assume_ready,
             scheduler::Handle::current(),
         );
-        Self {
+        Ok(Self {
             io: Some(io),
             registration,
             deferred_source: Some(|io| io),
-        }
+        })
     }
 
     /// Returns the registration, through which a registration deferred to
@@ -354,4 +362,11 @@ impl<E: Source> Drop for PollEvented<E> {
             let _ = self.registration.deregister(&mut io);
         }
     }
+}
+
+/// EXPERIMENT: see `PollEvented::new_deferred`.
+#[cfg(feature = "net")]
+fn eager_override() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TOKIO_EAGER_TCP").is_some_and(|v| v == "1"))
 }

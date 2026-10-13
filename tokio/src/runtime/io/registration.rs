@@ -228,7 +228,10 @@ impl Registration {
         ready!(crate::trace::trace_leaf(cx));
         // Keep track of task budget
         let coop = ready!(crate::task::coop::poll_proceed(cx));
-        let ev = ready!(self.registered().poll_readiness(cx, direction));
+        let shared = self.registered();
+        // EXPERIMENT: placement accounting.
+        self.handle().record_poll(shared.shard());
+        let ev = ready!(shared.poll_readiness(cx, direction));
 
         if ev.is_shutdown {
             return Poll::Ready(Err(gone()));

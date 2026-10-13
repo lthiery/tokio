@@ -168,7 +168,7 @@ impl TcpStream {
     /// the task that makes it.
     #[track_caller]
     pub(crate) fn new(connected: mio::net::TcpStream) -> io::Result<TcpStream> {
-        let io = PollEvented::new_deferred(connected, Ready::EMPTY);
+        let io = PollEvented::new_deferred(connected, Ready::EMPTY)?;
         Ok(TcpStream { io })
     }
 
@@ -176,7 +176,7 @@ impl TcpStream {
     /// its first read and write try the socket instead of waiting for the
     /// driver's first event (see `Registration::assume_ready`).
     pub(crate) fn new_accepted(connected: mio::net::TcpStream) -> io::Result<TcpStream> {
-        let io = PollEvented::new_deferred(connected, Ready::READABLE | Ready::WRITABLE);
+        let io = PollEvented::new_deferred(connected, Ready::READABLE | Ready::WRITABLE)?;
         Ok(TcpStream { io })
     }
 

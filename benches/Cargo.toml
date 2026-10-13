@@ -122,5 +122,10 @@ name = "net_request_hash"
 path = "net_request_hash.rs"
 harness = false
 
+[[bench]]
+name = "net_shard_echo"
+path = "net_shard_echo.rs"
+harness = false
+
 [lints]
 workspace = true
