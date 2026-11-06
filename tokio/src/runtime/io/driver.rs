@@ -17,7 +17,7 @@ use crate::runtime::io::registration_set;
 use crate::runtime::io::{IoDriverMetrics, RegistrationSet, ScheduledIo};
 
 use crate::loom::sync::Arc;
-use mio::event::Source;
+use mio::event::{SharedSource, Source};
 use std::fmt;
 use std::io;
 use std::time::Duration;
@@ -287,12 +287,31 @@ impl Handle {
         source: &mut impl mio::event::Source,
         interest: Interest,
     ) -> io::Result<Arc<ScheduledIo>> {
+        self.add_source_with(|registry, token| registry.register(source, token, interest.to_mio()))
+    }
+
+    /// Registers an I/O resource with the reactor through a shared reference,
+    /// like [`add_source`](Self::add_source).
+    pub(super) fn add_shared_source(
+        &self,
+        source: &dyn SharedSource,
+        interest: Interest,
+    ) -> io::Result<Arc<ScheduledIo>> {
+        self.add_source_with(|registry, token| {
+            registry.register_shared(source, token, interest.to_mio())
+        })
+    }
+
+    fn add_source_with(
+        &self,
+        register: impl FnOnce(&mio::Registry, mio::Token) -> io::Result<()>,
+    ) -> io::Result<Arc<ScheduledIo>> {
         let scheduled_io = self.registrations.allocate(&mut self.synced.lock())?;
         let token = scheduled_io.token();
 
         // we should remove the `scheduled_io` from the `registrations` set if registering
         // the `source` with the OS fails. Otherwise it will leak the `scheduled_io`.
-        if let Err(e) = self.registry.register(source, token, interest.to_mio()) {
+        if let Err(e) = register(&self.registry, token) {
             // safety: `scheduled_io` is part of the `registrations` set.
             unsafe {
                 self.registrations
