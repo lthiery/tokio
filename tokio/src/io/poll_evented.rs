@@ -1,8 +1,8 @@
 use crate::io::interest::Interest;
-use crate::runtime::io::Registration;
+use crate::runtime::io::{Registration, RegistrationRef};
 use crate::runtime::scheduler;
 
-use mio::event::Source;
+use mio::event::{SharedSource, Source};
 use std::fmt;
 use std::io;
 use std::ops::Deref;
@@ -66,6 +66,9 @@ cfg_io_driver! {
     pub(crate) struct PollEvented<E: Source> {
         io: Option<E>,
         registration: Registration,
+        /// For a registration deferred to first use, how to reach `io` as the
+        /// source to register.
+        deferred_source: Option<fn(&E) -> &(dyn SharedSource + Sync)>,
     }
 }
 
@@ -121,13 +124,15 @@ impl<E: Source> PollEvented<E> {
         Ok(Self {
             io: Some(io),
             registration,
+            deferred_source: None,
         })
     }
 
-    /// Returns a reference to the registration.
-    #[cfg(any(feature = "net", all(feature = "process", target_os = "linux")))]
-    pub(crate) fn registration(&self) -> &Registration {
-        &self.registration
+    /// Returns the registration, through which a registration deferred to
+    /// first use registers `io`.
+    pub(crate) fn registration(&self) -> RegistrationRef<'_> {
+        let source = self.deferred_source.map(|source| source(self.io.as_ref().unwrap()));
+        RegistrationRef::new(&self.registration, source)
     }
 
     /// Deregisters the inner io from the registration and returns a Result containing the inner io.
@@ -145,6 +150,7 @@ impl<E: Source> PollEvented<E> {
         let _ = self.registration.deregister(io);
         self.registration =
             Registration::new_with_interest_and_handle(io, interest, scheduler::Handle::current())?;
+        self.deferred_source = None;
 
         Ok(())
     }
@@ -169,7 +175,7 @@ feature! {
             use std::io::Read;
 
             loop {
-                let evt = ready!(self.registration.poll_read_ready(cx))?;
+                let evt = ready!(self.registration().poll_read_ready(cx))?;
 
                 let b = unsafe { &mut *(buf.unfilled_mut() as *mut [std::mem::MaybeUninit<u8>] as *mut [u8]) };
 
@@ -233,7 +239,7 @@ feature! {
             use std::io::Write;
 
             loop {
-                let evt = ready!(self.registration.poll_write_ready(cx))?;
+                let evt = ready!(self.registration().poll_write_ready(cx))?;
 
                 match self.io.as_ref().unwrap().write(buf) {
                     Ok(n) => {
@@ -286,7 +292,7 @@ feature! {
             &'a E: io::Write + 'a,
         {
             use std::io::Write;
-            self.registration.poll_write_io(cx, || self.io.as_ref().unwrap().write_vectored(bufs))
+            self.registration().poll_write_io(cx, || self.io.as_ref().unwrap().write_vectored(bufs))
         }
     }
 }

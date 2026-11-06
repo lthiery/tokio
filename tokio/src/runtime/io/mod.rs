@@ -10,7 +10,7 @@ cfg_io_uring! {
 }
 
 mod registration;
-pub(crate) use registration::Registration;
+pub(crate) use registration::{Registration, RegistrationRef};
 
 mod registration_set;
 use registration_set::RegistrationSet;

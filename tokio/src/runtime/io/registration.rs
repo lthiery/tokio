@@ -1,12 +1,14 @@
 #![cfg_attr(not(feature = "net"), allow(dead_code))]
 
 use crate::io::interest::Interest;
+use crate::io::ready::Ready;
 use crate::runtime::io::{Direction, Handle, ReadyEvent, ScheduledIo};
 use crate::runtime::scheduler;
 
-use crate::loom::sync::Arc;
-use mio::event::Source;
+use crate::loom::sync::{Arc, Mutex};
+use mio::event::{SharedSource, Source};
 use std::io;
+use std::sync::OnceLock;
 use std::task::{ready, Context, Poll};
 
 cfg_io_driver! {
@@ -17,7 +19,8 @@ cfg_io_driver! {
     /// level API for integrating with a reactor.
     ///
     /// The association between an I/O resource is made by calling
-    /// [`new_with_interest_and_handle`].
+    /// [`new_with_interest_and_handle`], or on first use for a registration
+    /// created with [`deferred`], through a [`RegistrationRef`].
     /// Once the association is established, it remains established until the
     /// registration instance is dropped.
     ///
@@ -40,6 +43,7 @@ cfg_io_driver! {
     /// events.
     ///
     /// [`new_with_interest_and_handle`]: method@Self::new_with_interest_and_handle
+    /// [`deferred`]: method@Self::deferred
     /// [`poll_read_ready`]: method@Self::poll_read_ready`
     /// [`poll_write_ready`]: method@Self::poll_write_ready`
     #[derive(Debug)]
@@ -49,9 +53,24 @@ cfg_io_driver! {
         /// TODO: this can probably be moved into `ScheduledIo`.
         handle: scheduler::Handle,
 
-        /// Reference to state stored by the driver.
-        shared: Arc<ScheduledIo>,
+        /// Reference to state stored by the driver. Empty until the resource
+        /// is registered, which a deferred registration does on first use.
+        shared: OnceLock<Arc<ScheduledIo>>,
+
+        /// How to register the resource, for a registration that does so on
+        /// first use. `None` for a resource registered at construction. The
+        /// lock serializes the registration between concurrent first users
+        /// (the read and write halves of a split stream).
+        deferred: Mutex<Option<Deferred>>,
     }
+}
+
+/// How a registration that is pending its first use registers its resource.
+#[derive(Debug)]
+struct Deferred {
+    interest: Interest,
+    /// Readiness to assume once registered; see `assume_ready`.
+    assume_ready: Ready,
 }
 
 unsafe impl Send for Registration {}
@@ -77,7 +96,48 @@ impl Registration {
     ) -> io::Result<Registration> {
         let shared = handle.driver().io().add_source(io, interest)?;
 
-        Ok(Registration { handle, shared })
+        Ok(Registration {
+            handle,
+            shared: OnceLock::from(shared),
+            deferred: Mutex::new(None),
+        })
+    }
+
+    /// Creates a registration that registers the resource with the reactor on
+    /// first use instead of now.
+    ///
+    /// The first readiness poll, `try_io`, or `readiness` through a
+    /// [`RegistrationRef`] registers its resource with the given handle's
+    /// reactor, from the task that makes it. Errors from that registration are
+    /// returned by the operation that triggered it, and the next operation
+    /// tries again. A resource that is never used is never registered.
+    ///
+    /// `assume_ready` is applied as soon as the resource is registered, so the
+    /// first operation tries the resource instead of waiting for the driver's
+    /// first event; see [`assume_ready`](Self::assume_ready).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle's runtime has no I/O driver, like
+    /// [`new_with_interest_and_handle`](Self::new_with_interest_and_handle).
+    #[track_caller]
+    pub(crate) fn deferred(
+        interest: Interest,
+        assume_ready: Ready,
+        handle: scheduler::Handle,
+    ) -> Registration {
+        // Keep the "IO is disabled" panic at construction time, where it is
+        // documented, rather than at the first read.
+        let _ = handle.driver().io();
+
+        Registration {
+            handle,
+            shared: OnceLock::new(),
+            deferred: Mutex::new(Some(Deferred {
+                interest,
+                assume_ready,
+            })),
+        }
     }
 
     /// Deregisters the I/O resource from the reactor it is associated with.
@@ -97,11 +157,16 @@ impl Registration {
     ///
     /// `Err` is returned if an error is encountered.
     pub(crate) fn deregister(&mut self, io: &mut impl Source) -> io::Result<()> {
-        self.handle().deregister_source(&self.shared, io)
+        let Some(shared) = self.shared.get() else {
+            // Never registered, so there is nothing to deregister.
+            return Ok(());
+        };
+
+        self.handle().deregister_source(shared, io)
     }
 
     pub(crate) fn clear_readiness(&self, event: ReadyEvent) {
-        self.shared.clear_readiness(event);
+        self.registered().clear_readiness(event);
     }
 
     /// Marks the resource ready without waiting for the driver's first event.
@@ -110,9 +175,12 @@ impl Registration {
     /// (under load that first event can queue behind every established
     /// connection's events), and both ends of a fresh `pair()` are writable.
     /// A wrong guess costs one `WouldBlock`, which clears the readiness again.
+    ///
+    /// For a deferred registration, pass the readiness to
+    /// [`deferred`](Self::deferred) instead: this one must be registered.
     #[cfg(feature = "net")]
-    pub(crate) fn assume_ready(&self, ready: crate::io::Ready) {
-        self.shared.assume_ready(ready);
+    pub(crate) fn assume_ready(&self, ready: Ready) {
+        self.registered().assume_ready(ready);
     }
 
     // Uses the poll path, requiring the caller to ensure mutual exclusion for
@@ -160,7 +228,7 @@ impl Registration {
         ready!(crate::trace::trace_leaf(cx));
         // Keep track of task budget
         let coop = ready!(crate::task::coop::poll_proceed(cx));
-        let ev = ready!(self.shared.poll_readiness(cx, direction));
+        let ev = ready!(self.registered().poll_readiness(cx, direction));
 
         if ev.is_shutdown {
             return Poll::Ready(Err(gone()));
@@ -196,7 +264,7 @@ impl Registration {
         interest: Interest,
         f: impl FnOnce() -> io::Result<R>,
     ) -> io::Result<R> {
-        let ev = self.shared.ready_event(interest);
+        let ev = self.registered().ready_event(interest);
 
         // Don't attempt the operation if the resource is not ready.
         if ev.ready.is_empty() {
@@ -213,7 +281,7 @@ impl Registration {
     }
 
     pub(crate) async fn readiness(&self, interest: Interest) -> io::Result<ReadyEvent> {
-        let ev = self.shared.readiness(interest).await;
+        let ev = self.registered().readiness(interest).await;
 
         if ev.is_shutdown {
             return Err(gone());
@@ -247,6 +315,136 @@ impl Registration {
     fn handle(&self) -> &Handle {
         self.handle.driver().io()
     }
+
+    /// Registers the resource of a deferred registration with the reactor,
+    /// unless it is registered already.
+    fn register(&self, source: &dyn SharedSource) -> io::Result<()> {
+        if self.shared.get().is_some() {
+            return Ok(());
+        }
+
+        self.register_deferred(source)
+    }
+
+    #[cold]
+    fn register_deferred(&self, source: &dyn SharedSource) -> io::Result<()> {
+        let deferred = self.deferred.lock();
+
+        // Another task may have registered the resource while this one
+        // waited for the lock.
+        if self.shared.get().is_some() {
+            return Ok(());
+        }
+
+        let Deferred {
+            interest,
+            assume_ready,
+        } = deferred
+            .as_ref()
+            .expect("a registration is either registered or deferred");
+
+        let shared = self.handle().add_shared_source(source, *interest)?;
+        shared.assume_ready(*assume_ready);
+
+        // The lock is held and `shared` was empty above, so this stores ours.
+        let _ = self.shared.set(shared);
+        Ok(())
+    }
+
+    /// The driver state for a registered resource. A deferred registration
+    /// is registered by the [`RegistrationRef`] its operations go through.
+    fn registered(&self) -> &Arc<ScheduledIo> {
+        self.shared
+            .get()
+            .expect("a deferred registration was used before it was registered")
+    }
+}
+
+/// A [`Registration`] together with the resource it registers on first use.
+///
+/// Readiness polls and I/O on a resource that may have deferred its
+/// registration go through this, so that whichever comes first registers the
+/// resource. For a resource registered at construction, `source` is `None` and
+/// every method is the [`Registration`] method of the same name.
+#[derive(Clone, Copy)]
+pub(crate) struct RegistrationRef<'a> {
+    registration: &'a Registration,
+    source: Option<&'a (dyn SharedSource + Sync)>,
+}
+
+impl<'a> RegistrationRef<'a> {
+    /// `source` is the resource of a deferred registration, and `None` for a
+    /// resource registered at construction.
+    pub(crate) fn new(
+        registration: &'a Registration,
+        source: Option<&'a (dyn SharedSource + Sync)>,
+    ) -> RegistrationRef<'a> {
+        RegistrationRef {
+            registration,
+            source,
+        }
+    }
+
+    fn registered(self) -> io::Result<&'a Registration> {
+        if let Some(source) = self.source {
+            self.registration.register(source)?;
+        }
+        Ok(self.registration)
+    }
+
+    pub(crate) fn clear_readiness(self, event: ReadyEvent) {
+        self.registration.clear_readiness(event);
+    }
+
+    #[cfg(feature = "net")]
+    pub(crate) fn assume_ready(self, ready: Ready) {
+        self.registration.assume_ready(ready);
+    }
+
+    pub(crate) fn poll_read_ready(self, cx: &mut Context<'_>) -> Poll<io::Result<ReadyEvent>> {
+        self.registered()?.poll_read_ready(cx)
+    }
+
+    pub(crate) fn poll_write_ready(self, cx: &mut Context<'_>) -> Poll<io::Result<ReadyEvent>> {
+        self.registered()?.poll_write_ready(cx)
+    }
+
+    #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
+    pub(crate) fn poll_read_io<R>(
+        self,
+        cx: &mut Context<'_>,
+        f: impl FnMut() -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.registered()?.poll_read_io(cx, f)
+    }
+
+    pub(crate) fn poll_write_io<R>(
+        self,
+        cx: &mut Context<'_>,
+        f: impl FnMut() -> io::Result<R>,
+    ) -> Poll<io::Result<R>> {
+        self.registered()?.poll_write_io(cx, f)
+    }
+
+    pub(crate) fn try_io<R>(
+        self,
+        interest: Interest,
+        f: impl FnOnce() -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.registered()?.try_io(interest, f)
+    }
+
+    pub(crate) async fn readiness(self, interest: Interest) -> io::Result<ReadyEvent> {
+        self.registered()?.readiness(interest).await
+    }
+
+    pub(crate) async fn async_io<R>(
+        self,
+        interest: Interest,
+        f: impl FnMut() -> io::Result<R>,
+    ) -> io::Result<R> {
+        self.registered()?.async_io(interest, f).await
+    }
 }
 
 impl Drop for Registration {
@@ -258,7 +456,9 @@ impl Drop for Registration {
         // cycle would remain.
         //
         // See tokio-rs/tokio#3481 for more details.
-        self.shared.clear_wakers();
+        if let Some(shared) = self.shared.get() {
+            shared.clear_wakers();
+        }
     }
 }
 
