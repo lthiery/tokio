@@ -128,6 +128,38 @@ impl<E: Source> PollEvented<E> {
         })
     }
 
+    /// Creates a new `PollEvented` associated with the default reactor, with
+    /// readable and writable interests, that registers `io` with the reactor
+    /// on its first use instead of now.
+    ///
+    /// The first readiness poll or `try_*` call registers the resource, from
+    /// the task that makes it; registration errors are returned by that call.
+    /// A `PollEvented` that is never used is never registered. `assume_ready`
+    /// is applied once registered, so the first operation tries the resource
+    /// instead of waiting for the driver's first event.
+    ///
+    /// # Panics
+    ///
+    /// Like [`Self::new`], panics if thread-local runtime is not set or has
+    /// no I/O driver.
+    #[cfg(feature = "net")]
+    #[track_caller]
+    pub(crate) fn new_deferred(io: E, assume_ready: crate::io::Ready) -> Self
+    where
+        E: SharedSource + Sync,
+    {
+        let registration = Registration::deferred(
+            Interest::READABLE | Interest::WRITABLE,
+            assume_ready,
+            scheduler::Handle::current(),
+        );
+        Self {
+            io: Some(io),
+            registration,
+            deferred_source: Some(|io| io),
+        }
+    }
+
     /// Returns the registration, through which a registration deferred to
     /// first use registers `io`.
     pub(crate) fn registration(&self) -> RegistrationRef<'_> {
