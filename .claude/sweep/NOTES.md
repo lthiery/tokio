@@ -201,3 +201,18 @@ TOKIO_BENCH_CPUS (run.sh uses that instead of taskset). One processor group,
 so cpu ids < 64; hades has 32 logical. Cross-checked with
 `--target x86_64-pc-windows-msvc` on lounas. Other benches (rt_io_shards, fs,
 signal) stay unix-only upstream, so build the two by name, not `--benches`.
+
+### hades on Windows: CPU numbering (GetLogicalProcessorInformationEx, 2026-11-08)
+
+SMT siblings are adjacent (LP 2k and 2k+1 = core k), unlike Linux (siblings at
++16). L3 masks: 0x0000ffff (CCD0, 96 MB) and 0xffff0000 (CCD1, 96 MB). So the
+October Linux layouts become, taking one thread per core:
+
+- A (server on one CCD): server `0,2,4,6,8,10,12,14`, client `16,18,...,30`.
+- B (2 shards, one group per CCD): server `0,2,4,6,16,18,20,22`, client
+  `8,10,12,14,24,26,28,30`.
+
+The Linux A/B results from 2026-10-13 are on hades' Ubuntu disk
+(~/tokio-lazy-shards/.claude/sweep/hades-{A-sameccd,B-crossccd}); pull them
+the next time it boots Linux, or re-run there on this tree for a same-binary
+comparison.
