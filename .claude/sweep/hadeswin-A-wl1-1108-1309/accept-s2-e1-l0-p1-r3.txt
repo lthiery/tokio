@@ -1,0 +1,6 @@
+task_per_conn/multi_thread_1
+                        time:   [18.333 µs 18.519 µs 18.696 µs]
+  task_per_conn/multi_thread_1: io_shard_poll_stats same=133766 other=0 off_worker=0 (other/total 0.0%) registered_per_shard=[66884]
+task_per_conn/multi_thread_4
+                        time:   [14.309 µs 14.582 µs 14.848 µs]
+  task_per_conn/multi_thread_4: io_shard_poll_stats same=63924 other=69842 off_worker=0 (other/total 52.2%) registered_per_shard=[33442, 33442]

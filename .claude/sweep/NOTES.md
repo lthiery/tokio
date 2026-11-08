@@ -244,3 +244,44 @@ net_accept task_per_conn/4 (pinned 0-7, 2 shards): 10.55 us, 51% cross-group
 (rr). Same shape as Linux: rr ~25% cross on 2 shards, local alone does not
 place, worker-local gives 0%. Absolute numbers are a 2-core-per-side config
 and not comparable to anything; the sweep uses the A/B layouts.
+
+## hades on WINDOWS, 2026-11-08 (hadeswin-{A,B}-wl{0,1}-1108-1309)
+
+Tree f2e5450c (register_shared lazy + #8450 + WL v3 + EXPERIMENT), 8 server
+workers 1/core + 8 client workers 1/core, 2 shards, 64 conns x 100 rounds, 3
+alternating rounds, RST close on, Windows LP numbering (see above). A = server
+on one CCD, B = one shard group per CCD. Medians, echo/steady par 64, us:
+
+| layout | wl | eager+rr | lazy+rr | lazy+local | eager+local | 1 shard |
+|---|---|---|---|---|---|---|
+| A | 0 | 23056 (35%) | 23193 (35%) | 26466 (42%, [6,59]) | 27391 (44%, [65,0]) | 27087 |
+| B | 0 | 24986 (34%) | 24714 (34%) | 25020 (35%, [22,43]) | 27045 (41%, [65,0]) | 27962 |
+| A | 1 | 22495 (50%) | 23944 (50%) | **22438 (0%)** | 28274 (50%, [65,0]) | 28966 |
+| B | 1 | 25472 (50%) | 26730 (50%) | **24428 (0%)** | 31076 (50%, [65,0]) | 31481 |
+
+(parenthesis = cross-group poll fraction; per-shard spread where unbalanced.)
+
+Findings:
+
+1. Sharding itself pays on Windows: 1 -> 2 shards is -15..-20% steady in every
+   layout (27-32 ms -> 22-26 ms). On lounas/epoll it was neutral. One IOCP per
+   shard relieves a serialization point epoll does not have.
+2. lazy + local + worker-local = 0% cross-group, balanced [33,32], and the
+   fastest config in both layouts, as on Linux. In B (group = CCD) it beats
+   rr-WL by 4-9% (24.4 vs 25.5 eager / 26.7 lazy); in A by 0-6%. So the
+   structural 0% turns into a small latency gain when the groups are whole L3
+   domains, but still <=10%, like lounas: 64-byte echo is syscall-bound, not
+   cache-bound. net_shard_echo is not the bench that would show a big L3 effect.
+3. Layout B is ~10% slower than A for EVERY config including 1 shard (32 vs 29
+   ms): splitting the server across CCDs costs in the scheduler's shared state
+   (inject queue, stealing, shard driver lock) regardless of I/O placement.
+4. Lazy vs eager: net_accept task_per_conn/4 -14/-15% (15.4 -> 13.1 us at 1
+   shard, 13.6 -> 11.7 at 2, both layouts); echo steady neutral under rr.
+5. Placement without affinity behaves exactly as on Linux: eager+local
+   collapses onto the acceptor's shard ([65,0], +15-25%), lazy+local spreads
+   unevenly under a burst and follows the acceptor under a trickle.
+6. Zero panics or hangs across 4 legs x 36 configs; the probe fix holds on
+   Windows (WL + 2 shards was the deadlock case on Linux).
+
+Not yet done: hades LINUX on this same tree for the same-binary-logic
+epoll-vs-IOCP comparison (October Linux A/B dirs are on hades' Ubuntu disk).

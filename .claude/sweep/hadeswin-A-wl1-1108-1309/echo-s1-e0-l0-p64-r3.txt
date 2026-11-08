@@ -1,0 +1,6 @@
+echo/steady             time:   [29.419 ms 29.570 ms 29.738 ms]
+                        time:   [-0.7085% +0.4591% +1.6342%] (p = 0.45 > 0.05)
+  echo/steady: io_shard_poll_stats same=6770366 other=0 off_worker=0 (other/total 0.0%) registered_per_shard=[65]
+echo/fresh              time:   [4.2565 ms 4.3096 ms 4.3725 ms]
+                        time:   [-11.901% -10.335% -8.8805%] (p = 0.00 < 0.05)
+  echo/fresh: io_shard_poll_stats same=2069084 other=0 off_worker=0 (other/total 0.0%) registered_per_shard=[61121]
