@@ -185,8 +185,12 @@ Question for Windows: one IOCP per shard, a rearm syscall per WouldBlock; does
 cross-group placement cost more than on epoll, and does hades' 2x96MB L3 turn
 the 0% vs 43-75% cross-group difference into latency.
 
-Smoke (lounas, 4+4 workers on 0-3/4-7, 2 shards, 16 conns, 20 rounds, suite
-compiling on the box at the same time, so timings are NOT clean): knobs all
-behave, WL=1 gives 0% cross-group again. lazy+rr steady came out 11.3 ms vs
-1.8 ms for the other three configs; re-check on a quiet box before believing
-it.
+Smoke (lounas, 4+4 workers on 0-3/4-7, 2 shards, 16 conns, 20 rounds): knobs
+all behave, WL=1 gives 0% cross-group again. A first pass showed lazy+rr
+steady at 11.3 ms vs 1.8 ms; that was the test suite compiling on the same
+box. Quiet re-run, 3 alternating rounds: eager+rr 1.61/1.82/1.66 ms, lazy+rr
+1.75/1.95/1.98 ms, 1-shard control 1.84 (eager) / 1.78 (lazy). Within the
+usual spread of this bench.
+
+Linux suite on the full stack (tokio_unstable, full,worker-local): 2554 passed,
+0 failed, 70 ignored, 192 binaries (2026-11-08).
