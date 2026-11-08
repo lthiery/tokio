@@ -229,3 +229,18 @@ Two changes:
   OFF by default. Linux cost of the knob (4+4 workers, 2 shards): echo/fresh
   unchanged (1.41 vs 1.45 ms), net_accept task_per_conn/4 14.6 -> 16.2 us.
   Windows sweeps run with it on; Linux comparisons must say which.
+
+### Windows smoke, hades (2026-11-08, 4+4 workers on LPs 0-3/4-7 = 2 cores
+each, 2 shards, 16 conns, 20 rounds, RST close on)
+
+| config | steady | fresh | cross-group | per shard |
+|---|---|---|---|---|
+| eager rr | 1.087 ms | 903 us | 24.4% | [9,8] |
+| lazy rr | 1.106 ms | 967 us | 24.5% | [9,8] |
+| lazy local | 1.121 ms | 990 us | 26.4% | [11,6] |
+| lazy local WL | 1.109 ms | 999 us | **0.0%** | [9,8] |
+
+net_accept task_per_conn/4 (pinned 0-7, 2 shards): 10.55 us, 51% cross-group
+(rr). Same shape as Linux: rr ~25% cross on 2 shards, local alone does not
+place, worker-local gives 0%. Absolute numbers are a 2-core-per-side config
+and not comparable to anything; the sweep uses the A/B layouts.
