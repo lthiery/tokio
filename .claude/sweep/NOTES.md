@@ -194,3 +194,10 @@ usual spread of this bench.
 
 Linux suite on the full stack (tokio_unstable, full,worker-local): 2554 passed,
 0 failed, 70 ignored, 192 binaries (2026-11-08).
+
+Windows port of the benches (f666cbf0): net_shard_echo lost its `#![cfg(unix)]`
+and pins with SetThreadAffinityMask; net_accept pins its process from
+TOKIO_BENCH_CPUS (run.sh uses that instead of taskset). One processor group,
+so cpu ids < 64; hades has 32 logical. Cross-checked with
+`--target x86_64-pc-windows-msvc` on lounas. Other benches (rt_io_shards, fs,
+signal) stay unix-only upstream, so build the two by name, not `--benches`.
