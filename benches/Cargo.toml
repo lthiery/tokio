@@ -14,6 +14,7 @@ tokio = { version = "1.5.0", path = "../tokio", features = ["full"] }
 criterion = "0.5.1"
 rand = "0.9"
 rand_chacha = "0.9"
+socket2 = "0.6"
 
 [dev-dependencies]
 tokio-util = { version = "0.7.0", path = "../tokio-util", features = ["full"] }

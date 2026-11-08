@@ -77,8 +77,21 @@ const BATCH: u64 = 64;
 fn client(addr: SocketAddr) -> StdStream {
     let mut c = StdStream::connect(addr).unwrap();
     c.set_nodelay(true).unwrap();
+    if rst_close() {
+        socket2::SockRef::from(&c)
+            .set_linger(Some(std::time::Duration::ZERO))
+            .unwrap();
+    }
     c.write_all(REQUEST).unwrap();
     c
+}
+
+/// EXPERIMENT: `TOKIO_BENCH_RST_CLOSE=1` closes clients with RST (SO_LINGER
+/// 0) so their ports skip TIME_WAIT; needed on Windows, which has no
+/// `tcp_tw_reuse` and runs out of dynamic ports within seconds here.
+fn rst_close() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TOKIO_BENCH_RST_CLOSE").is_some_and(|v| v == "1"))
 }
 
 async fn serve(mut s: TcpStream) {

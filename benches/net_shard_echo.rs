@@ -65,6 +65,14 @@ fn env_cpus(name: &str) -> Vec<usize> {
     out
 }
 
+/// `TOKIO_BENCH_RST_CLOSE=1`: clients close with RST (SO_LINGER 0) so their
+/// ports skip TIME_WAIT. Needed on Windows, which has no `tcp_tw_reuse`: the
+/// fresh-connection shape exhausts the dynamic port range in seconds.
+fn rst_close() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TOKIO_BENCH_RST_CLOSE").is_some_and(|v| v == "1"))
+}
+
 /// Pins the calling thread to `cpus`.
 #[cfg(unix)]
 fn pin_to(cpus: &[usize]) {
@@ -250,6 +258,11 @@ async fn connect_all(addr: SocketAddr, n: usize) -> Vec<TcpStream> {
                 tokio::spawn(async move {
                     let s = TcpStream::connect(addr).await.unwrap();
                     s.set_nodelay(true).unwrap();
+                    if rst_close() {
+                        socket2::SockRef::from(&s)
+                            .set_linger(Some(Duration::ZERO))
+                            .unwrap();
+                    }
                     s
                 })
             })
