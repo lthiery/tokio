@@ -216,3 +216,16 @@ The Linux A/B results from 2026-10-13 are on hades' Ubuntu disk
 (~/tokio-lazy-shards/.claude/sweep/hades-{A-sameccd,B-crossccd}); pull them
 the next time it boots Linux, or re-run there on this tree for a same-binary
 comparison.
+
+### Windows: client port exhaustion (2026-11-08)
+
+First Windows smoke: echo/steady ran (eager rr 1.13 ms, 24% cross-group), then
+echo/fresh and net_accept died with WSAEADDRINUSE (10048) on connect: 16384
+dynamic ports, 120 s TIME_WAIT, no tcp_tw_reuse; 19k sockets in TIME_WAIT.
+Two changes:
+- hades: `netsh int ipv4 set dynamicport tcp start=10000 num=55535` (persistent).
+- benches: `TOKIO_BENCH_RST_CLOSE=1` makes clients close with SO_LINGER 0
+  (RST, no TIME_WAIT), in both net_shard_echo and net_accept via socket2.
+  OFF by default. Linux cost of the knob (4+4 workers, 2 shards): echo/fresh
+  unchanged (1.41 vs 1.45 ms), net_accept task_per_conn/4 14.6 -> 16.2 us.
+  Windows sweeps run with it on; Linux comparisons must say which.
