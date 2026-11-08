@@ -30,6 +30,46 @@ use tokio::runtime::{self, Runtime};
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 
+/// EXPERIMENT: `TOKIO_BENCH_CPUS` ("0-3,8") pins the whole process, so the
+/// runtime threads built below inherit it. Replaces `taskset` for runs on
+/// Windows.
+fn pin_process() {
+    let Ok(v) = std::env::var("TOKIO_BENCH_CPUS") else {
+        return;
+    };
+    let mut cpus = Vec::new();
+    for part in v.split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                cpus.extend(a..=b);
+            }
+            None => cpus.push(part.parse().unwrap()),
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for &c in &cpus {
+            libc::CPU_SET(c, &mut set);
+        }
+        // pid 0 is the calling thread; threads spawned after this inherit it.
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessAffinityMask};
+        let mask = cpus.iter().fold(0usize, |m, &c| {
+            assert!(
+                c < usize::BITS as usize,
+                "cpu {c} is outside the first processor group"
+            );
+            m | (1 << c)
+        });
+        SetProcessAffinityMask(GetCurrentProcess(), mask);
+    }
+}
+
 const REQUEST: &[u8] = &[1; 64];
 const BATCH: u64 = 64;
 
@@ -150,14 +190,17 @@ async fn task_per_conn(listener: Arc<TcpListener>, n: u64) {
 }
 
 fn block_on_current_thread(c: &mut Criterion) {
+    pin_process();
     block_on(c, "block_on/current_thread", rt_current_thread());
 }
 
 fn block_on_multi_thread_1(c: &mut Criterion) {
+    pin_process();
     block_on(c, "block_on/multi_thread_1", rt_multi_thread(1));
 }
 
 fn serial_task_multi_thread_1(c: &mut Criterion) {
+    pin_process();
     spawned(
         c,
         "serial_task/multi_thread_1",
@@ -167,6 +210,7 @@ fn serial_task_multi_thread_1(c: &mut Criterion) {
 }
 
 fn serial_task_multi_thread_4(c: &mut Criterion) {
+    pin_process();
     spawned(
         c,
         "serial_task/multi_thread_4",
@@ -176,6 +220,7 @@ fn serial_task_multi_thread_4(c: &mut Criterion) {
 }
 
 fn task_per_conn_multi_thread_1(c: &mut Criterion) {
+    pin_process();
     spawned(
         c,
         "task_per_conn/multi_thread_1",
@@ -185,6 +230,7 @@ fn task_per_conn_multi_thread_1(c: &mut Criterion) {
 }
 
 fn task_per_conn_multi_thread_4(c: &mut Criterion) {
+    pin_process();
     spawned(
         c,
         "task_per_conn/multi_thread_4",
@@ -325,18 +371,23 @@ fn live_bench(c: &mut Criterion, name: &str, busy: usize, inline: bool, cap: Opt
 }
 
 fn live_task_per_conn_0(c: &mut Criterion) {
+    pin_process();
     live_bench(c, "live/task_per_conn/busy_0", 0, false, None);
 }
 fn live_task_per_conn_1024(c: &mut Criterion) {
+    pin_process();
     live_bench(c, "live/task_per_conn/busy_1024", 1024, false, None);
 }
 fn live_inline_0(c: &mut Criterion) {
+    pin_process();
     live_bench(c, "live/inline_first_read/busy_0", 0, true, None);
 }
 fn live_inline_1024(c: &mut Criterion) {
+    pin_process();
     live_bench(c, "live/inline_first_read/busy_1024", 1024, true, None);
 }
 fn live_task_per_conn_cap8_1024(c: &mut Criterion) {
+    pin_process();
     live_bench(c, "live/task_per_conn_cap8/busy_1024", 1024, false, Some(8));
 }
 

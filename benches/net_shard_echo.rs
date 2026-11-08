@@ -29,8 +29,6 @@
 //! the task has a fixed home and its first poll, hence its registration,
 //! happens there.
 
-#![cfg(unix)]
-
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -67,6 +65,8 @@ fn env_cpus(name: &str) -> Vec<usize> {
     out
 }
 
+/// Pins the calling thread to `cpus`.
+#[cfg(unix)]
 fn pin_to(cpus: &[usize]) {
     if cpus.is_empty() {
         return;
@@ -77,6 +77,26 @@ fn pin_to(cpus: &[usize]) {
             libc::CPU_SET(c, &mut set);
         }
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+/// Pins the calling thread to `cpus`. One processor group only, so CPUs
+/// 0..64.
+#[cfg(windows)]
+fn pin_to(cpus: &[usize]) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+    if cpus.is_empty() {
+        return;
+    }
+    let mask = cpus.iter().fold(0usize, |m, &c| {
+        assert!(
+            c < usize::BITS as usize,
+            "cpu {c} is outside the first processor group"
+        );
+        m | (1 << c)
+    });
+    unsafe {
+        SetThreadAffinityMask(GetCurrentThread(), mask);
     }
 }
 

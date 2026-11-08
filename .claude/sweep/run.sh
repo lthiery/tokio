@@ -3,8 +3,9 @@
 # Usage: run.sh <outdir> <server_cpus> <client_cpus> <rounds> [echo_bin] [accept_bin]
 set -u
 out=$1; scpu=$2; ccpu=$3; rounds=$4
-echo_bin=${5:-$(ls ~/tokio-lazy-shards/target/release/deps/net_shard_echo-* | grep -v '\.d$' | head -1)}
-acc_bin=${6:-$(ls ~/tokio-lazy-shards/target/release/deps/net_accept-* | grep -v '\.d$' | head -1)}
+here=$(cd "$(dirname "$0")/../.." && pwd)
+echo_bin=${5:-$(ls "$here"/target/bench/release/deps/net_shard_echo-* | grep -vE '\.(d|pdb)$' | head -1)}
+acc_bin=${6:-$(ls "$here"/target/bench/release/deps/net_accept-* | grep -vE '\.(d|pdb)$' | head -1)}
 mkdir -p "$out"
 export TOKIO_BENCH_WORKERS=${TOKIO_BENCH_WORKERS:-8} TOKIO_BENCH_SERVER_CPUS=$scpu TOKIO_BENCH_CLIENT_CPUS=$ccpu
 export TOKIO_BENCH_CLIENT_WORKERS=${TOKIO_BENCH_CLIENT_WORKERS:-8} TOKIO_BENCH_PIN_PER_WORKER=${TOKIO_BENCH_PIN_PER_WORKER:-1}
@@ -27,7 +28,7 @@ for r in $(seq 1 "$rounds"); do
       "$echo_bin" --bench --warm-up-time 1 --measurement-time 3 --noplot 2>&1 \
       | grep -E 'time:|io_shard_poll_stats|panicked|error' > "$out/echo-$tag.txt"
     [ "$4" = 1 ] && [ "$WITH_ACCEPT" = 1 ] && TOKIO_BENCH_IO_SHARDS=$1 TOKIO_EAGER_TCP=$2 TOKIO_IO_SHARD_LOCAL=$3 \
-      taskset -c "$scpu,$ccpu" "$acc_bin" --bench 'task_per_conn/multi_thread_4|task_per_conn/multi_thread_1' \
+      TOKIO_BENCH_CPUS="$scpu,$ccpu" "$acc_bin" --bench 'task_per_conn/multi_thread_4|task_per_conn/multi_thread_1' \
       --warm-up-time 1 --measurement-time 3 --noplot 2>&1 \
       | grep -E '^[a-z_/0-9]+ *$|time:|task_per_conn/multi_thread_[14]: io_shard|panicked|error' > "$out/accept-$tag.txt"
     echo "done $tag $(date +%T)" >> "$out/meta.txt"
