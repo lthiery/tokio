@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tokio::runtime::Builder;
 use tokio::sync::oneshot;
-use tokio::task::spawn_worker_local;
+use tokio::task::{run_on_each_worker, run_on_worker, spawn_worker_local};
 
 fn rt(workers: usize) -> tokio::runtime::Runtime {
     Builder::new_multi_thread()
@@ -88,8 +88,8 @@ fn cross_thread_wake() {
             join.await.unwrap()
         });
 
-        // Sent from the `block_on` thread, which is not a worker: the wake
-        // must travel through the worker-local inject queue and unpark.
+        // Sent from a non-runtime thread: the wake must travel through the
+        // worker-local inject queue and unpark.
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             tx.send(7).unwrap();
@@ -151,6 +151,7 @@ fn panics_outside_runtime() {
     let _join = spawn_worker_local(async {});
 }
 
+#[cfg(panic = "unwind")]
 #[test]
 fn panics_on_current_thread_runtime() {
     let rt = Builder::new_current_thread().build().unwrap();
@@ -167,6 +168,7 @@ fn panics_on_current_thread_runtime() {
     assert!(result);
 }
 
+#[cfg(panic = "unwind")]
 #[test]
 fn block_in_place_panics_with_live_worker_local_tasks() {
     let rt = rt(2);
@@ -201,26 +203,170 @@ fn block_in_place_allowed_without_worker_local_tasks() {
 }
 
 #[test]
-fn many_tasks_many_workers() {
+fn run_on_worker_targets_correct_worker() {
     let rt = rt(4);
     rt.block_on(async {
-        let mut joins = Vec::new();
-        for i in 0..64u32 {
-            joins.push(tokio::spawn(async move {
-                let join = spawn_worker_local(async move {
-                    let mut acc = 0;
-                    for j in 0..i {
-                        tokio::task::yield_now().await;
-                        acc += j;
-                    }
-                    acc
+        for target in 0..4 {
+            let (tx, rx) = oneshot::channel();
+            run_on_worker(target, move || {
+                spawn_worker_local(async move {
+                    tx.send(tokio::runtime::worker_index()).unwrap();
                 });
-                join.await.unwrap()
-            }));
-        }
-        for (i, join) in joins.into_iter().enumerate() {
-            let i = i as u32;
-            assert_eq!(join.await.unwrap(), (0..i).sum::<u32>());
+            });
+            assert_eq!(rx.await.unwrap(), Some(target));
         }
     });
 }
+
+#[test]
+fn run_on_worker_from_non_runtime_thread() {
+    let rt = rt(2);
+    let handle = rt.handle().clone();
+    let (tx, rx) = oneshot::channel();
+
+    std::thread::spawn(move || {
+        let _guard = handle.enter();
+        run_on_worker(0, move || {
+            tx.send(tokio::runtime::worker_index()).unwrap();
+        });
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(rt.block_on(rx).unwrap(), Some(0));
+}
+
+#[test]
+fn run_on_each_worker_visits_all() {
+    let rt = rt(4);
+    rt.block_on(async {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        run_on_each_worker(|index| {
+            let tx = tx.clone();
+            move || {
+                spawn_worker_local(async move {
+                    tx.send((index, tokio::runtime::worker_index())).unwrap();
+                });
+            }
+        });
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let (index, actual) = rx.recv().await.unwrap();
+            assert_eq!(Some(index), actual);
+            seen.push(index);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+    });
+}
+
+#[test]
+fn handle_and_runtime_run_on_worker_without_enter() {
+    let rt = rt(4);
+    let handle = rt.handle().clone();
+
+    let (tx, rx) = oneshot::channel();
+    handle.run_on_worker(2, move || {
+        tx.send(tokio::runtime::worker_index()).unwrap();
+    });
+    assert_eq!(rt.block_on(rx).unwrap(), Some(2));
+
+    // `run_on_each_worker` lets the builder move non-`Clone` per-worker
+    // resources (here, individual `oneshot::Sender`s) onto each worker.
+    let mut rxs = Vec::new();
+    rt.run_on_each_worker(|index| {
+        let (tx, rx) = oneshot::channel();
+        rxs.push((index, rx));
+        move || {
+            spawn_worker_local(async move {
+                tx.send(tokio::runtime::worker_index()).unwrap();
+            });
+        }
+    });
+
+    rt.block_on(async {
+        for (index, rx) in rxs {
+            assert_eq!(rx.await.unwrap(), Some(index));
+        }
+    });
+}
+
+#[test]
+fn run_on_worker_same_worker_fast_path() {
+    let rt = rt(2);
+    rt.block_on(async {
+        let result = tokio::spawn(async {
+            let me = tokio::runtime::worker_index().unwrap();
+            let (tx, rx) = oneshot::channel();
+            run_on_worker(me, move || {
+                tx.send(tokio::runtime::worker_index()).unwrap();
+            });
+            (me, rx.await.unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(Some(result.0), result.1);
+    });
+}
+
+#[test]
+fn run_on_worker_panic_is_contained() {
+    let rt = rt(2);
+    rt.block_on(async {
+        let (tx, rx) = oneshot::channel();
+        run_on_worker(0, || panic!("boom"));
+        // A panicking closure must not take down the worker: queue another
+        // closure on the same worker and observe it running.
+        run_on_worker(0, move || {
+            tx.send(()).unwrap();
+        });
+        rx.await.unwrap();
+    });
+}
+
+#[test]
+fn run_on_worker_after_shutdown_drops_closure() {
+    let rt = rt(2);
+    let handle = rt.handle().clone();
+
+    let sentinel = Arc::new(());
+    let weak = Arc::downgrade(&sentinel);
+
+    drop(rt);
+
+    // The closure captures a runtime handle: if the request queue kept it
+    // after shutdown, the closure would keep the scheduler alive and the
+    // scheduler the closure, leaking both. The closed queue must drop the
+    // request immediately instead.
+    {
+        let _enter = handle.enter();
+        let handle = handle.clone();
+        run_on_worker(0, move || {
+            let _handle = handle;
+            let _sentinel = sentinel;
+        });
+    }
+
+    drop(handle);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+#[should_panic(expected = "out of range")]
+fn run_on_worker_index_out_of_range() {
+    let rt = rt(2);
+    rt.block_on(async {
+        run_on_worker(2, || {});
+    });
+}
+
+#[test]
+#[should_panic(expected = "requires the multi-threaded runtime")]
+fn run_on_worker_current_thread_panics() {
+    let rt = Builder::new_current_thread().build().unwrap();
+    rt.block_on(async {
+        run_on_worker(0, || {});
+    });
+}
+

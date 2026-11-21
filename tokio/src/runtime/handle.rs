@@ -517,6 +517,107 @@ impl Handle {
     }
 }
 
+cfg_worker_local! {
+    impl Handle {
+        /// Runs a closure on a specific worker thread of this multi-threaded
+        /// runtime.
+        ///
+        /// This is the handle-bound counterpart to [`tokio::task::run_on_worker`]:
+        /// it does not require entering the runtime context first. See
+        /// [`tokio::task::run_on_worker`] for execution, panic, and shutdown
+        /// semantics.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `worker_index` is greater than or equal to the number of
+        /// worker threads, or if this handle does not belong to a
+        /// multi-threaded runtime.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// # #[cfg(not(target_family = "wasm"))]
+        /// # {
+        /// use tokio::runtime::Builder;
+        ///
+        /// let rt = Builder::new_multi_thread().worker_threads(2).build().unwrap();
+        /// let handle = rt.handle().clone();
+        /// let (tx, rx) = tokio::sync::oneshot::channel();
+        ///
+        /// handle.run_on_worker(1, move || {
+        ///     tx.send(tokio::runtime::worker_index()).unwrap();
+        /// });
+        ///
+        /// assert_eq!(rt.block_on(rx).unwrap(), Some(1));
+        /// # }
+        /// ```
+        ///
+        /// **Note**: This is an [unstable API][unstable]. The public API of this
+        /// may break in 1.x releases. See [the documentation on unstable
+        /// features][unstable] for details.
+        ///
+        /// [unstable]: crate#unstable-features
+        /// [`tokio::task::run_on_worker`]: crate::task::run_on_worker
+        #[track_caller]
+        pub fn run_on_worker<F>(&self, worker_index: usize, f: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            let spawned_at = crate::runtime::task::SpawnLocation::capture();
+            match &self.inner {
+                scheduler::Handle::MultiThread(handle) => {
+                    crate::task::spawn_worker_local::run_on_worker_handle(
+                        handle,
+                        worker_index,
+                        f,
+                        spawned_at,
+                    );
+                }
+                #[allow(unreachable_patterns)]
+                _ => panic!("`Handle::run_on_worker` requires the multi-threaded runtime"),
+            }
+        }
+
+        /// Runs a closure on every worker thread of this multi-threaded
+        /// runtime.
+        ///
+        /// Calls `f(worker_index)` once per worker on the calling thread to
+        /// construct the closure to ship to that worker, then runs each
+        /// returned closure on its target worker thread. See
+        /// [`tokio::task::run_on_each_worker`] for details.
+        ///
+        /// # Panics
+        ///
+        /// Panics if this handle does not belong to a multi-threaded runtime.
+        ///
+        /// **Note**: This is an [unstable API][unstable]. The public API of this
+        /// may break in 1.x releases. See [the documentation on unstable
+        /// features][unstable] for details.
+        ///
+        /// [unstable]: crate#unstable-features
+        /// [`tokio::task::run_on_each_worker`]: crate::task::run_on_each_worker
+        #[track_caller]
+        pub fn run_on_each_worker<F, G>(&self, f: F)
+        where
+            F: FnMut(usize) -> G,
+            G: FnOnce() + Send + 'static,
+        {
+            let spawned_at = crate::runtime::task::SpawnLocation::capture();
+            match &self.inner {
+                scheduler::Handle::MultiThread(handle) => {
+                    crate::task::spawn_worker_local::run_on_each_worker_handle(
+                        handle,
+                        f,
+                        spawned_at,
+                    );
+                }
+                #[allow(unreachable_patterns)]
+                _ => panic!("`Handle::run_on_each_worker` requires the multi-threaded runtime"),
+            }
+        }
+    }
+}
+
 impl std::panic::UnwindSafe for Handle {}
 
 impl std::panic::RefUnwindSafe for Handle {}

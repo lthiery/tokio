@@ -213,6 +213,27 @@ cfg_rt! {
         })
     }
 
+    /// Runs `f` with the current worker context if this thread is currently
+    /// driving `worker_index` of `handle` and holds its core.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    #[track_caller]
+    pub(crate) fn with_matching_worker<R>(
+        handle: &crate::loom::sync::Arc<crate::runtime::scheduler::multi_thread::Handle>,
+        worker_index: usize,
+        f: impl FnOnce(&crate::runtime::scheduler::multi_thread::Context) -> R,
+    ) -> Option<R> {
+        with_scheduler(|ctx| match ctx {
+            Some(scheduler::Context::MultiThread(cx))
+                if cx.matches_handle(handle)
+                    && cx.worker_index() == worker_index
+                    && cx.has_core() =>
+            {
+                Some(f(cx))
+            }
+            _ => None,
+        })
+    }
+
     #[track_caller]
     pub(crate) fn defer(waker: &Waker) {
         with_scheduler(|maybe_scheduler| {

@@ -1,4 +1,6 @@
-use crate::runtime::task;
+use crate::loom::sync::Arc;
+use crate::runtime::scheduler::multi_thread;
+use crate::runtime::task::{self, SpawnLocation};
 use crate::runtime::{context, AutoBox};
 use crate::task::JoinHandle;
 use crate::util::trace::SpawnMeta;
@@ -16,6 +18,9 @@ use std::future::Future;
 ///
 /// The spawned task may still be woken from any thread; only polling and
 /// dropping are pinned.
+///
+/// To create worker-local tasks on a *different* worker, use
+/// [`run_on_worker`] or [`Handle::run_on_worker`](crate::runtime::Handle::run_on_worker).
 ///
 /// # Interaction with `block_in_place`
 ///
@@ -36,7 +41,7 @@ use std::future::Future;
 /// thread calling [`Runtime::block_on`](crate::runtime::Runtime::block_on)
 /// is *not* a worker thread: to use this function from the future passed to
 /// `block_on` (including an `async fn main`), first move onto a worker
-/// with [`tokio::spawn`](crate::spawn).
+/// with [`tokio::spawn`](crate::spawn) or [`run_on_worker`].
 ///
 /// # Examples
 ///
@@ -77,6 +82,243 @@ where
     F::Output: 'static,
 {
     let meta = SpawnMeta::new_unnamed(std::mem::size_of::<F>());
+    spawn_worker_local_with_meta(future, meta)
+}
+
+/// Runs a closure on a specific worker thread of the current multi-threaded
+/// runtime.
+///
+/// The closure runs on the target worker's thread, from where it can call
+/// [`spawn_worker_local`] to create tasks bound to that worker. This is the
+/// building block for setting up per-worker state (for example, one reactor
+/// task per worker).
+///
+/// The closure body runs inside a worker-local task, so a panic in it is
+/// contained like any other task panic.
+///
+/// This is fire-and-forget: there is no handle to await completion or
+/// observe panics. To get results out, have the closure spawn a task and
+/// send over a channel. If the runtime is shutting down, the closure may be
+/// dropped without running.
+///
+/// To call this without entering the runtime context first, use
+/// [`Handle::run_on_worker`](crate::runtime::Handle::run_on_worker) or
+/// [`Runtime::run_on_worker`](crate::runtime::Runtime::run_on_worker).
+///
+/// # Panics
+///
+/// Panics if `worker_index` is greater than or equal to the number of worker
+/// threads, or if called from outside a multi-threaded runtime.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(not(target_family = "wasm"))]
+/// # {
+/// #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+/// async fn main() {
+///     let (tx, rx) = tokio::sync::oneshot::channel();
+///
+///     tokio::task::run_on_worker(1, move || {
+///         tokio::task::spawn_worker_local(async move {
+///             let index = tokio::runtime::worker_index();
+///             tx.send(index).unwrap();
+///         });
+///     });
+///
+///     assert_eq!(rx.await.unwrap(), Some(1));
+/// }
+/// # }
+/// ```
+///
+/// **Note**: This is an [unstable API][unstable]. The public API of this may
+/// break in 1.x releases. See [the documentation on unstable
+/// features][unstable] for details.
+///
+/// [unstable]: crate#unstable-features
+#[track_caller]
+pub fn run_on_worker<F>(worker_index: usize, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    let spawned_at = SpawnLocation::capture();
+    with_multi_thread_handle("run_on_worker", |handle| {
+        run_on_worker_handle(handle, worker_index, f, spawned_at);
+    });
+}
+
+/// Runs a closure on every worker thread of the current multi-threaded
+/// runtime.
+///
+/// Calls `f(worker_index)` once per worker on the calling thread to construct
+/// the closure to ship to that worker, then runs each returned closure on its
+/// target worker thread. Because `f` runs on the calling thread, it does not
+/// need to be `Send`, `'static`, or `Clone`, making it easy to move unique
+/// per-worker resources (such as channels or sockets) onto each worker.
+///
+/// See [`run_on_worker`] for the execution and panic semantics of each
+/// invocation. To call this without entering the runtime context first, use
+/// [`Handle::run_on_each_worker`](crate::runtime::Handle::run_on_each_worker)
+/// or [`Runtime::run_on_each_worker`](crate::runtime::Runtime::run_on_each_worker).
+///
+/// # Panics
+///
+/// Panics if called from outside a multi-threaded runtime.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(not(target_family = "wasm"))]
+/// # {
+/// #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+/// async fn main() {
+///     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+///
+///     tokio::task::run_on_each_worker(|index| {
+///         let tx = tx.clone();
+///         move || {
+///             tx.send((index, tokio::runtime::worker_index())).unwrap();
+///         }
+///     });
+///
+///     let mut seen = vec![rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+///     seen.sort_unstable();
+///     assert_eq!(seen, vec![(0, Some(0)), (1, Some(1))]);
+/// }
+/// # }
+/// ```
+///
+/// **Note**: This is an [unstable API][unstable]. The public API of this may
+/// break in 1.x releases. See [the documentation on unstable
+/// features][unstable] for details.
+///
+/// [unstable]: crate#unstable-features
+#[track_caller]
+pub fn run_on_each_worker<F, G>(f: F)
+where
+    F: FnMut(usize) -> G,
+    G: FnOnce() + Send + 'static,
+{
+    let spawned_at = SpawnLocation::capture();
+    with_multi_thread_handle("run_on_each_worker", |handle| {
+        run_on_each_worker_handle(handle, f, spawned_at);
+    });
+}
+
+/// Runs `f` on `worker_index` of `handle`, taking a lock-free direct-spawn
+/// fast path when already executing on that worker with its core.
+pub(crate) fn run_on_worker_handle<F>(
+    handle: &Arc<multi_thread::Handle>,
+    worker_index: usize,
+    f: F,
+    spawned_at: SpawnLocation,
+) where
+    F: FnOnce() + Send + 'static,
+{
+    let mut f = Some(f);
+    let spawned_directly = context::with_matching_worker(handle, worker_index, |cx| {
+        let f = f.take().unwrap();
+        let future = async move { f() };
+        let mut meta = SpawnMeta::new_unnamed(std::mem::size_of_val(&future));
+        meta.spawned_at = spawned_at;
+        drop(spawn_on_worker_cx(cx, future, meta));
+    })
+    .is_some();
+
+    if spawned_directly {
+        return;
+    }
+
+    handle.push_worker_local_spawn_request(
+        worker_index,
+        wrap_spawn_request_at(f.unwrap(), spawned_at),
+    );
+}
+
+pub(crate) fn run_on_each_worker_handle<F, G>(
+    handle: &Arc<multi_thread::Handle>,
+    mut f: F,
+    spawned_at: SpawnLocation,
+) where
+    F: FnMut(usize) -> G,
+    G: FnOnce() + Send + 'static,
+{
+    for index in 0..handle.num_workers() {
+        run_on_worker_handle(handle, index, f(index), spawned_at);
+    }
+}
+
+/// Wraps a user closure so it executes inside a worker-local task on the
+/// target worker: the task harness contains panics and fires the usual task
+/// hooks. The outer closure runs in the worker's spawn-request drain, where
+/// the core is available, so the inner spawn cannot fail.
+fn wrap_spawn_request_at<F>(f: F, spawned_at: SpawnLocation) -> Box<dyn FnOnce() + Send>
+where
+    F: FnOnce() + Send + 'static,
+{
+    Box::new(move || {
+        let future = async move { f() };
+        let mut meta = SpawnMeta::new_unnamed(std::mem::size_of_val(&future));
+        meta.spawned_at = spawned_at;
+        // Fire-and-forget: the JoinHandle is intentionally dropped.
+        drop(spawn_worker_local_with_meta(future, meta));
+    })
+}
+
+#[track_caller]
+fn with_multi_thread_handle<R>(api_name: &str, f: impl FnOnce(&Arc<multi_thread::Handle>) -> R) -> R {
+    use crate::runtime::scheduler;
+
+    match context::with_current(|handle| match handle {
+        scheduler::Handle::MultiThread(handle) => Some(f(handle)),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }) {
+        Ok(Some(ret)) => ret,
+        Ok(None) => panic!("`{api_name}` requires the multi-threaded runtime"),
+        Err(e) => {
+            panic!("`{api_name}` must be called from the context of a Tokio 1.x runtime: {e}")
+        }
+    }
+}
+
+fn spawn_on_worker_cx<F>(
+    cx: &multi_thread::Context,
+    future: F,
+    meta: SpawnMeta<'_>,
+) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    if AutoBox::<F>::SHOULD_BOX {
+        spawn_on_worker_cx_inner(cx, Box::pin(future), meta)
+    } else {
+        spawn_on_worker_cx_inner(cx, future, meta)
+    }
+}
+
+fn spawn_on_worker_cx_inner<F>(
+    cx: &multi_thread::Context,
+    future: F,
+    meta: SpawnMeta<'_>,
+) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    let id = task::Id::next();
+    let task = crate::util::trace::task(future, "task", meta, id.as_u64());
+    cx.spawn_worker_local(task, id, meta.spawned_at)
+        .expect("matching worker context verified core presence")
+}
+
+#[track_caller]
+fn spawn_worker_local_with_meta<F>(future: F, meta: SpawnMeta<'_>) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
     if AutoBox::<F>::SHOULD_BOX {
         spawn_worker_local_inner(Box::pin(future), meta)
     } else {

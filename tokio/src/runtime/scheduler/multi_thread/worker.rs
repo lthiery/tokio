@@ -1016,6 +1016,11 @@ impl Context {
             self.worker.handle.ptr_eq(handle)
         }
 
+        /// Returns `true` if this worker currently holds its core.
+        pub(crate) fn has_core(&self) -> bool {
+            self.core.borrow().is_some()
+        }
+
         /// Returns `true` if this worker currently holds its core and has any
         /// alive worker-local tasks bound to it.
         fn has_alive_worker_local_tasks(&self) -> bool {
@@ -1898,6 +1903,35 @@ impl Handle {
                 self.shared.remotes[worker_index].unpark.unpark(&self.driver);
             }
         }
+        /// Queues a closure to run on a specific worker thread and unparks that
+        /// worker if it is parked.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `worker_index` is out of range.
+        pub(crate) fn push_worker_local_spawn_request(
+            &self,
+            worker_index: usize,
+            f: Box<dyn FnOnce() + Send>,
+        ) {
+            assert!(
+                worker_index < self.shared.worker_locals.len(),
+                "worker index {} is out of range: the runtime has {} worker threads",
+                worker_index,
+                self.shared.worker_locals.len(),
+            );
+
+            // The push fails if the queue is closed (the runtime is shutting
+            // down); the request is dropped without running and there is no
+            // worker to unpark.
+            let worker_local = &self.shared.worker_locals[worker_index];
+            if worker_local.push_spawn_request(f) && worker_local.should_unpark() {
+                // See `push_worker_local_task` for why the worker is
+                // unparked directly rather than through the idle set.
+                self.shared.remotes[worker_index].unpark.unpark(&self.driver);
+            }
+        }
+
         fn debug_assert_worker_locals_empty(&self) {
             debug_assert!(self
                 .shared

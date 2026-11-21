@@ -502,6 +502,58 @@ impl Runtime {
     }
 }
 
+cfg_worker_local! {
+    impl Runtime {
+        /// Runs a closure on a specific worker thread of this multi-threaded
+        /// runtime.
+        ///
+        /// See [`Handle::run_on_worker`](crate::runtime::Handle::run_on_worker)
+        /// for details.
+        ///
+        /// # Panics
+        ///
+        /// Panics if `worker_index` is greater than or equal to the number of
+        /// worker threads, or if this runtime is not a multi-threaded runtime.
+        ///
+        /// **Note**: This is an [unstable API][unstable]. The public API of this
+        /// may break in 1.x releases. See [the documentation on unstable
+        /// features][unstable] for details.
+        ///
+        /// [unstable]: crate#unstable-features
+        #[track_caller]
+        pub fn run_on_worker<F>(&self, worker_index: usize, f: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            self.handle.run_on_worker(worker_index, f);
+        }
+
+        /// Runs a closure on every worker thread of this multi-threaded
+        /// runtime.
+        ///
+        /// See [`Handle::run_on_each_worker`](crate::runtime::Handle::run_on_each_worker)
+        /// for details.
+        ///
+        /// # Panics
+        ///
+        /// Panics if this runtime is not a multi-threaded runtime.
+        ///
+        /// **Note**: This is an [unstable API][unstable]. The public API of this
+        /// may break in 1.x releases. See [the documentation on unstable
+        /// features][unstable] for details.
+        ///
+        /// [unstable]: crate#unstable-features
+        #[track_caller]
+        pub fn run_on_each_worker<F, G>(&self, f: F)
+        where
+            F: FnMut(usize) -> G,
+            G: FnOnce() + Send + 'static,
+        {
+            self.handle.run_on_each_worker(f);
+        }
+    }
+}
+
 impl Drop for Runtime {
     fn drop(&mut self) {
         match &mut self.scheduler {
