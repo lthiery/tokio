@@ -9,6 +9,13 @@ pub(crate) struct Config {
     /// How many ticks before pulling a task from the global/remote queue?
     pub(crate) global_queue_interval: Option<u32>,
 
+    /// How many ticks before prioritizing the worker-local queue?
+    ///
+    /// When `None`, shares the worker's `global_queue_interval` (offset by
+    /// half an interval).
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(crate) worker_local_queue_interval: Option<std::num::NonZeroU32>,
+
     /// How many ticks before yielding to the driver for timer and I/O events?
     pub(crate) event_interval: u32,
 

@@ -175,6 +175,12 @@ struct Core {
     /// How often to check the global queue
     global_queue_interval: u32,
 
+    /// Optional explicit interval for the periodic worker-local priority slot.
+    /// When `None`, shares `global_queue_interval` (offset by half an interval)
+    /// without an extra modulo.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    worker_local_queue_interval: Option<std::num::NonZeroU32>,
+
     /// Fast random number generator.
     rand: FastRand,
 
@@ -340,6 +346,8 @@ pub(super) fn create(
             had_driver: park::HadDriver::No,
             park: Some(park),
             global_queue_interval: stats.tuned_global_queue_interval(&config),
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            worker_local_queue_interval: config.worker_local_queue_interval,
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
             #[cfg(all(tokio_unstable, feature = "worker-local"))]
@@ -651,23 +659,31 @@ impl Context {
             let tick_rem = core.tick % core.global_queue_interval;
 
             // Periodically prioritize worker-local tasks, mirroring how
-            // `next_task` periodically prioritizes the inject queue. The
-            // half-interval offset staggers the two checks whenever
-            // `global_queue_interval > 1`. Unlike the inject check, this slot
-            // does not replace the regular slot: after running a worker-local
-            // task, control falls through to the regular queues below. A
+            // `next_task` periodically prioritizes the inject queue. By
+            // default this shares `global_queue_interval` (reusing `tick_rem`
+            // with zero extra division) and staggers the two checks by half an
+            // interval whenever the interval > 1. When an explicit
+            // `worker_local_queue_interval` is configured, it runs on that
+            // cadence instead. Unlike the inject check, this slot does not
+            // replace the regular slot: after running a worker-local task,
+            // control falls through to the regular queues below. A
             // worker-local task that always reschedules itself therefore
-            // cannot starve regular tasks, even with `global_queue_interval`
-            // set to 1 on a single-worker runtime where no other worker
-            // could steal them.
+            // cannot starve regular tasks, even with interval 1 on a
+            // single-worker runtime where no other worker could steal them.
             #[cfg(all(tokio_unstable, feature = "worker-local"))]
             let mut ran_worker_local = false;
             #[cfg(all(tokio_unstable, feature = "worker-local"))]
-            if tick_rem == core.global_queue_interval / 2 {
-                (core, ran_worker_local) = match self.poll_worker_local(core) {
-                    ControlFlow::Continue(result) => result,
-                    ControlFlow::Break(()) => return,
+            {
+                let check_worker_local = match core.worker_local_queue_interval {
+                    Some(interval) => core.tick % interval.get() == interval.get() / 2,
+                    None => tick_rem == core.global_queue_interval / 2,
                 };
+                if check_worker_local {
+                    (core, ran_worker_local) = match self.poll_worker_local(core) {
+                        ControlFlow::Continue(result) => result,
+                        ControlFlow::Break(()) => return,
+                    };
+                }
             }
 
             // First, check work available to the current worker.

@@ -122,6 +122,10 @@ pub struct Builder {
     /// self-tuning strategy based on mean task poll times.
     pub(super) global_queue_interval: Option<u32>,
 
+    /// How many ticks before prioritizing the worker-local queue?
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(super) worker_local_queue_interval: Option<std::num::NonZeroU32>,
+
     /// How many ticks before yielding to the driver for timer and I/O events?
     pub(super) event_interval: u32,
 
@@ -348,6 +352,8 @@ impl Builder {
             // Defaults for these values depend on the scheduler kind, so we get them
             // as parameters.
             global_queue_interval: None,
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            worker_local_queue_interval: None,
             event_interval,
 
             seed_generator: RngSeedGenerator::new(RngSeed::new()),
@@ -1274,6 +1280,61 @@ impl Builder {
         self
     }
 
+    cfg_worker_local! {
+        /// Sets the number of scheduler ticks after which a multi-threaded
+        /// worker prioritizes its worker-local task queue.
+        ///
+        /// A scheduler "tick" roughly corresponds to one `poll` invocation on a
+        /// task. Worker-local tasks always run whenever a worker's regular local
+        /// queue is empty; this interval controls how often a busy worker
+        /// checks its worker-local queue (and pending `run_on_worker` spawn
+        /// requests) even while regular tasks remain queued.
+        ///
+        /// By default, this option is unset and each worker shares its
+        /// (self-tuned) [`global_queue_interval`](Builder::global_queue_interval),
+        /// staggered by half an interval.
+        ///
+        /// Setting a smaller value reduces tail latency for worker-local tasks
+        /// when sharing a worker with regular tasks. Setting the interval to
+        /// `1` polls a worker-local task on every tick while still falling
+        /// through to the regular queues so neither queue can starve the other.
+        ///
+        /// This option only applies to multi-threaded runtimes. Attempting to
+        /// use this option with any other runtime type has no effect.
+        ///
+        /// **Note**: This is an [unstable API][unstable]. The public API of
+        /// this may break in 1.x releases. See [the documentation on unstable
+        /// features][unstable] for details.
+        ///
+        /// [unstable]: crate#unstable-features
+        ///
+        /// # Panics
+        ///
+        /// This function will panic if `0` is passed as an argument.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// # #[cfg(not(target_family = "wasm"))]
+        /// # {
+        /// # use tokio::runtime;
+        /// # pub fn main() {
+        /// let rt = runtime::Builder::new_multi_thread()
+        ///     .worker_local_queue_interval(16)
+        ///     .build()
+        ///     .unwrap();
+        /// # }
+        /// # }
+        /// ```
+        #[track_caller]
+        pub fn worker_local_queue_interval(&mut self, val: u32) -> &mut Self {
+            let val = std::num::NonZeroU32::new(val)
+                .expect("worker_local_queue_interval must be greater than 0");
+            self.worker_local_queue_interval = Some(val);
+            self
+        }
+    }
+
     /// Sets the number of scheduler ticks after which the scheduler will poll for
     /// external events (timers, I/O, and so on).
     ///
@@ -1792,6 +1853,8 @@ impl Builder {
                 after_poll: self.after_poll.clone(),
                 after_termination: self.after_termination.clone(),
                 global_queue_interval: self.global_queue_interval,
+                #[cfg(all(tokio_unstable, feature = "worker-local"))]
+                worker_local_queue_interval: None,
                 event_interval: self.event_interval,
                 #[cfg(tokio_unstable)]
                 unhandled_panic: self.unhandled_panic.clone(),
@@ -2215,6 +2278,8 @@ cfg_rt_multi_thread! {
                     after_poll: self.after_poll.clone(),
                     after_termination: self.after_termination.clone(),
                     global_queue_interval: self.global_queue_interval,
+                    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+                    worker_local_queue_interval: self.worker_local_queue_interval,
                     event_interval: self.event_interval,
                     #[cfg(tokio_unstable)]
                     unhandled_panic: self.unhandled_panic.clone(),
@@ -2264,6 +2329,12 @@ impl fmt::Debug for Builder {
                 "enable_eager_driver_handoff",
                 &self.enable_eager_driver_handoff,
             );
+
+        #[cfg(all(tokio_unstable, feature = "worker-local"))]
+        debug.field(
+            "worker_local_queue_interval",
+            &self.worker_local_queue_interval,
+        );
 
         if self.name.is_none() {
             debug.finish_non_exhaustive()

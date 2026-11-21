@@ -934,3 +934,161 @@ fn batch_cross_thread_wake_preserves_fifo_and_drains_all() {
     });
     assert_eq!(order, (0..8).collect::<Vec<_>>());
 }
+
+#[test]
+#[should_panic(expected = "worker_local_queue_interval must be greater than 0")]
+fn worker_local_queue_interval_zero_panics() {
+    Builder::new_multi_thread().worker_local_queue_interval(0);
+}
+
+#[test]
+fn worker_local_queue_interval_one_does_not_starve_regular_tasks() {
+    struct SelfWake {
+        stop: Arc<AtomicBool>,
+        started: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl std::future::Future for SelfWake {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+            }
+            if self.stop.load(Ordering::SeqCst) {
+                std::task::Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    let rt = Builder::new_multi_thread()
+        .worker_threads(1)
+        .global_queue_interval(61)
+        .worker_local_queue_interval(1)
+        .build()
+        .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+    rt.run_on_worker(0, {
+        let stop = stop.clone();
+        move || {
+            spawn_worker_local(SelfWake {
+                stop,
+                started: Some(started_tx),
+            });
+        }
+    });
+
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+
+    rt.spawn(async move {
+        done_tx.send(()).unwrap();
+    });
+
+    let done = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+    stop.store(true, Ordering::SeqCst);
+    done.expect("regular task starved with worker_local_queue_interval(1)");
+}
+
+#[test]
+fn worker_local_queue_interval_controls_priority_frequency() {
+    // A self-waking future that counts its own polls until `stop` is set.
+    struct CountPolls {
+        polls: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+        stop_after: Option<usize>,
+    }
+
+    impl std::future::Future for CountPolls {
+        type Output = ();
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            let n = self.polls.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(limit) = self.stop_after {
+                if n >= limit {
+                    self.stop.store(true, Ordering::SeqCst);
+                    return std::task::Poll::Ready(());
+                }
+            }
+            if self.stop.load(Ordering::SeqCst) {
+                std::task::Poll::Ready(())
+            } else {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    let run_case = |wl_interval: u32| -> usize {
+        let rt = Builder::new_multi_thread()
+            .worker_threads(1)
+            .disable_lifo_slot()
+            .global_queue_interval(1000)
+            .worker_local_queue_interval(wl_interval)
+            .build()
+            .unwrap();
+
+        let wl_polls = Arc::new(AtomicUsize::new(0));
+        let reg_polls = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = oneshot::channel();
+
+        // Spawn both the worker-local task and the regular task from the same
+        // worker-local closure so both are queued before the regular loop
+        // starts ticking.
+        rt.run_on_worker(0, {
+            let wl_polls = wl_polls.clone();
+            let reg_polls = reg_polls.clone();
+            let stop = stop.clone();
+            move || {
+                spawn_worker_local(CountPolls {
+                    polls: wl_polls,
+                    stop: stop.clone(),
+                    stop_after: None,
+                });
+                tokio::spawn(async move {
+                    CountPolls {
+                        polls: reg_polls,
+                        stop,
+                        stop_after: Some(400),
+                    }
+                    .await;
+                    let _ = done_tx.send(());
+                });
+            }
+        });
+
+        rt.block_on(done_rx).unwrap();
+        drop(rt);
+        wl_polls.load(Ordering::SeqCst)
+    };
+
+    // With `global_queue_interval(1000)`, sharing it would give <= 1 priority
+    // poll during 400 regular ticks. An explicit interval of 4 gives ~100, and
+    // an explicit interval of 1 gives ~400 (1:1 alternation).
+    let polls_every_4 = run_case(4);
+    let polls_every_1 = run_case(1);
+
+    assert!(
+        (50..=200).contains(&polls_every_4),
+        "expected ~100 worker-local polls at interval=4, got {polls_every_4}"
+    );
+    assert!(
+        polls_every_1 >= 300,
+        "expected ~400 worker-local polls at interval=1, got {polls_every_1}"
+    );
+}
