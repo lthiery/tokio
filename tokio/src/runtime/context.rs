@@ -169,6 +169,50 @@ cfg_rt! {
         with_scheduler(|ctx| ctx.and_then(|c| c.worker_index()))
     }
 
+    /// Binds a worker-local task to the current worker.
+    ///
+    /// Fails unless the current thread is a multi-threaded runtime worker
+    /// holding its core: possession of the core is what makes it sound to
+    /// touch the worker's `LocalOwnedTasks`.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    #[track_caller]
+    pub(crate) fn spawn_worker_local<F>(
+        future: F,
+        id: crate::runtime::task::Id,
+        spawned_at: crate::runtime::task::SpawnLocation,
+    ) -> Result<
+        crate::runtime::task::JoinHandle<F::Output>,
+        crate::runtime::scheduler::multi_thread::worker_local::SpawnWorkerLocalError,
+    >
+    where
+        F: crate::future::Future + 'static,
+        F::Output: 'static,
+    {
+        use crate::runtime::scheduler::multi_thread::worker_local::SpawnWorkerLocalError;
+
+        with_scheduler(|ctx| match ctx {
+            Some(scheduler::Context::MultiThread(cx)) => {
+                // Respect `Handle::enter()`: if another runtime handle has
+                // been entered on this thread, refuse rather than silently
+                // spawning onto the shadowed worker's runtime.
+                let matches_current = with_current(|handle| match handle {
+                    scheduler::Handle::MultiThread(current) => cx.matches_handle(current),
+                    #[allow(unreachable_patterns)]
+                    _ => false,
+                })
+                .unwrap_or(false);
+
+                if !matches_current {
+                    return Err(SpawnWorkerLocalError::NotOnWorker);
+                }
+
+                cx.spawn_worker_local(future, id, spawned_at)
+                    .ok_or(SpawnWorkerLocalError::NoCore)
+            }
+            _ => Err(SpawnWorkerLocalError::NotOnWorker),
+        })
+    }
+
     #[track_caller]
     pub(crate) fn defer(waker: &Waker) {
         with_scheduler(|maybe_scheduler| {

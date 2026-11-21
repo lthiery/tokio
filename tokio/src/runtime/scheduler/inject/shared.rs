@@ -118,4 +118,25 @@ impl<T: 'static> Shared<T> {
 
         Pop::new(n, synced)
     }
+
+    /// Removes and returns the entire linked list of queued tasks in O(1),
+    /// returning `(head, tail, len)`.
+    ///
+    /// # Safety
+    ///
+    /// Must be called with the same `Synced` instance returned by `Shared::new`.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(crate) unsafe fn drain_all(
+        &self,
+        synced: &mut Synced,
+    ) -> (Option<task::RawTask>, Option<task::RawTask>, usize) {
+        // safety: All updates to the len atomic are guarded by the mutex.
+        let len = unsafe { self.len.unsync_load() };
+        if len == 0 {
+            return (None, None, 0);
+        }
+
+        self.len.store(0, Release);
+        (synced.head.take(), synced.tail.take(), len)
+    }
 }

@@ -68,6 +68,18 @@ use crate::runtime::{
 };
 use crate::runtime::{context, TaskHooks};
 use crate::task::coop;
+
+cfg_worker_local! {
+    use crate::future::Future;
+    use crate::loom::sync::atomic::{fence, Ordering::SeqCst};
+    use crate::runtime::scheduler::multi_thread::worker_local::{
+        LocalQueue, WorkerLocalScheduler, WorkerLocalShared,
+    };
+    use crate::runtime::task::JoinHandle;
+    use crate::runtime::TaskMeta;
+    use std::collections::VecDeque;
+    use std::panic::{self, AssertUnwindSafe};
+}
 use crate::util::atomic_cell::AtomicCell;
 use crate::util::cacheline::CachePadded;
 use crate::util::rand::{FastRand, RngSeedGenerator};
@@ -165,6 +177,17 @@ struct Core {
 
     /// Fast random number generator.
     rand: FastRand,
+
+    /// Queue of runnable worker-local tasks. Only ever touched by the thread
+    /// holding this core; tasks in it are bound to this worker and are
+    /// invisible to stealers.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    worker_local_queue: LocalQueue,
+
+    /// Reusable scratch buffer swapped with `WorkerLocalShared::spawn_requests`
+    /// during drain so the underlying allocation is preserved across drains.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    spawn_requests_buf: VecDeque<Box<dyn FnOnce() + Send>>,
 }
 
 /// State shared across all workers
@@ -184,6 +207,11 @@ pub(crate) struct Shared {
     /// Collection of all active tasks spawned onto this executor.
     pub(crate) owned: OwnedTasks<Arc<Handle>>,
 
+    /// Per-worker state for worker-local tasks, cache-padded to avoid false
+    /// sharing between adjacent workers.
+    #[cfg(all(tokio_unstable, feature = "worker-local"))]
+    pub(super) worker_locals: Box<[CachePadded<WorkerLocalShared>]>,
+
     /// Data synchronized by the scheduler mutex
     pub(super) synced: Mutex<Synced>,
 
@@ -201,7 +229,7 @@ pub(crate) struct Shared {
     config: Config,
 
     /// Collects metrics from the runtime.
-    pub(super) scheduler_metrics: SchedulerMetrics,
+    pub(super) scheduler_metrics: CachePadded<SchedulerMetrics>,
 
     pub(super) worker_metrics: Box<[WorkerMetrics]>,
 
@@ -263,6 +291,11 @@ pub(crate) struct Launch(Vec<Arc<Worker>>);
 /// A notified task handle
 type Notified = task::Notified<Arc<Handle>>;
 
+cfg_worker_local! {
+    /// A notified worker-local task handle
+    type NotifiedWorkerLocal = task::Notified<WorkerLocalScheduler>;
+}
+
 /// Value picked out of thin-air. Running the LIFO slot a handful of times
 /// seems sufficient to benefit from locality. More than 3 times probably is
 /// over-weighting. The value can be tuned in the future with data that shows
@@ -309,6 +342,10 @@ pub(super) fn create(
             global_queue_interval: stats.tuned_global_queue_interval(&config),
             stats,
             rand: FastRand::from_seed(config.seed_generator.next_seed()),
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            worker_local_queue: LocalQueue::new(),
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            spawn_requests_buf: VecDeque::new(),
         }));
 
         remotes.push(Remote { steal, unpark });
@@ -327,6 +364,11 @@ pub(super) fn create(
             inject: CachePadded::new(InjectQueue::new()),
             idle: CachePadded::new(idle),
             owned: OwnedTasks::new(size),
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            worker_locals: (0..size)
+                .map(|_| CachePadded::new(WorkerLocalShared::new()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             synced: Mutex::new(Synced {
                 idle: idle_synced,
                 #[cfg(all(tokio_unstable, feature = "time"))]
@@ -335,7 +377,7 @@ pub(super) fn create(
             shutdown_cores: Mutex::new(vec![]),
             trace_status: TraceStatus::new(remotes_len),
             config,
-            scheduler_metrics: SchedulerMetrics::new(),
+            scheduler_metrics: CachePadded::new(SchedulerMetrics::new()),
             worker_metrics: worker_metrics.into_boxed_slice(),
             schedule_latency_start,
             _counters: Counters,
@@ -466,6 +508,19 @@ fn maybe_move_runtime() -> Result<(bool, bool), &'static str> {
 
         let cx = maybe_cx.expect("no .is_some() == false cases above should lead here");
 
+        // Worker-local tasks are bound to the OS thread driving their worker.
+        // Handing the core to another thread would let them be polled or
+        // dropped on a different thread, which is unsound for `!Send`
+        // futures. Refuse to block while any are alive on this worker. Note
+        // that this must be checked *before* the core is taken out of the
+        // context below: panicking with the core moved into a local would
+        // drop it, wedging runtime shutdown.
+        if cx.has_alive_worker_local_tasks() {
+            return Err(
+                "cannot call `block_in_place` on a worker that is running worker-local tasks",
+            );
+        }
+
         // Since deferred tasks don't stay on `core`, make sure to wake them
         // before blocking.
         cx.defer.wake();
@@ -590,13 +645,57 @@ impl Context {
             // Run maintenance, if needed
             core = self.maintenance(core);
 
+            // Compute the tick remainder once per iteration so both the
+            // periodic worker-local priority check and `next_task`'s global
+            // queue check share a single division.
+            let tick_rem = core.tick % core.global_queue_interval;
+
+            // Periodically prioritize worker-local tasks, mirroring how
+            // `next_task` periodically prioritizes the inject queue. The
+            // half-interval offset staggers the two checks whenever
+            // `global_queue_interval > 1`. Unlike the inject check, this slot
+            // does not replace the regular slot: after running a worker-local
+            // task, control falls through to the regular queues below. A
+            // worker-local task that always reschedules itself therefore
+            // cannot starve regular tasks, even with `global_queue_interval`
+            // set to 1 on a single-worker runtime where no other worker
+            // could steal them.
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            let mut ran_worker_local = false;
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            if tick_rem == core.global_queue_interval / 2 {
+                (core, ran_worker_local) = match self.poll_worker_local(core) {
+                    ControlFlow::Continue(result) => result,
+                    ControlFlow::Break(()) => return,
+                };
+            }
+
             // First, check work available to the current worker.
-            if let Some(task) = core.next_task(&self.worker) {
+            if let Some(task) = core.next_task(&self.worker, tick_rem == 0) {
                 core = match self.run_task(task, core) {
                     ControlFlow::Continue(core) => core,
                     ControlFlow::Break(()) => return,
                 };
                 continue;
+            }
+
+            // No regular local work: run worker-local tasks before resorting
+            // to stealing (unless the priority slot above already ran one on
+            // this tick). This is also the prompt pickup path for spawn
+            // requests and cross-thread wakes after an unpark.
+            #[cfg(all(tokio_unstable, feature = "worker-local"))]
+            {
+                if ran_worker_local {
+                    continue;
+                }
+                let ran;
+                (core, ran) = match self.poll_worker_local(core) {
+                    ControlFlow::Continue(result) => result,
+                    ControlFlow::Break(()) => return,
+                };
+                if ran {
+                    continue;
+                }
             }
 
             // We consumed all work in the queues and will start searching for work.
@@ -789,6 +888,200 @@ impl Context {
         })
     }
 
+    cfg_worker_local! {
+        /// Runs pending spawn requests, then at most one worker-local task.
+        ///
+        /// Returns the core and whether a task ran.
+        fn poll_worker_local(&self, core: Box<Core>) -> ControlFlow<(), (Box<Core>, bool)> {
+            let mut core = match self.drain_worker_local_spawn_requests(core) {
+                ControlFlow::Continue(core) => core,
+                ControlFlow::Break(()) => return ControlFlow::Break(()),
+            };
+
+            if let Some(task) = core.next_worker_local_task(&self.worker) {
+                let core = match self.run_worker_local_task(task, core) {
+                    ControlFlow::Continue(core) => core,
+                    ControlFlow::Break(()) => return ControlFlow::Break(()),
+                };
+                return ControlFlow::Continue((core, true));
+            }
+
+            ControlFlow::Continue((core, false))
+        }
+
+        /// Runs a worker-local task.
+        ///
+        /// This mirrors `run_task`, without the LIFO-slot loop (worker-local
+        /// wakes always go to the back of the worker-local queue).
+        fn run_worker_local_task(
+            &self,
+            task: NotifiedWorkerLocal,
+            mut core: Box<Core>,
+        ) -> ControlFlow<(), Box<Core>> {
+            let task = self.worker.handle.shared.worker_locals[self.worker.index]
+                .owned
+                .assert_owner(task);
+
+            // Make sure the worker is not in the **searching** state. This
+            // enables another idle worker to try to steal work.
+            let notified_parked_worker = core.transition_from_searching(&self.worker);
+
+            // Mirror `run_task`'s eager driver handoff so waking to run a
+            // worker-local task does not leave `had_driver` stale or stall I/O
+            // driver handoff when `enable_eager_driver_handoff` is enabled.
+            if cfg!(tokio_unstable)
+                && core.enable_eager_driver_handoff
+                && core.had_driver == park::HadDriver::Yes
+                && !notified_parked_worker
+            {
+                core.had_driver = park::HadDriver::No;
+                self.worker.handle.notify_parked_local();
+            }
+
+            let schedule_latency_context = task
+                .get_scheduled_at()
+                .prepare(self.worker.handle.shared.schedule_latency_start);
+            let task_schedule_latency = core.stats.start_poll(schedule_latency_context);
+
+            let task_meta = task.task_meta(task_schedule_latency);
+
+            // Make the core available to the runtime context
+            *self.core.borrow_mut() = Some(core);
+
+            // Run the task
+            coop::budget(|| {
+                self.worker
+                    .handle
+                    .task_hooks
+                    .poll_start_callback(&task_meta);
+
+                task.run();
+
+                self.worker.handle.task_hooks.poll_stop_callback(&task_meta);
+            });
+
+            // Check if we still have the core. Polling the task (and dropping
+            // its future or output) cannot lose it because the task remains in
+            // `owned` until `Harness::complete` calls `release`, so
+            // `block_in_place` panics. However, `poll_stop_callback` runs after
+            // `task.run()` has released a completed task: if no other
+            // worker-local tasks are alive, it could call `block_in_place` and
+            // hand the core to another thread.
+            let Some(mut core) = self.core.borrow_mut().take() else {
+                return ControlFlow::Break(());
+            };
+            core.stats.end_poll();
+            ControlFlow::Continue(core)
+        }
+
+        /// Runs pending spawn-request closures for this worker.
+        ///
+        /// The closures spawn worker-local tasks through the thread-local
+        /// context, so the core is made available to the context for the
+        /// duration of the drain.
+        fn drain_worker_local_spawn_requests(
+            &self,
+            mut core: Box<Core>,
+        ) -> ControlFlow<(), Box<Core>> {
+            let worker_local = &self.worker.handle.shared.worker_locals[self.worker.index];
+
+            if !worker_local.has_spawn_requests() {
+                return ControlFlow::Continue(core);
+            }
+
+            let mut requests = std::mem::take(&mut core.spawn_requests_buf);
+            worker_local.take_spawn_requests(&mut requests);
+
+            *self.core.borrow_mut() = Some(core);
+
+            for f in requests.drain(..) {
+                let _ = panic::catch_unwind(AssertUnwindSafe(f));
+            }
+
+            // Defensively check that we still have the core, mirroring
+            // `run_task`. The only closures queued here wrap user code in a
+            // worker-local task rather than running it directly, so they cannot
+            // currently reach `block_in_place` and lose the core.
+            match self.core.borrow_mut().take() {
+                Some(mut core) => {
+                    core.spawn_requests_buf = requests;
+                    ControlFlow::Continue(core)
+                }
+                None => ControlFlow::Break(()),
+            }
+        }
+
+        /// Returns `true` if this worker belongs to `handle`.
+        pub(crate) fn matches_handle(&self, handle: &Arc<Handle>) -> bool {
+            self.worker.handle.ptr_eq(handle)
+        }
+
+        /// Returns `true` if this worker currently holds its core and has any
+        /// alive worker-local tasks bound to it.
+        fn has_alive_worker_local_tasks(&self) -> bool {
+            self.core.borrow().is_some()
+                && !self.worker.handle.shared.worker_locals[self.worker.index]
+                    .owned
+                    .is_empty()
+        }
+        /// Binds a worker-local task to this worker and schedules it.
+        ///
+        /// Returns `None` if this thread does not currently hold the worker's
+        /// core (for example, inside `block_in_place`). Possession of the core
+        /// is what makes touching `owned` sound: only one thread can hold the
+        /// core, and the `block_in_place` gate keeps it on this thread while
+        /// any worker-local tasks are alive.
+        pub(crate) fn spawn_worker_local<F>(
+            &self,
+            future: F,
+            id: task::Id,
+            spawned_at: task::SpawnLocation,
+        ) -> Option<JoinHandle<F::Output>>
+        where
+            F: Future + 'static,
+            F::Output: 'static,
+        {
+            if self.core.borrow().is_none() {
+                return None;
+            }
+
+            let handle = &self.worker.handle;
+            let index = self.worker.index;
+
+            let (join_handle, notified) = handle.shared.worker_locals[index].owned.bind(
+                future,
+                WorkerLocalScheduler::new(handle.clone(), index),
+                id,
+                spawned_at,
+            );
+
+            handle.task_hooks.spawn(&TaskMeta {
+                id,
+                spawned_at,
+                #[cfg(all(tokio_unstable, feature = "schedule-latency"))]
+                schedule_latency: None,
+                _phantom: std::marker::PhantomData,
+            });
+
+            // The scheduler routes the task into this worker's local queue via
+            // the context. `notified` is `None` if the runtime is shutting down,
+            // in which case `bind` already shut the task down without inserting
+            // it into `owned` (so it must not count as alive).
+            if let Some(notified) = notified {
+                handle.shared.worker_locals[index].record_spawn();
+                handle.schedule_worker_local_task(index, notified);
+            }
+
+            Some(join_handle)
+        }
+    }
+
+    cfg_not_worker_local! {
+        fn has_alive_worker_local_tasks(&self) -> bool {
+            false
+        }
+    }
+
     fn reset_lifo_enabled(&self, core: &mut Core) {
         core.lifo_enabled = !self.worker.handle.shared.config.disable_lifo_slot;
     }
@@ -852,6 +1145,8 @@ impl Context {
                     break;
                 }
             }
+
+            core.clear_worker_local_parked(&self.worker);
         }
 
         if let Some(f) = &self.worker.handle.shared.config.after_unpark {
@@ -1051,8 +1346,8 @@ impl Core {
     }
 
     /// Return the next notified task available to this worker.
-    fn next_task(&mut self, worker: &Worker) -> Option<Notified> {
-        if self.tick % self.global_queue_interval == 0 {
+    fn next_task(&mut self, worker: &Worker, check_global: bool) -> Option<Notified> {
+        if check_global {
             // Update the global queue interval, if needed
             self.tune_global_queue_interval(worker);
 
@@ -1065,6 +1360,15 @@ impl Core {
 
             if maybe_task.is_some() {
                 return maybe_task;
+            }
+
+            // If this worker has queued worker-local work, it is not idle:
+            // skip polling the global inject queue on off-interval ticks to
+            // avoid contending on `Shared::inject` on every worker-local poll.
+            // The global queue is still checked on every `global_queue_interval`
+            // tick above.
+            if self.has_worker_local_queued_tasks() {
+                return None;
             }
 
             if worker.inject().is_empty() {
@@ -1121,6 +1425,134 @@ impl Core {
 
     fn next_local_task(&mut self) -> Option<Notified> {
         self.lifo_slot.take().or_else(|| self.run_queue.pop())
+    }
+
+    cfg_worker_local! {
+        /// Returns the next worker-local task, refilling the local queue from
+        /// this worker's inject queue when it runs dry.
+        fn next_worker_local_task(&mut self, worker: &Worker) -> Option<NotifiedWorkerLocal> {
+            let worker_local = &worker.handle.shared.worker_locals[worker.index];
+
+            if let Some(task) = self.worker_local_queue.pop_front() {
+                worker_local.set_queue_depth(self.worker_local_queue.len());
+                return Some(task);
+            }
+
+            if worker_local.inject_shared.is_empty() {
+                return None;
+            }
+
+            // Unlike the scheduler-wide inject queue, this queue has a single
+            // consumer (this worker), so splice the entire linked list in O(1)
+            // and drop the lock before touching the local queue.
+            let (head, tail, len) = {
+                let mut synced = worker_local.inject_synced.lock();
+                // safety: passing in the `inject::Synced` created with this
+                // `Shared`
+                unsafe { worker_local.inject_shared.drain_all(&mut synced) }
+            };
+
+            // safety: `(head, tail, len)` came from `inject_shared.drain_all`.
+            unsafe {
+                self.worker_local_queue.splice_from(head, tail, len);
+            }
+
+            let ret = self.worker_local_queue.pop_front();
+            worker_local.set_queue_depth(self.worker_local_queue.len());
+
+            ret
+        }
+
+        /// Returns `true` if this worker has runnable worker-local tasks in
+        /// its local queue.
+        fn has_worker_local_queued_tasks(&self) -> bool {
+            !self.worker_local_queue.is_empty()
+        }
+
+        /// Returns `true` if this worker has pending worker-local work in any
+        /// form: runnable tasks, cross-thread wakes, or spawn requests.
+        fn has_worker_local_work(&self, worker: &Worker) -> bool {
+            if !self.worker_local_queue.is_empty() {
+                return true;
+            }
+
+            let worker_local = &worker.handle.shared.worker_locals[worker.index];
+            !worker_local.inject_shared.is_empty() || worker_local.has_spawn_requests()
+        }
+
+        /// Clears the parked flag published for cross-thread worker-local
+        /// pushers.
+        fn clear_worker_local_parked(&self, worker: &Worker) {
+            worker.handle.shared.worker_locals[worker.index].set_parked(false);
+        }
+
+        /// Publishes parked state for cross-thread worker-local pushers and
+        /// re-checks the shared worker-local queues after a `SeqCst` fence.
+        ///
+        /// Returns `false` if worker-local work is pending and parking should
+        /// be aborted. Pairs with `WorkerLocalShared::should_unpark` so active
+        /// workers are not spuriously unparked while guaranteeing no lost
+        /// wakeup when parking.
+        fn try_park_worker_local(&self, worker: &Worker) -> bool {
+            if !self.worker_local_queue.is_empty() {
+                return false;
+            }
+            let worker_local = &worker.handle.shared.worker_locals[worker.index];
+            worker_local.set_parked(true);
+            fence(SeqCst);
+            if !worker_local.inject_shared.is_empty() || worker_local.has_spawn_requests() {
+                worker_local.set_parked(false);
+                return false;
+            }
+            true
+        }
+
+        /// Shuts down this worker's worker-local tasks. Runs on the thread
+        /// holding this worker's core (`pre_shutdown`).
+        fn pre_shutdown_worker_local(&mut self, worker: &Worker) {
+            let worker_local = &worker.handle.shared.worker_locals[worker.index];
+
+            // Close the spawn-request queue and drop pending requests
+            // without running them; from here on, racing pushes are
+            // rejected and dropped by the pusher.
+            worker_local.close_spawn_requests();
+
+            // Close the inject queue so subsequent cross-thread wakes are
+            // dropped, then drain any already-queued notifications.
+            {
+                let mut synced = worker_local.inject_synced.lock();
+                worker_local.inject_shared.close(&mut synced);
+                // safety: passing in the `inject::Synced` created with this
+                // `Shared`
+                while unsafe { worker_local.inject_shared.pop(&mut synced) }.is_some() {}
+            }
+
+            // Drop queued notifications in the local queue.
+            self.worker_local_queue.clear();
+            worker_local.set_queue_depth(0);
+
+            // Cancel and drop all worker-local tasks.
+            worker_local.owned.close_and_shutdown_all();
+            worker_local.clear_num_alive();
+        }
+    }
+
+    cfg_not_worker_local! {
+        fn has_worker_local_queued_tasks(&self) -> bool {
+            false
+        }
+
+        fn has_worker_local_work(&self, _worker: &Worker) -> bool {
+            false
+        }
+
+        fn clear_worker_local_parked(&self, _worker: &Worker) {}
+
+        fn try_park_worker_local(&self, _worker: &Worker) -> bool {
+            true
+        }
+
+        fn pre_shutdown_worker_local(&mut self, _worker: &Worker) {}
     }
 
     /// Function responsible for stealing tasks from another worker
@@ -1185,7 +1617,17 @@ impl Core {
         if self.is_searching {
             return false;
         }
-        self.lifo_slot.is_some() as usize + self.run_queue.len() > 1
+        let run_queue_len = self.run_queue.len();
+        if self.lifo_slot.is_some() as usize + run_queue_len > 1 {
+            return true;
+        }
+        run_queue_len > 0 && self.has_worker_local_queued_tasks()
+    }
+
+    /// Returns `true` if this worker has any pending work, including
+    /// worker-local work.
+    fn has_any_work(&self, worker: &Worker) -> bool {
+        self.has_worker_local_work(worker) || self.has_tasks()
     }
 
     /// Prepares the worker state for parking.
@@ -1194,6 +1636,10 @@ impl Core {
     fn transition_to_parked(&mut self, worker: &Worker) -> bool {
         // Workers should not park if they have work to do or are about to be traced
         if self.has_tasks() || self.is_traced {
+            return false;
+        }
+
+        if !self.try_park_worker_local(worker) {
             return false;
         }
 
@@ -1219,10 +1665,11 @@ impl Core {
 
     /// Returns `true` if the transition happened.
     fn transition_from_parked(&mut self, worker: &Worker) -> bool {
-        // If a task is in the lifo slot/run queue, then we must unpark regardless of
-        // being notified. Same when woken to be traced: a dump unparks worker
-        // threads without going through `Idle`, so the worker does it here.
-        if self.has_tasks() || self.is_traced {
+        // If a task is in the lifo slot/run queue (or worker-local work is
+        // pending), then we must unpark regardless of being notified. Same when
+        // woken to be traced: a dump unparks worker threads without going
+        // through `Idle`, so the worker does it here.
+        if self.has_any_work(worker) || self.is_traced {
             // When a worker wakes, it should only transition to the "searching"
             // state when the wake originates from another worker *or* a new task
             // is pushed. We do *not* want the worker to transition to "searching"
@@ -1278,6 +1725,8 @@ impl Core {
             .shared
             .owned
             .close_and_shutdown_all(start as usize);
+
+        self.pre_shutdown_worker_local(worker);
 
         self.stats
             .submit(&worker.handle.shared.worker_metrics[worker.index]);
@@ -1378,6 +1827,88 @@ impl Handle {
         if should_notify && core.park.is_some() {
             self.notify_parked_local();
         }
+    }
+
+    cfg_worker_local! {
+        /// Schedules a worker-local task onto the worker it is bound to.
+        pub(super) fn schedule_worker_local_task(
+            &self,
+            worker_index: usize,
+            task: NotifiedWorkerLocal,
+        ) {
+            if self.shared.schedule_latency_start.is_some() {
+                task.set_scheduled_at(ScheduleLatencyInstant::new(
+                    self.shared.schedule_latency_start,
+                ));
+            }
+
+            with_current(|maybe_cx| {
+                let mut same_runtime = false;
+                if let Some(cx) = maybe_cx {
+                    if self.ptr_eq(&cx.worker.handle) {
+                        same_runtime = true;
+                        // Fast path: the current thread is driving the target worker.
+                        if cx.worker.index == worker_index {
+                            if let Some(core) = cx.core.borrow_mut().as_mut() {
+                                core.stats.inc_local_schedule_count();
+                                core.worker_local_queue.push_back(task);
+                                self.shared.worker_locals[worker_index]
+                                    .set_queue_depth(core.worker_local_queue.len());
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                self.push_worker_local_task(worker_index, task, !same_runtime);
+            });
+        }
+
+        /// Pushes a worker-local task to its worker's inject queue from another
+        /// thread and unparks that worker if it is parked.
+        fn push_worker_local_task(
+            &self,
+            worker_index: usize,
+            task: NotifiedWorkerLocal,
+            is_external: bool,
+        ) {
+            if is_external {
+                self.shared.scheduler_metrics.inc_remote_schedule_count();
+            }
+
+            let worker_local = &self.shared.worker_locals[worker_index];
+            {
+                let mut synced = worker_local.inject_synced.lock();
+                // safety: passing in the `inject::Synced` created with this
+                // `Shared`. If the queue is closed (shutdown), the task
+                // notification is dropped; the task itself has already been shut
+                // down by `pre_shutdown`.
+                unsafe {
+                    worker_local.inject_shared.push(&mut synced, task);
+                }
+            }
+
+            // Unlike regular tasks, this work cannot be picked up by any other
+            // worker, so the target is unparked directly rather than through the
+            // idle set (`idle.unpark_worker_by_id` would corrupt `num_searching`
+            // when the worker isn't parked). Only unpark if the worker is
+            // parked so busy workers don't accumulate a stale `NOTIFIED` token
+            // and record spurious no-op parks on their next idle transition.
+            if worker_local.should_unpark() {
+                self.shared.remotes[worker_index].unpark.unpark(&self.driver);
+            }
+        }
+        fn debug_assert_worker_locals_empty(&self) {
+            debug_assert!(self
+                .shared
+                .worker_locals
+                .iter()
+                .all(|worker_local| worker_local.owned.is_empty()));
+        }
+    }
+
+    cfg_not_worker_local! {
+        fn debug_assert_worker_locals_empty(&self) {}
     }
 
     fn next_remote_task(&self) -> Option<Notified> {
@@ -1481,6 +2012,7 @@ impl Handle {
         }
 
         debug_assert!(self.shared.owned.is_empty());
+        self.debug_assert_worker_locals_empty();
 
         for mut core in cores.drain(..) {
             core.shutdown(self);
