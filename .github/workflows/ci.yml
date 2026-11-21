@@ -283,11 +283,11 @@ jobs:
     strategy:
       matrix:
         include:
-          - { os: windows-latest, extra_features: "" }
-          - { os: ubuntu-latest, extra_features: "" }
+          - { os: windows-latest, extra_features: "worker-local" }
+          - { os: ubuntu-latest, extra_features: "worker-local" }
           # only Linux supports io_uring
           - { os: ubuntu-latest, extra_features: io-uring }
-          - { os: macos-latest, extra_features: "" }
+          - { os: macos-latest, extra_features: "worker-local" }
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust ${{ env.rust_stable }}
@@ -893,9 +893,9 @@ jobs:
       matrix:
         run:
           - os: windows-latest
-            extra_features: "tracing"
+            extra_features: "tracing,worker-local"
           - os: ubuntu-latest
-            extra_features: "tracing,io-uring,taskdump"
+            extra_features: "tracing,io-uring,taskdump,worker-local"
 
     steps:
       - uses: actions/checkout@v7
@@ -922,7 +922,7 @@ jobs:
           toolchain: ${{ env.rust_stable }}
       - uses: Swatinem/rust-cache@v2
       - name: build --cfg loom
-        run: cargo test --no-run --lib --features full
+        run: cargo test --no-run --lib --features full,worker-local
         working-directory: tokio
         env:
           RUSTFLAGS: --cfg loom --cfg tokio_unstable -Dwarnings
@@ -1230,7 +1230,7 @@ jobs:
           tool: cargo-hack
 
       - name: Check tokio feature matrix for emscripten
-        run: cargo hack check -p tokio --each-feature --exclude-features full,net,process,signal,rt-multi-thread,io-uring,taskdump,schedule-latency --target wasm32-unknown-emscripten
+        run: cargo hack check -p tokio --each-feature --exclude-features full,net,process,signal,rt-multi-thread,io-uring,taskdump,schedule-latency,worker-local --target wasm32-unknown-emscripten
         working-directory: tokio
 
       - name: Test tokio for emscripten (JSPI)
@@ -1270,10 +1270,10 @@ jobs:
         include:
           - os: windows-latest
             # Windows neither supports io-uring nor taskdump.
-            extra_features: "tracing"
+            extra_features: "tracing,worker-local"
           - os: ubuntu-latest
             # includes all unstable features.
-            extra_features: "tracing,io-uring,taskdump"
+            extra_features: "tracing,io-uring,taskdump,worker-local"
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust ${{ matrix.rust }}

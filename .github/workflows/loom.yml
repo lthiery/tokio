@@ -110,6 +110,7 @@ jobs:
           - scope: loom_multi_thread::group_b
           - scope: loom_multi_thread::group_c
           - scope: loom_multi_thread::group_d
+          - scope: loom_worker_local
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust ${{ env.rust_stable }}
@@ -118,7 +119,7 @@ jobs:
             toolchain: ${{ env.rust_stable }}
       - uses: Swatinem/rust-cache@v2
       - name: loom ${{ matrix.scope }}
-        run: cargo test --lib --release --features full -- --nocapture $SCOPE
+        run: cargo test --lib --release --features full,worker-local -- --nocapture $SCOPE
         working-directory: tokio
         env:
           SCOPE: ${{ matrix.scope }}
